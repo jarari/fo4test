@@ -429,6 +429,7 @@ public:
 	bool dlssgMenuResumeReady = true;
 	uint32_t dlssgStableGameplayFrames = 0;
 	bool pauseMenuOpen = false;
+	bool scopeMenuOpen = false;
 	bool temporalFeaturesBlocked = false;
 	bool frameGenerationActive = false;
 	bool fsrFrameGenerationActive = false;

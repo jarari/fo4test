@@ -856,6 +856,9 @@ RE::BSEventNotifyControl Upscaling::ProcessEvent(const RE::MenuOpenCloseEvent& a
 			singleton->LoadSettings();
 		}
 	}
+	if (a_event.menuName == "ScopeMenu") {
+		singleton->scopeMenuOpen = a_event.opening;
+	}
 
 	return RE::BSEventNotifyControl::kContinue;
 }
@@ -2342,7 +2345,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		}
 		d3d12FSRInputsReady = CaptureD3D12FSRInputs(a_renderTargetIndex, motionVectorTexture, fsrJitter, renderSize, displaySize);
 		if (d3d12FSRInputsReady && !fsrFrameGenerationActive) {
-			const auto usePresentOverride = getD3D12FSROutput() != nullptr;
+			const auto usePresentOverride = getD3D12FSROutput() != nullptr && !scopeMenuOpen;
 			const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(false, true, false, !usePresentOverride);
 			if (d3d12Result.fsr) {
 				if (!(usePresentOverride && prepareD3D12PresentOverrideUI() && setD3D12PresentOverride(getD3D12FSROutput()))) {
@@ -2391,7 +2394,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		const bool hasPresentOverrideOutput =
 			dlssPresentOverrideReady ||
 			(d3d12FSRInputsReady && getD3D12FSROutput());
-		const auto usePresentOverride = hasPresentOverrideOutput;
+		const auto usePresentOverride = hasPresentOverrideOutput && !scopeMenuOpen;
 		const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(
 			useD3D12DLSS,
 			d3d12FSRInputsReady && fsrFrameGenerationActive,
