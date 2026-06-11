@@ -60,9 +60,48 @@ float originalDynamicWidthRatio = 1.0f;
 
 namespace
 {
+	constexpr const char* kSettingsPath = "Data\\MCM\\Settings\\Upscaling.ini";
 	constexpr uint32_t kDLSSGResumeStableFrames = 2;
 	constexpr std::ptrdiff_t kServingThreadStateOffset = 0x68;
 	constexpr auto kLoadingScreenPumpInterval = std::chrono::milliseconds(500);
+	FILETIME g_lastSettingsWriteTime{};
+	bool g_hasLastSettingsWriteTime = false;
+	bool g_lastSettingsFileExists = false;
+
+	bool TryGetSettingsWriteTime(FILETIME& a_writeTime)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA data{};
+		if (!GetFileAttributesExA(kSettingsPath, GetFileExInfoStandard, &data)) {
+			return false;
+		}
+
+		a_writeTime = data.ftLastWriteTime;
+		return true;
+	}
+
+	void RememberSettingsWriteTime()
+	{
+		FILETIME writeTime{};
+		if (TryGetSettingsWriteTime(writeTime)) {
+			g_lastSettingsWriteTime = writeTime;
+			g_lastSettingsFileExists = true;
+			g_hasLastSettingsWriteTime = true;
+		} else {
+			g_lastSettingsWriteTime = {};
+			g_lastSettingsFileExists = false;
+			g_hasLastSettingsWriteTime = true;
+		}
+	}
+
+	bool SettingsFileChangedSinceLastLoad()
+	{
+		FILETIME writeTime{};
+		if (!TryGetSettingsWriteTime(writeTime)) {
+			return !g_hasLastSettingsWriteTime || g_lastSettingsFileExists;
+		}
+
+		return !g_hasLastSettingsWriteTime || !g_lastSettingsFileExists || CompareFileTime(&writeTime, &g_lastSettingsWriteTime) != 0;
+	}
 
 	float* GetGlobalDynamicWidthRatio()
 	{
@@ -237,9 +276,45 @@ namespace
 		a_texture->resource->GetDesc(&currentDesc);
 		return currentDesc.Width == a_desc.Width &&
 			currentDesc.Height == a_desc.Height &&
+			currentDesc.MipLevels == a_desc.MipLevels &&
+			currentDesc.ArraySize == a_desc.ArraySize &&
 			currentDesc.Format == a_desc.Format &&
+			currentDesc.SampleDesc.Count == a_desc.SampleDesc.Count &&
+			currentDesc.SampleDesc.Quality == a_desc.SampleDesc.Quality &&
+			currentDesc.Usage == a_desc.Usage &&
 			currentDesc.BindFlags == a_desc.BindFlags &&
+			currentDesc.CPUAccessFlags == a_desc.CPUAccessFlags &&
 			currentDesc.MiscFlags == a_desc.MiscFlags;
+	}
+
+	void EnsureTexture2D(
+		D3D11_TEXTURE2D_DESC a_desc,
+		std::unique_ptr<Texture2D>& a_texture,
+		bool a_createSRV,
+		bool a_createUAV)
+	{
+		a_desc.Usage = D3D11_USAGE_DEFAULT;
+		a_desc.CPUAccessFlags = 0;
+
+		if (!SharedTextureMatches(a_texture, a_desc)) {
+			a_texture = std::make_unique<Texture2D>(a_desc);
+		}
+
+		if (a_createSRV && !a_texture->srv) {
+			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+			srvDesc.Format = a_desc.Format;
+			srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srvDesc.Texture2D.MipLevels = 1;
+			a_texture->CreateSRV(srvDesc);
+		}
+
+		if (a_createUAV && !a_texture->uav) {
+			D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+			uavDesc.Format = a_desc.Format;
+			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+			uavDesc.Texture2D.MipSlice = 0;
+			a_texture->CreateUAV(uavDesc);
+		}
 	}
 
 	void EnsureSharedD3D12Texture(
@@ -720,7 +795,8 @@ void Upscaling::LoadSettings()
 
 	CSimpleIniA ini;
 	ini.SetUnicode();
-	ini.LoadFile("Data\\MCM\\Settings\\Upscaling.ini");
+	ini.LoadFile(kSettingsPath);
+	RememberSettingsWriteTime();
 	
 	settings.upscaleMethodPreference = static_cast<uint>(ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2));
 	settings.qualityMode = static_cast<uint>(ini.GetLongValue("Settings", "iQualityMode", 1));
@@ -772,10 +848,11 @@ RE::BSEventNotifyControl Upscaling::ProcessEvent(const RE::MenuOpenCloseEvent& a
 {
 	auto singleton = GetSingleton();
 
-	// Reload settings when closing MCM menu
+	// Reload settings after MCM writes, without doing file parse work on
+	// every normal ESC close.
 	if (a_event.menuName == "PauseMenu") {
 		singleton->pauseMenuOpen = a_event.opening;
-		if (!a_event.opening) {
+		if (!a_event.opening && SettingsFileChangedSinceLastLoad()) {
 			singleton->LoadSettings();
 		}
 	}
@@ -975,14 +1052,10 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 	for (int i = 0; i < ARRAYSIZE(renderTargetsPatch); i++)
 		UpdateRenderTarget(renderTargetsPatch[i], a_currentWidthRatio, a_currentHeightRatio);
 
-	// Reset render-size dependent local textures. Shared D3D11/D3D12 bridge
-	// textures are descriptor-checked at capture time and can be reused when
-	// menu transitions return to the same dimensions.
-	upscalingTexture = nullptr;
-	dlssOutputTexture = nullptr;
-	dilatedMotionVectorTexture = nullptr;
-	depthOverrideTexture = nullptr;
-	dlssgHUDLessTexture = nullptr;
+	// Keep render-size dependent local textures allocated across menu
+	// suspends. They are descriptor-checked below and in
+	// CreateUpscalingResources(), so only real resolution/format changes
+	// recreate GPU resources.
 	dlssTransparencyMaskReady = false;
 	for (std::size_t i = 0; i < dlssgInputsReady.size(); ++i) {
 		dlssgInputsReady[i] = false;
@@ -1014,26 +1087,10 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 
 	frameBufferResource->Release();
 
-	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
-		.Format = texDesc.Format,
-		.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
-		.Texture2D = {
-			.MostDetailedMip = 0,
-			.MipLevels = 1 }
-	};
-
-	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
-		.Format = texDesc.Format,
-		.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
-		.Texture2D = {.MipSlice = 0 }
-	};
-
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 
 	// Intermediate upscaling texture (stores DLSS/FSR output)
-	upscalingTexture = std::make_unique<Texture2D>(texDesc);
-	upscalingTexture->CreateSRV(srvDesc);
-	upscalingTexture->CreateUAV(uavDesc);
+	EnsureTexture2D(texDesc, upscalingTexture, true, true);
 
 	// Do not need to replace render targets at native resolution
 	if (a_currentWidthRatio == 1.0f && a_currentHeightRatio == 1.0f)
@@ -1044,12 +1101,7 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 	texDesc.Height = static_cast<uint>(static_cast<float>(texDesc.Height) * a_currentHeightRatio);
 
 	texDesc.Format = DXGI_FORMAT_R32_FLOAT;
-	srvDesc.Format = texDesc.Format;
-	uavDesc.Format = texDesc.Format;
-
-	depthOverrideTexture = std::make_unique<Texture2D>(texDesc);
-	depthOverrideTexture->CreateSRV(srvDesc);
-	depthOverrideTexture->CreateUAV(uavDesc);
+	EnsureTexture2D(texDesc, depthOverrideTexture, true, true);
 }
 
 void Upscaling::OverrideRenderTargets(std::initializer_list<int> a_indicesToCopy)
@@ -2598,40 +2650,16 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			dlssD3D12TransparencyMaskReady[frameIndex] = false;
 			auto* opaqueOnly = FidelityFX::GetSingleton()->colorOpaqueOnlyTexture.get();
 			if (opaqueOnly && opaqueOnly->srv && upscalingTexture->srv) {
-				bool recreateTransparencyMask = !dlssTransparencyMaskTexture || !dlssTransparencyMaskTexture->resource;
-				if (!recreateTransparencyMask) {
-					D3D11_TEXTURE2D_DESC currentMaskDesc{};
-					dlssTransparencyMaskTexture->resource->GetDesc(&currentMaskDesc);
-					recreateTransparencyMask =
-						currentMaskDesc.Width != static_cast<UINT>(a_renderSize.x) ||
-						currentMaskDesc.Height != static_cast<UINT>(a_renderSize.y) ||
-						currentMaskDesc.Format != DXGI_FORMAT_R32_FLOAT;
-				}
-
-				if (recreateTransparencyMask) {
-					D3D11_TEXTURE2D_DESC maskDesc{};
-					maskDesc.Width = static_cast<UINT>(a_renderSize.x);
-					maskDesc.Height = static_cast<UINT>(a_renderSize.y);
-					maskDesc.MipLevels = 1;
-					maskDesc.ArraySize = 1;
-					maskDesc.Format = DXGI_FORMAT_R32_FLOAT;
-					maskDesc.SampleDesc.Count = 1;
-					maskDesc.Usage = D3D11_USAGE_DEFAULT;
-					maskDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-
-					D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-					srvDesc.Format = maskDesc.Format;
-					srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-					srvDesc.Texture2D.MipLevels = 1;
-
-					D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-					uavDesc.Format = maskDesc.Format;
-					uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-
-					dlssTransparencyMaskTexture = std::make_unique<Texture2D>(maskDesc);
-					dlssTransparencyMaskTexture->CreateSRV(srvDesc);
-					dlssTransparencyMaskTexture->CreateUAV(uavDesc);
-				}
+				D3D11_TEXTURE2D_DESC maskDesc{};
+				maskDesc.Width = static_cast<UINT>(a_renderSize.x);
+				maskDesc.Height = static_cast<UINT>(a_renderSize.y);
+				maskDesc.MipLevels = 1;
+				maskDesc.ArraySize = 1;
+				maskDesc.Format = DXGI_FORMAT_R32_FLOAT;
+				maskDesc.SampleDesc.Count = 1;
+				maskDesc.Usage = D3D11_USAGE_DEFAULT;
+				maskDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+				EnsureTexture2D(maskDesc, dlssTransparencyMaskTexture, true, true);
 
 				auto shader = GetGenerateDLSSTransparencyMaskCS();
 				if (shader && dlssTransparencyMaskTexture && dlssTransparencyMaskTexture->uav) {
@@ -2842,23 +2870,11 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		return;
 	}
 
-	bool recreateHUDLess = !dlssgHUDLessTexture;
-	if (dlssgHUDLessTexture) {
-		D3D11_TEXTURE2D_DESC currentDesc{};
-		dlssgHUDLessTexture->resource->GetDesc(&currentDesc);
-		recreateHUDLess =
-			currentDesc.Width != frameBufferDesc.Width ||
-			currentDesc.Height != frameBufferDesc.Height ||
-			currentDesc.Format != frameBufferDesc.Format;
-	}
-
-	if (recreateHUDLess) {
-		auto hudlessDesc = frameBufferDesc;
-		hudlessDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-		hudlessDesc.CPUAccessFlags = 0;
-		hudlessDesc.MiscFlags = 0;
-		dlssgHUDLessTexture = std::make_unique<Texture2D>(hudlessDesc);
-	}
+	auto hudlessDesc = frameBufferDesc;
+	hudlessDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	hudlessDesc.CPUAccessFlags = 0;
+	hudlessDesc.MiscFlags = 0;
+	EnsureTexture2D(hudlessDesc, dlssgHUDLessTexture, false, false);
 
 	context->CopyResource(dlssgHUDLessTexture->resource.get(), frameBufferResource);
 
@@ -3135,36 +3151,15 @@ void Upscaling::CreateUpscalingResources()
 
 	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-	// Create view descriptions
-	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
-		.Format = texDesc.Format,
-		.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
-		.Texture2D = {
-			.MostDetailedMip = 0,
-			.MipLevels = 1 }
-	};
-
-	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {
-		.Format = texDesc.Format,
-		.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D,
-		.Texture2D = {.MipSlice = 0 }
-	};
-
 	if (Streamline::GetSingleton()->featureDLSS) {
 		texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-		uavDesc.Format = texDesc.Format;
-
-		dlssOutputTexture = std::make_unique<Texture2D>(texDesc);
-		dlssOutputTexture->CreateUAV(uavDesc);
+		EnsureTexture2D(texDesc, dlssOutputTexture, false, true);
 	}
 
 	// Create dilated motion vector texture for DLSS and FSR.
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 	texDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
-	uavDesc.Format = texDesc.Format;
-
-	dilatedMotionVectorTexture = std::make_unique<Texture2D>(texDesc);
-	dilatedMotionVectorTexture->CreateUAV(uavDesc);
+	EnsureTexture2D(texDesc, dilatedMotionVectorTexture, false, true);
 }
 
 void Upscaling::DestroyUpscalingResources()
