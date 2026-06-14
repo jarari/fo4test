@@ -542,11 +542,11 @@ std::string OSD::BuildDetailedText() const
 		std::snprintf(line, sizeof(line), "Generated FPS: %.1f\n", generatedFPS);
 		text += line;
 	}
+	std::snprintf(line, sizeof(line), "VRAM: %llu MB\n", static_cast<unsigned long long>(vramUsageMB));
+	text += line;
 
 	if (activeMethod == Upscaling::UpscaleMethod::kDLSS) {
 		std::snprintf(line, sizeof(line), "Res: %.0fx%.0f -> %.0fx%.0f\n", upscaling->osdRenderSize.x, upscaling->osdRenderSize.y, upscaling->osdNativeSize.x, upscaling->osdNativeSize.y);
-		text += line;
-		std::snprintf(line, sizeof(line), "VRAM: %llu MB\n", static_cast<unsigned long long>(vramUsageMB));
 		text += line;
 		std::snprintf(line, sizeof(line), "Reflex: %s\n", ReflexModeName(streamline->GetCurrentReflexMode()));
 		text += line;
