@@ -132,20 +132,6 @@ public:
 	// DLSS Operations
 	// ========================================
 
-	/**
-	 * @brief Execute DLSS upscaling
-	 * @param a_color Input color texture
-	 * @param a_outputColor Output color texture
-	 * @param a_dilatedMotionVectorTexture Dilated motion vectors for better temporal stability
-	 * @param a_jitter Camera jitter offset for current frame
-	 * @param a_renderSize Render resolution dimensions
-	 * @param a_qualityMode DLSS quality mode (0=DLAA, 1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance)
-	 *
-	 * Performs DLSS upscaling from render resolution to display resolution.
-	 * Uses dilated motion vectors and depth buffer for temporal reconstruction.
-	 * The upscaled result is written back to a_color texture.
-	 */
-	void Upscale(Texture2D* a_color, Texture2D* a_outputColor, Texture2D* a_dilatedMotionVectorTexture, float2 a_jitter, float2 a_renderSize, float2 a_displaySize, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset);
 	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, bool* a_sharpened);
 
 	/**
@@ -165,7 +151,7 @@ public:
 	/**
 	 * @brief Enable/disable DLSS-G for the current frame.
 	 */
-	void UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGenerate, bool a_dynamicMFGEnabled, uint a_dynamicMFGTargetFPS, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, DXGI_FORMAT a_uiFormat = DXGI_FORMAT_UNKNOWN);
+	bool UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGenerate, bool a_dynamicMFGEnabled, uint a_dynamicMFGTargetFPS, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, DXGI_FORMAT a_uiFormat = DXGI_FORMAT_UNKNOWN);
 	void RequestDLSSGDisable();
 	bool HasPendingDLSSGDisable() const { return pendingDLSSGDisable; }
 	void ApplyPendingDLSSGDisable();

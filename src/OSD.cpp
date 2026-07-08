@@ -100,6 +100,8 @@ namespace
 			return "DLSS";
 		case Upscaling::UpscaleMethod::kFSR:
 			return "FSR";
+		case Upscaling::UpscaleMethod::kSpatialFallback:
+			return "Fallback";
 		case Upscaling::UpscaleMethod::kDisabled:
 		default:
 			return "Off";
@@ -569,6 +571,11 @@ std::string OSD::BuildDetailedText() const
 		text += line;
 		std::snprintf(line, sizeof(line), "FSR Quality: %s\n", QualityName(upscaling->settings.qualityMode));
 		text += line;
+	} else if (activeMethod == Upscaling::UpscaleMethod::kSpatialFallback) {
+		std::snprintf(line, sizeof(line), "Res: %.0fx%.0f -> %.0fx%.0f\n", upscaling->osdRenderSize.x, upscaling->osdRenderSize.y, upscaling->osdNativeSize.x, upscaling->osdNativeSize.y);
+		text += line;
+		std::snprintf(line, sizeof(line), "Fallback: Spatial\n");
+		text += line;
 	}
 
 	std::snprintf(line, sizeof(line), "Jitter: %.4f, %.4f\n", jitter.x, jitter.y);
@@ -663,7 +670,9 @@ void OSD::Render(
 	}
 
 	const auto activeMethod = Upscaling::GetSingleton()->upscaleMethod;
-	if (activeMethod != Upscaling::UpscaleMethod::kDLSS && activeMethod != Upscaling::UpscaleMethod::kFSR) {
+	if (activeMethod != Upscaling::UpscaleMethod::kDLSS &&
+		activeMethod != Upscaling::UpscaleMethod::kFSR &&
+		activeMethod != Upscaling::UpscaleMethod::kSpatialFallback) {
 		return;
 	}
 

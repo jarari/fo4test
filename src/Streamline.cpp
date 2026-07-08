@@ -337,7 +337,12 @@ void Streamline::CheckFeature(sl::Feature a_feature, IDXGIAdapter* a_adapter, bo
 void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 {
 	logger::info("[Streamline] Checking features");
-	CheckFeature(sl::kFeatureDLSS, a_adapter, featureDLSS, "DLSS");
+	if (UsesD3D12()) {
+		CheckFeature(sl::kFeatureDLSS, a_adapter, featureDLSS, "DLSS");
+	} else {
+		featureDLSS = false;
+		logger::info("[Streamline] DLSS skipped: D3D11 DLSS SR is deprecated; use the D3D12 proxy path");
+	}
 	if (UsesD3D12()) {
 		CheckFeature(sl::kFeatureDLSS_G, a_adapter, featureDLSSG, "DLSS-G");
 	} else {
@@ -549,11 +554,11 @@ void Streamline::UpdateReflex(uint a_reflexMode, bool a_forceEnabled)
 	currentReflexThreadId = threadId;
 }
 
-void Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGenerate, bool a_dynamicMFGEnabled, uint a_dynamicMFGTargetFPS, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, DXGI_FORMAT a_uiFormat)
+bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGenerate, bool a_dynamicMFGEnabled, uint a_dynamicMFGTargetFPS, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, DXGI_FORMAT a_uiFormat)
 {
 	if (!featureDLSSG || !slDLSSGSetOptions) {
 		dlssgActive = false;
-		return;
+		return false;
 	}
 
 	if (!dlssgStateKnown && slDLSSGGetState) {
@@ -603,7 +608,7 @@ void Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 
 	if (mode == sl::DLSSGMode::eOff) {
 		RequestDLSSGDisable();
-		return;
+		return true;
 	}
 
 	pendingDLSSGDisable = false;
@@ -620,7 +625,7 @@ void Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		currentMotionVectorFormat == a_motionVectorFormat &&
 		currentDepthFormat == a_depthFormat &&
 		currentUIFormat == a_uiFormat) {
-		return;
+		return true;
 	}
 
 	sl::DLSSGOptions options{};
@@ -644,7 +649,7 @@ void Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	if (SL_FAILED(result, slDLSSGSetOptions(viewport, options))) {
 		logger::warn("[Streamline] Could not set DLSS-G mode {}: {}", static_cast<uint32_t>(mode), magic_enum::enum_name(result));
 		dlssgActive = false;
-		return;
+		return false;
 	}
 
 	currentDLSSGMode = mode;
@@ -660,6 +665,7 @@ void Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	currentUIFormat = a_uiFormat;
 	dlssgActive = mode != sl::DLSSGMode::eOff;
 
+	return true;
 }
 
 void Streamline::RequestDLSSGDisable()
@@ -1057,103 +1063,6 @@ bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resour
 	return true;
 }
 
-void Streamline::Upscale(Texture2D* a_upscaleTexture, Texture2D* a_outputTexture, Texture2D* a_dilatedMotionVectorTexture, float2 a_jitter, float2 a_renderSize, float2 a_displaySize, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset)
-{
-	UpdateConstants(a_jitter);
-
-	static auto rendererData = RE::BSGraphics::GetRendererData();
-	auto& depthTexture = rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain];
-
-	static auto gameViewport = Util::State_GetSingleton();
-	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
-
-	{
-		sl::DLSSMode dlssMode;
-		switch (a_qualityMode) {
-		case 1:
-			dlssMode = sl::DLSSMode::eMaxQuality;
-			break;
-		case 2:
-			dlssMode = sl::DLSSMode::eBalanced;
-			break;
-		case 3:
-			dlssMode = sl::DLSSMode::eMaxPerformance;
-			break;
-		case 4:
-			dlssMode = sl::DLSSMode::eUltraPerformance;
-			break;
-		default:
-			dlssMode = sl::DLSSMode::eDLAA;
-			break;
-		}
-
-		sl::DLSSOptions dlssOptions{};
-		dlssOptions.mode = dlssMode;
-		dlssOptions.outputWidth = static_cast<uint32_t>(a_displaySize.x);
-		dlssOptions.outputHeight = static_cast<uint32_t>(a_displaySize.y);
-		dlssOptions.colorBuffersHDR = sl::Boolean::eFalse;
-		ApplyDLSSModelPreset(dlssOptions, a_dlssModelPreset);
-
-		if (SL_FAILED(result, slDLSSSetOptions(viewport, dlssOptions))) {
-			logger::critical("[Streamline] Could not enable DLSS");
-		} else {
-			currentDLSSQualityMode = a_qualityMode;
-			currentDLSSModelPreset = a_dlssModelPreset;
-		}
-
-		static auto loggedDLSSSettings = false;
-		if (!loggedDLSSSettings && slDLSSGetOptimalSettings) {
-			sl::DLSSOptimalSettings optimalSettings{};
-			if (SL_SUCCEEDED(result, slDLSSGetOptimalSettings(dlssOptions, optimalSettings))) {
-				logger::info(
-					"[Streamline] DLSS settings mode={} output={}x{} optimal={}x{} min={}x{} max={}x{} taggedRender={}x{}",
-					static_cast<uint32_t>(dlssMode),
-					dlssOptions.outputWidth,
-					dlssOptions.outputHeight,
-					optimalSettings.optimalRenderWidth,
-					optimalSettings.optimalRenderHeight,
-					optimalSettings.renderWidthMin,
-					optimalSettings.renderHeightMin,
-					optimalSettings.renderWidthMax,
-					optimalSettings.renderHeightMax,
-					static_cast<uint32_t>(a_renderSize.x),
-					static_cast<uint32_t>(a_renderSize.y));
-				loggedDLSSSettings = true;
-			}
-		}
-	}
-
-	{
-		sl::Extent lowResExtent{ 0, 0, (uint)a_renderSize.x, (uint)a_renderSize.y };
-		sl::Extent fullExtent{ 0, 0, (uint)a_displaySize.x, (uint)a_displaySize.y };
-
-		sl::Resource colorIn = { sl::ResourceType::eTex2d, a_upscaleTexture->resource.get(), 0 };
-		sl::Resource colorOut = { sl::ResourceType::eTex2d, a_outputTexture->resource.get(), 0 };
-		sl::Resource depth = { sl::ResourceType::eTex2d, reinterpret_cast<ID3D11Texture2D*>(depthTexture.texture), 0 };
-		sl::Resource mvec = { sl::ResourceType::eTex2d, a_dilatedMotionVectorTexture->resource.get(), 0};
-
-		sl::ResourceTag colorInTag = sl::ResourceTag{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
-		sl::ResourceTag colorOutTag = sl::ResourceTag{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent };
-		sl::ResourceTag depthTag = sl::ResourceTag{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
-		sl::ResourceTag mvecTag = sl::ResourceTag{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
-
-		sl::ResourceTag resourceTags[] = { colorInTag, colorOutTag, depthTag, mvecTag };
-		if (slSetTagForFrame && frameToken) {
-			slSetTagForFrame(*frameToken, viewport, resourceTags, _countof(resourceTags), context);
-		} else if (slSetTag) {
-			slSetTag(viewport, resourceTags, _countof(resourceTags), context);
-		}
-	}
-
-	sl::ViewportHandle view(viewport);
-	const sl::BaseStructure* inputs[] = { &view };
-	slEvaluateFeature(sl::kFeatureDLSS, *frameToken, inputs, _countof(inputs), context);
-
-	if (ApplyNISSharpen(a_outputTexture->resource.get(), a_upscaleTexture->resource.get(), context, frameToken, a_displaySize, a_sharpness)) {
-		context->CopyResource(a_outputTexture->resource.get(), a_upscaleTexture->resource.get());
-	}
-}
-
 bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, bool* a_sharpened)
 {
 	std::ignore = a_colorFormat;
@@ -1164,6 +1073,18 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	}
 
 	if (!featureDLSS || !slDLSSSetOptions || !slEvaluateFeature || !slSetTagForFrame || !a_color || !a_outputColor || !a_motionVectors || !a_depth || !a_commandList || !a_frameToken) {
+		logger::warn(
+			"[Streamline] D3D12 DLSS unavailable before tagging feature={} setOptions={} evaluate={} setTag={} color={} output={} mvec={} depth={} commandList={} frameToken={}",
+			featureDLSS,
+			static_cast<bool>(slDLSSSetOptions),
+			static_cast<bool>(slEvaluateFeature),
+			static_cast<bool>(slSetTagForFrame),
+			static_cast<void*>(a_color),
+			static_cast<void*>(a_outputColor),
+			static_cast<void*>(a_motionVectors),
+			static_cast<void*>(a_depth),
+			static_cast<void*>(a_commandList),
+			static_cast<void*>(a_frameToken));
 		return false;
 	}
 
@@ -1206,22 +1127,53 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 
 	sl::ResourceTag colorInTag = { &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
 	sl::ResourceTag colorOutTag = { &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent };
-	sl::ResourceTag depthTag = { &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
-	sl::ResourceTag mvecTag = { &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
+	sl::ResourceTag depthTag = { &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
+	sl::ResourceTag mvecTag = { &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
 	sl::ResourceTag biasCurrentColorTag = { &biasCurrentColor, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
 	sl::ResourceTag transparencyTag = { &transparency, sl::kBufferTypeTransparencyHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
 
 	sl::ResourceTag resourceTags[] = { colorInTag, colorOutTag, depthTag, mvecTag, biasCurrentColorTag, transparencyTag };
 	const auto numResourceTags = static_cast<uint32_t>(a_transparencyMask ? _countof(resourceTags) : _countof(resourceTags) - 2);
 	if (SL_FAILED(result, slSetTagForFrame(*a_frameToken, viewport, resourceTags, numResourceTags, a_commandList))) {
-		logger::warn("[Streamline] Could not tag D3D12 DLSS resources: {}", magic_enum::enum_name(result));
+		logger::warn(
+			"[Streamline] Could not tag D3D12 DLSS resources: {} token={} tags={} render={}x{} display={}x{} color={} output={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
+			magic_enum::enum_name(result),
+			static_cast<uint32_t>(*a_frameToken),
+			numResourceTags,
+			lowResExtent.width,
+			lowResExtent.height,
+			fullExtent.width,
+			fullExtent.height,
+			static_cast<void*>(a_color),
+			static_cast<void*>(a_outputColor),
+			static_cast<void*>(a_motionVectors),
+			static_cast<void*>(a_depth),
+			static_cast<void*>(a_transparencyMask),
+			magic_enum::enum_name(a_colorFormat),
+			magic_enum::enum_name(a_motionVectorFormat),
+			magic_enum::enum_name(a_depthFormat));
 		return false;
 	}
 
 	sl::ViewportHandle view(viewport);
 	const sl::BaseStructure* inputs[] = { &view };
 	if (SL_FAILED(result, slEvaluateFeature(sl::kFeatureDLSS, *a_frameToken, inputs, _countof(inputs), a_commandList))) {
-		logger::warn("[Streamline] D3D12 DLSS evaluate failed: {}", magic_enum::enum_name(result));
+		logger::warn(
+			"[Streamline] D3D12 DLSS evaluate failed: {} token={} render={}x{} display={}x{} color={} output={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
+			magic_enum::enum_name(result),
+			static_cast<uint32_t>(*a_frameToken),
+			lowResExtent.width,
+			lowResExtent.height,
+			fullExtent.width,
+			fullExtent.height,
+			static_cast<void*>(a_color),
+			static_cast<void*>(a_outputColor),
+			static_cast<void*>(a_motionVectors),
+			static_cast<void*>(a_depth),
+			static_cast<void*>(a_transparencyMask),
+			magic_enum::enum_name(a_colorFormat),
+			magic_enum::enum_name(a_motionVectorFormat),
+			magic_enum::enum_name(a_depthFormat));
 		return false;
 	}
 

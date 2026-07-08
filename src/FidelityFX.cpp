@@ -247,11 +247,6 @@ void FidelityFX::GenerateReactiveMask()
 	// The DX12 path generates the mask immediately before dispatching FSR.
 }
 
-void FidelityFX::Upscale(Texture2D*, float2, float2, float)
-{
-	logger::warn("[FidelityFX] DX11 FSR path is unavailable with this SDK; use the D3D12 swapchain path.");
-}
-
 bool FidelityFX::EnsureContext(ID3D12Device* a_device, float2 a_renderSize, float2 a_displaySize)
 {
 	if (!a_device || a_renderSize.x <= 0.0f || a_renderSize.y <= 0.0f || a_displaySize.x <= 0.0f || a_displaySize.y <= 0.0f) {

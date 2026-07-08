@@ -67,7 +67,8 @@ public:
 	{
 		kDisabled,  ///< No upscaling, native TAA
 		kFSR,       ///< AMD FidelityFX Super Resolution 3
-		kDLSS       ///< NVIDIA Deep Learning Super Sampling
+		kDLSS,      ///< NVIDIA Deep Learning Super Sampling
+		kSpatialFallback  ///< Local spatial fallback used while temporal SDK requests are retry-blocked
 	};
 
 	static constexpr bool kForceFSRFrameGenerationForTesting = false;
@@ -328,6 +329,7 @@ public:
 	ID3D11ComputeShader* GetGenerateFrameGenerationBuffersCS();
 	ID3D11ComputeShader* GetGenerateFrameGenerationUIColorAlphaCS();
 	ID3D11ComputeShader* GetGenerateDLSSTransparencyMaskCS();
+	ID3D11ComputeShader* GetSpatialFallbackUpscaleCS();
 
 	/**
 	 * @brief Get or compile custom SSR raytracing pixel shader
@@ -376,6 +378,7 @@ public:
 	void DestroyUpscalingResources();
 
 	std::unique_ptr<Texture2D> upscalingTexture;           ///< Intermediate upscaling texture
+	std::unique_ptr<Texture2D> spatialFallbackTexture;     ///< Full-resolution local fallback output
 	std::unique_ptr<Texture2D> dlssOutputTexture;          ///< Full-resolution DLSS output texture
 	std::unique_ptr<Texture2D> dilatedMotionVectorTexture; ///< Dilated motion vectors for DLSS
 	std::unique_ptr<Texture2D> dlssgHUDLessTexture;        ///< Persistent HUD-less color for DLSS-G present-time consumption
@@ -428,13 +431,27 @@ public:
 	bool d3d12DLSSMenuSuspended = false;
 	bool dlssgMenuResumeReady = true;
 	uint32_t dlssgStableGameplayFrames = 0;
-	bool pauseMenuOpen = false;
-	bool scopeMenuOpen = false;
 	bool temporalFeaturesBlocked = false;
 	bool frameGenerationActive = false;
 	bool fsrFrameGenerationActive = false;
 	bool frameGenerationInputsWanted = false;
 	bool d3d12DLSSActive = false;
+
+	enum class FeatureRequest
+	{
+		kDLSS,
+		kFSR,
+		kDLSSG,
+		kFSRFrameGeneration
+	};
+
+	struct FeatureRetryBlock
+	{
+		uint64_t retryGameFrame = 0;
+		bool active = false;
+	};
+
+	std::array<FeatureRetryBlock, 4> featureRetryBlocks{};
 
 	/**
 	 * @struct UpscalingCB
@@ -460,6 +477,7 @@ private:
 	winrt::com_ptr<ID3D11ComputeShader> generateFrameGenerationBuffersCS;  ///< Motion/depth reticle fix shader for frame generation inputs
 	winrt::com_ptr<ID3D11ComputeShader> generateFrameGenerationUIColorAlphaCS;  ///< Reticle UI color/alpha extraction shader for frame generation
 	winrt::com_ptr<ID3D11ComputeShader> generateDLSSTransparencyMaskCS;  ///< DLSS transparency/history rejection mask
+	winrt::com_ptr<ID3D11ComputeShader> spatialFallbackUpscaleCS;       ///< Minimal local spatial fallback upscaler
 	winrt::com_ptr<ID3D11PixelShader> BSImagespaceShaderSSLRRaytracing;  ///< Custom SSR shader
 
 	std::unique_ptr<Texture2D> frameGenerationPreAlphaTexture;
@@ -474,5 +492,9 @@ private:
 	uint32_t dlssTransparencyMaskFrame = 0;
 
 	bool WantsFrameGenerationInputs();
+	bool IsFeatureRequestBlocked(FeatureRequest a_feature) const;
+	void ReportFeatureRequestFailure(FeatureRequest a_feature, std::string_view a_context);
+	void ClearFeatureRequestFailure(FeatureRequest a_feature);
+	void ClearFrameFeatureRequests();
 	bool EnsureFrameGenerationPatchResources(float2 a_renderSize, DXGI_FORMAT a_colorResourceFormat, DXGI_FORMAT a_colorSRVFormat, DXGI_FORMAT a_motionVectorFormat);
 };
