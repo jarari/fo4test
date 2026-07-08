@@ -13,6 +13,118 @@ namespace
 {
 	using CreateSwapChain_t = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
 
+	struct SwapChainSize
+	{
+		UINT width = 0;
+		UINT height = 0;
+	};
+
+	struct GameSwapChainDesc
+	{
+		HWND hwnd = nullptr;
+		SwapChainSize size{};
+		bool valid = false;
+	};
+
+	GameSwapChainDesc gameSwapChainDesc;
+
+	bool GetClientSize(HWND a_hwnd, SwapChainSize& a_size)
+	{
+		if (!a_hwnd) {
+			return false;
+		}
+
+		RECT clientRect{};
+		if (!GetClientRect(a_hwnd, &clientRect)) {
+			return false;
+		}
+
+		const auto width = clientRect.right - clientRect.left;
+		const auto height = clientRect.bottom - clientRect.top;
+		if (width <= 0 || height <= 0) {
+			return false;
+		}
+
+		a_size.width = static_cast<UINT>(width);
+		a_size.height = static_cast<UINT>(height);
+		return true;
+	}
+
+	SwapChainSize ResolveSwapChainSize(const DXGI_SWAP_CHAIN_DESC& a_desc)
+	{
+		SwapChainSize size{};
+		if (GetClientSize(a_desc.OutputWindow, size)) {
+			return size;
+		}
+
+		size.width = a_desc.BufferDesc.Width;
+		size.height = a_desc.BufferDesc.Height;
+		return size;
+	}
+
+	bool IsPlausibleGameSwapChainSize(const SwapChainSize& a_size)
+	{
+		return a_size.width >= 640 && a_size.height >= 360;
+	}
+
+	void CaptureGameSwapChainDesc(const DXGI_SWAP_CHAIN_DESC& a_desc)
+	{
+		auto size = ResolveSwapChainSize(a_desc);
+		if (!a_desc.OutputWindow || !IsPlausibleGameSwapChainSize(size)) {
+			gameSwapChainDesc = {};
+			logger::warn(
+				"[DX12SwapChain] Game swapchain candidate rejected hwnd={} size={}x{}",
+				static_cast<void*>(a_desc.OutputWindow),
+				size.width,
+				size.height);
+			return;
+		}
+
+		gameSwapChainDesc.hwnd = a_desc.OutputWindow;
+		gameSwapChainDesc.size = size;
+		gameSwapChainDesc.valid = true;
+		logger::info(
+			"[DX12SwapChain] Game swapchain candidate hwnd={} size={}x{}",
+			static_cast<void*>(gameSwapChainDesc.hwnd),
+			gameSwapChainDesc.size.width,
+			gameSwapChainDesc.size.height);
+	}
+
+	bool IsGameSwapChainRequest(const DXGI_SWAP_CHAIN_DESC& a_desc)
+	{
+		if (DX12SwapChain::GetSingleton()->IsReady()) {
+			logger::info("[DX12SwapChain] Skipping factory swapchain hook because the D3D12 proxy swapchain is already active");
+			return false;
+		}
+
+		auto size = ResolveSwapChainSize(a_desc);
+		if (!gameSwapChainDesc.valid) {
+			logger::warn(
+				"[DX12SwapChain] Skipping factory swapchain hook because no game swapchain candidate is available; hwnd={} size={}x{}",
+				static_cast<void*>(a_desc.OutputWindow),
+				size.width,
+				size.height);
+			return false;
+		}
+
+		if (a_desc.OutputWindow != gameSwapChainDesc.hwnd ||
+			size.width != gameSwapChainDesc.size.width ||
+			size.height != gameSwapChainDesc.size.height ||
+			!IsPlausibleGameSwapChainSize(size)) {
+			logger::info(
+				"[DX12SwapChain] Skipping non-game swapchain hwnd={} size={}x{} expectedHwnd={} expectedSize={}x{}",
+				static_cast<void*>(a_desc.OutputWindow),
+				size.width,
+				size.height,
+				static_cast<void*>(gameSwapChainDesc.hwnd),
+				gameSwapChainDesc.size.width,
+				gameSwapChainDesc.size.height);
+			return false;
+		}
+
+		return true;
+	}
+
 	winrt::com_ptr<IDXGIAdapter> ResolveAdapter(IDXGIAdapter* a_adapter, ID3D11Device* a_device)
 	{
 		winrt::com_ptr<IDXGIAdapter> result;
@@ -74,6 +186,10 @@ struct hkIDXGIFactoryCreateSwapChain
 		IDXGISwapChain** ppSwapChain)
 	{
 		if (!This || !pDevice || !pDesc || !ppSwapChain || !pDesc->Windowed) {
+			return func(This, pDevice, pDesc, ppSwapChain);
+		}
+
+		if (!IsGameSwapChainRequest(*pDesc)) {
 			return func(This, pDevice, pDesc, ppSwapChain);
 		}
 
@@ -173,6 +289,8 @@ struct hkD3D11CreateDeviceAndSwapChain
 
 		auto streamline = Streamline::GetSingleton();
 		if (pSwapChainDesc && pSwapChainDesc->Windowed && pAdapter) {
+			CaptureGameSwapChainDesc(*pSwapChainDesc);
+
 			static bool factoryHooked = false;
 			if (!factoryHooked) {
 				winrt::com_ptr<IDXGIFactory> dxgiFactory;
