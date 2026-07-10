@@ -89,6 +89,8 @@ namespace
 	winrt::com_ptr<ID3D11RenderTargetView> g_enbNativeDepthRTV;
 	std::uintptr_t g_enbTextureOriginalSRVAddress = 0;
 	std::array<std::uintptr_t, 2> g_enbPrepassDepthSRVAddresses{};
+	std::uint32_t* g_enbCompositeWidth = nullptr;
+	std::uint32_t* g_enbCompositeHeight = nullptr;
 	thread_local int g_enbNativeImageSpaceParamScopeDepth = 0;
 	thread_local int g_enbPrepassDepthBridgeScopeDepth = 0;
 	thread_local std::array<void*, 2> g_enbHDRFinalCompositeEffects{};
@@ -470,10 +472,11 @@ namespace
 			return false;
 		}
 
-		constexpr std::array<const char*, 8> features{
+		constexpr std::array<const char*, 9> features{
 			"EnablePrepass",
 			"EnableSubSurfaceScattering",
 			"EnableSSAO",
+			"EnableDetailedShadow",
 			"EnableWater",
 			"EnableReflections",
 			"EnablePuddleReflections",
@@ -985,6 +988,198 @@ float4 PSMain(VSOut input) : SV_Target
 		std::memcpy(&displacement, a_instruction + 3, sizeof(displacement));
 		return reinterpret_cast<std::uintptr_t>(a_instruction) + 7 + displacement;
 	}
+
+	std::uintptr_t ResolveENBRIPRelativeAddress(
+		const std::uint8_t* a_instruction,
+		std::size_t a_displacementOffset,
+		std::size_t a_instructionSize)
+	{
+		std::int32_t displacement = 0;
+		std::memcpy(&displacement, a_instruction + a_displacementOffset, sizeof(displacement));
+		return reinterpret_cast<std::uintptr_t>(a_instruction) + a_instructionSize + displacement;
+	}
+
+	struct ENBCodeRange
+	{
+		const std::uint8_t* begin;
+		std::size_t size;
+	};
+
+	std::optional<ENBCodeRange> GetENBExecutableCode(HMODULE a_module)
+	{
+		if (!a_module) {
+			return std::nullopt;
+		}
+
+		const auto base = reinterpret_cast<std::uintptr_t>(a_module);
+		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			return std::nullopt;
+		}
+		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) {
+			return std::nullopt;
+		}
+
+		ENBCodeRange result{};
+		const auto sections = IMAGE_FIRST_SECTION(nt);
+		for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+			const auto size = static_cast<std::size_t>(sections[i].Misc.VirtualSize);
+			if ((sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 && size > result.size) {
+				result = {
+					reinterpret_cast<const std::uint8_t*>(base + sections[i].VirtualAddress), size
+				};
+			}
+		}
+		return result.begin ? std::optional{ result } : std::nullopt;
+	}
+
+	std::uintptr_t FindENBSettingStorage(
+		HMODULE a_module,
+		const ENBCodeRange& a_code,
+		std::string_view a_setting)
+	{
+		const auto settingName = FindENBModuleString(a_module, a_setting);
+		if (!settingName) {
+			return 0;
+		}
+
+		for (std::size_t offset = 0; offset + 14 <= a_code.size; ++offset) {
+			const auto instruction = a_code.begin + offset;
+			// ENB registers booleans as: lea r9, storage; lea r8, setting name.
+			if (instruction[0] == 0x4C && instruction[1] == 0x8D && instruction[2] == 0x0D &&
+				instruction[7] == 0x4C && instruction[8] == 0x8D && instruction[9] == 0x05 &&
+				ResolveENBRIPRelativeAddress(instruction + 7) == settingName) {
+				return ResolveENBRIPRelativeAddress(instruction);
+			}
+		}
+		return 0;
+	}
+
+	bool HasENBViewportCall(const std::uint8_t* a_begin, const std::uint8_t* a_end)
+	{
+		for (auto instruction = a_begin; instruction + 7 <= a_end; ++instruction) {
+			const auto opcodeOffset = (instruction[0] & 0xF0) == 0x40 ? 1u : 0u;
+			std::int32_t vtableOffset = 0;
+			std::memcpy(&vtableOffset, instruction + opcodeOffset + 2, sizeof(vtableOffset));
+			if (instruction[opcodeOffset] == 0xFF &&
+				(instruction[opcodeOffset + 1] & 0xF8) == 0x90 && vtableOffset == 0x160) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool IsWritableProcessAddress(const void* a_address)
+	{
+		MEMORY_BASIC_INFORMATION memory{};
+		if (!a_address || VirtualQuery(a_address, &memory, sizeof(memory)) != sizeof(memory) ||
+			memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+			return false;
+		}
+
+		const auto protection = memory.Protect & 0xFF;
+		return protection == PAGE_READWRITE ||
+			protection == PAGE_WRITECOPY ||
+			protection == PAGE_EXECUTE_READWRITE ||
+			protection == PAGE_EXECUTE_WRITECOPY;
+	}
+
+	void ResolveENBCompositeResolutionGlobals()
+	{
+		if (!enbLoaded || g_enbCompositeWidth || g_enbCompositeHeight) {
+			return;
+		}
+
+		const auto module = FindENBModule();
+		const auto code = GetENBExecutableCode(module);
+		if (!code) {
+			return;
+		}
+		const auto detailedShadow = FindENBSettingStorage(module, *code, "EnableDetailedShadow");
+		if (!detailedShadow) {
+			return;
+		}
+
+		for (std::size_t offset = 0; offset + 7 <= code->size; ++offset) {
+			const auto settingRead = code->begin + offset;
+			if (settingRead[0] != 0x83 || settingRead[1] != 0x3D || settingRead[6] != 0x01 ||
+				ResolveENBRIPRelativeAddress(settingRead, 2, 7) != detailedShadow) {
+				continue;
+			}
+
+			const auto scanEnd = std::min(code->size, offset + 0x200);
+			for (std::size_t cursor = offset + 7; cursor + 13 <= scanEnd; ++cursor) {
+				const auto load = code->begin + cursor;
+				std::uintptr_t first = 0;
+				std::uintptr_t second = 0;
+				const auto twoPlainLoads = load[0] == 0x8B && load[1] == 0x15 && load[6] == 0x8B && load[7] == 0x05;
+				const auto rexSecondLoad = load[0] == 0x8B && load[1] == 0x05 &&
+					load[6] == 0x44 && load[7] == 0x8B && load[8] == 0x1D;
+				if (twoPlainLoads) {
+					first = ResolveENBRIPRelativeAddress(load, 2, 6);
+					second = ResolveENBRIPRelativeAddress(load + 6, 2, 6);
+				} else if (rexSecondLoad) {
+					first = ResolveENBRIPRelativeAddress(load, 2, 6);
+					second = ResolveENBRIPRelativeAddress(load + 6, 3, 7);
+				} else {
+					continue;
+				}
+
+				const auto lower = std::min(first, second);
+				const auto upper = std::max(first, second);
+				if (upper - lower != sizeof(std::uint32_t) ||
+					!HasENBViewportCall(load + (twoPlainLoads ? 12 : 13), code->begin + scanEnd) ||
+					!IsWritableProcessAddress(reinterpret_cast<const void*>(lower)) ||
+					!IsWritableProcessAddress(reinterpret_cast<const void*>(upper))) {
+					continue;
+				}
+
+				g_enbCompositeWidth = reinterpret_cast<std::uint32_t*>(lower);
+				g_enbCompositeHeight = reinterpret_cast<std::uint32_t*>(upper);
+				return;
+			}
+		}
+	}
+
+	class ScopedENBCompositeResolution
+	{
+	public:
+		ScopedENBCompositeResolution(bool a_active, float a_widthRatio, float a_heightRatio)
+		{
+			if (!a_active || !g_enbCompositeWidth || !g_enbCompositeHeight ||
+				a_widthRatio <= 0.0f || a_heightRatio <= 0.0f) {
+				return;
+			}
+
+			originalWidth_ = *g_enbCompositeWidth;
+			originalHeight_ = *g_enbCompositeHeight;
+			if (originalWidth_ < 64 || originalHeight_ < 64 ||
+				originalWidth_ > 16384 || originalHeight_ > 16384) {
+				return;
+			}
+
+			*g_enbCompositeWidth = std::max(1u, static_cast<std::uint32_t>(originalWidth_ * a_widthRatio));
+			*g_enbCompositeHeight = std::max(1u, static_cast<std::uint32_t>(originalHeight_ * a_heightRatio));
+			active_ = true;
+		}
+
+		~ScopedENBCompositeResolution()
+		{
+			if (active_) {
+				*g_enbCompositeWidth = originalWidth_;
+				*g_enbCompositeHeight = originalHeight_;
+			}
+		}
+
+		ScopedENBCompositeResolution(const ScopedENBCompositeResolution&) = delete;
+		ScopedENBCompositeResolution& operator=(const ScopedENBCompositeResolution&) = delete;
+
+	private:
+		std::uint32_t originalWidth_{ 0 };
+		std::uint32_t originalHeight_{ 0 };
+		bool active_{ false };
+	};
 
 	std::vector<std::uintptr_t> FindENBPrepassVariableSRVSlots(
 		std::uintptr_t a_prepass,
@@ -1967,6 +2162,10 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately
 		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
 		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
 		const bool enbCompatibilityActive = IsENBSRCompatibilityActive(upscaling->upscaleMethod);
+		const ScopedENBCompositeResolution enbResolution(
+			requiresOverride && enbCompatibilityActive,
+			originalDynamicWidthRatio,
+			originalDynamicHeightRatio);
 		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
 			func(This, a2, a3);
 			return;
@@ -2010,6 +2209,10 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately_First
 		const bool useENBProxyDomain =
 			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f) &&
 			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
+		const ScopedENBCompositeResolution enbResolution(
+			useENBProxyDomain,
+			renderTargetManager->dynamicWidthRatio,
+			renderTargetManager->dynamicHeightRatio);
 
 		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
 			func(This, a2, a3);
@@ -2211,6 +2414,7 @@ void Upscaling::InstallHooks()
 	// Fix dynamic resolution after upscaling
 	stl::detour_thunk<DrawWorld_Imagespace>(REL::ID{ 587723, 2318322 });
 	if (isOG && enbLoaded) {
+		ResolveENBCompositeResolutionGlobals();
 		ResolveENBPrepassResourceSlots();
 	}
 }
