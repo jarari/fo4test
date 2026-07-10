@@ -7,8 +7,6 @@
 #include "Streamline.h"
 #include "Upscaling.h"
 
-extern bool enbLoaded;
-
 namespace
 {
 	using CreateSwapChain_t = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
@@ -328,8 +326,7 @@ struct hkD3D11CreateDeviceAndSwapChain
 		}
 
 		if (streamline->interposer && !streamline->UsesD3D12()){
-			if (!enbLoaded)
-				streamline->slUpgradeInterface((void**)&(*ppSwapChain));
+			streamline->slUpgradeInterface((void**)&(*ppSwapChain));
 			streamline->slSetD3DDevice(*ppDevice);
 
 			streamline->SetSwapChain(*ppSwapChain);

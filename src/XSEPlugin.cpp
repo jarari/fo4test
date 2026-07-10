@@ -83,6 +83,9 @@ void AddDebugInformation()
 void OnInit(F4SE::MessagingInterface::Message* a_msg)
 {
 	switch (a_msg->type) {
+	case F4SE::MessagingInterface::kPostPostLoad:
+		Upscaling::InstallHighFPSPhysicsFixCompatibility();
+		break;
 	case F4SE::MessagingInterface::kGameDataReady:
 	{
 		logger::info("Data loaded");

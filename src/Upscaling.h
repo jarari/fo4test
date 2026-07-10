@@ -54,6 +54,7 @@ public:
 	 * game systems to integrate upscaling functionality
 	 */
 	static void InstallHooks();
+	static void InstallHighFPSPhysicsFixCompatibility();
 
 	// ========================================
 	// Settings & Configuration
@@ -199,14 +200,19 @@ public:
 	 * during main rendering pass
 	 */
 	void OverrideRenderTargets(std::initializer_list<int> a_indicesToCopy = {});
+	void OverrideRenderTargetsSelective(std::initializer_list<int> a_targetIndices, std::initializer_list<int> a_indicesToCopy = {});
 
 	/**
 	 * @brief Restore original render targets
 	 * @param a_indicesToCopy Optional array of render target indices that require expensive copy. Empty = copy all.
+	 * @param a_copyAllWhenEmpty Set false to restore pointers and metadata without copying proxy contents.
 	 *
 	 * Restores full resolution render targets after scaled rendering is complete
 	 */
-	void ResetRenderTargets(std::initializer_list<int> a_indicesToCopy = {});
+	void ResetRenderTargets(
+		std::initializer_list<int> a_indicesToCopy = {},
+		bool a_copyAllWhenEmpty = true);
+	void ResetRenderTargetsSelective(std::initializer_list<int> a_targetIndices, std::initializer_list<int> a_indicesToCopy = {});
 
 	/**
 	 * @brief Update a single render target

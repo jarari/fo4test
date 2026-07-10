@@ -1,14 +1,19 @@
 #include "Upscaling.h"
 
 #include <algorithm>
-#include <chrono>
+#include <array>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <d3dcompiler.h>
 #include <limits>
+#include <optional>
 #include <SimpleIni.h>
+#include <vector>
 
 #include "DX12SwapChain.h"
+#include "ENB/ENBSeriesAPI.h"
 
 extern bool enbLoaded;
 
@@ -49,8 +54,9 @@ struct Interface3D_Renderer_Create
 		auto renderer = func(a_name, a_depth, a_fov, a_alwaysRenderWhenEnabled);
 		if (renderer &&
 			Upscaling::GetSingleton()->upscaleMethod != Upscaling::UpscaleMethod::kDisabled &&
-			a_name == "WorkbenchItem3D") {
+			(a_name == "WorkbenchItem3D" || a_name == "Container3D")) {
 			renderer->postAA = true;
+			renderer->useFullPremultAlpha = true;
 		}
 		return renderer;
 	}
@@ -66,12 +72,467 @@ namespace
 	constexpr uint32_t kDLSSGResumeStableFrames = 2;
 	constexpr uint64_t kFeatureRetryGameFrames = 200;
 	constexpr uint64_t kTextureMemoryUpgradeReserveBytes = 512ull * 1024ull * 1024ull;
-	constexpr std::ptrdiff_t kServingThreadStateOffset = 0x68;
-	constexpr auto kLoadingScreenPumpInterval = std::chrono::milliseconds(250);
 	FILETIME g_lastSettingsWriteTime{};
 	bool g_hasLastSettingsWriteTime = false;
 	bool g_lastSettingsFileExists = false;
 	bool g_textureMemoryReserveApplied = false;
+	winrt::com_ptr<ID3D11VertexShader> g_enbScaleCopyVS;
+	winrt::com_ptr<ID3D11PixelShader> g_enbScaleCopyPS;
+	winrt::com_ptr<ID3D11SamplerState> g_enbScaleCopySampler;
+	winrt::com_ptr<ID3D11BlendState> g_enbScaleCopyBlendState;
+	winrt::com_ptr<ID3D11DepthStencilState> g_enbScaleCopyDepthStencilState;
+	winrt::com_ptr<ID3D11RasterizerState> g_enbScaleCopyRasterizerState;
+	winrt::com_ptr<ID3D11Texture2D> g_enbSRInputRenderRect;
+	winrt::com_ptr<ID3D11RenderTargetView> g_enbSRInputRenderRectRTV;
+	winrt::com_ptr<ID3D11Texture2D> g_enbNativeDepth;
+	winrt::com_ptr<ID3D11ShaderResourceView> g_enbNativeDepthSRV;
+	winrt::com_ptr<ID3D11RenderTargetView> g_enbNativeDepthRTV;
+	std::uintptr_t g_enbTextureOriginalSRVAddress = 0;
+	std::array<std::uintptr_t, 2> g_enbPrepassDepthSRVAddresses{};
+	thread_local int g_enbNativeImageSpaceParamScopeDepth = 0;
+	thread_local int g_enbPrepassDepthBridgeScopeDepth = 0;
+	thread_local std::array<void*, 2> g_enbHDRFinalCompositeEffects{};
+	thread_local void* g_enbRefractionCompositeEffect = nullptr;
+	thread_local std::array<void*, 0x20> g_enbNativePauseBlurShaders{};
+	thread_local std::size_t g_enbNativePauseBlurShaderCount = 0;
+
+	constexpr std::ptrdiff_t kImageSpaceEffectUseDynamicResolutionOffset = 0xA8;
+	constexpr std::ptrdiff_t kImageSpaceEffectListOffset = 0x18;
+	constexpr std::ptrdiff_t kImageSpaceEffectCountOffset = 0x22;
+	constexpr std::ptrdiff_t kImageSpaceManagerNativeGeometryOffset = 0x28;
+	constexpr std::ptrdiff_t kServingThreadStateOffset = 0x68;
+	constexpr std::ptrdiff_t kHFPFDisableLoadingAnimationPatchOffset = 0x19D;
+	constexpr std::array<std::uint8_t, 4> kHFPFDisableLoadingAnimationPatch{ 0x0F, 0x1F, 0x40, 0x00 };
+
+	class ScopedENBNativeImageSpaceParams
+	{
+	public:
+		ScopedENBNativeImageSpaceParams()
+		{
+			++g_enbNativeImageSpaceParamScopeDepth;
+		}
+
+		~ScopedENBNativeImageSpaceParams()
+		{
+			--g_enbNativeImageSpaceParamScopeDepth;
+		}
+
+		ScopedENBNativeImageSpaceParams(const ScopedENBNativeImageSpaceParams&) = delete;
+		ScopedENBNativeImageSpaceParams& operator=(const ScopedENBNativeImageSpaceParams&) = delete;
+	};
+
+	class ScopedENBPrepassDepthBridgeActivation
+	{
+	public:
+		explicit ScopedENBPrepassDepthBridgeActivation(bool a_active) :
+			active_(a_active)
+		{
+			if (active_) {
+				++g_enbPrepassDepthBridgeScopeDepth;
+			}
+		}
+
+		~ScopedENBPrepassDepthBridgeActivation()
+		{
+			if (active_) {
+				--g_enbPrepassDepthBridgeScopeDepth;
+			}
+		}
+
+		ScopedENBPrepassDepthBridgeActivation(const ScopedENBPrepassDepthBridgeActivation&) = delete;
+		ScopedENBPrepassDepthBridgeActivation& operator=(const ScopedENBPrepassDepthBridgeActivation&) = delete;
+
+	private:
+		bool active_{ false };
+	};
+
+	bool ShouldForceENBNativeImageSpaceParams(int32_t a_effectIndex)
+	{
+		return g_enbNativeImageSpaceParamScopeDepth > 0 &&
+			(a_effectIndex == 3 || a_effectIndex == 8 || a_effectIndex == 9 || a_effectIndex == 15);
+	}
+
+	struct JobListManager_ServingThread_DisplayLoadingScreen
+	{
+		static void thunk(void* a_this)
+		{
+			func(a_this);
+			if (!DX12SwapChain::GetSingleton()->IsReady()) {
+				return;
+			}
+
+			auto* state = reinterpret_cast<volatile std::int32_t*>(
+				reinterpret_cast<std::byte*>(a_this) + kServingThreadStateOffset);
+			while (*state == 2) {
+				Sleep(250);
+				if (*state != 2) {
+					break;
+				}
+				try {
+					func(a_this);
+				} catch (const std::exception& e) {
+					logger::error("[Upscaling] Loading-screen renderer repump aborted: {}", e.what());
+					break;
+				} catch (...) {
+					logger::error("[Upscaling] Loading-screen renderer repump aborted by an unknown exception");
+					break;
+				}
+			}
+		}
+
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+
+	bool HasHFPFDisableLoadingAnimationPatch(std::uintptr_t a_displayLoadingScreen)
+	{
+		std::array<std::uint8_t, kHFPFDisableLoadingAnimationPatch.size()> bytes{};
+		std::memcpy(
+			bytes.data(),
+			reinterpret_cast<const void*>(a_displayLoadingScreen + kHFPFDisableLoadingAnimationPatchOffset),
+			bytes.size());
+		return bytes == kHFPFDisableLoadingAnimationPatch;
+	}
+
+	class ScopedImageSpaceEffectNativeParams
+	{
+	public:
+		ScopedImageSpaceEffectNativeParams(void* a_effect, int32_t a_effectIndex)
+		{
+			if (!a_effect || !ShouldForceENBNativeImageSpaceParams(a_effectIndex)) {
+				return;
+			}
+
+			useDynamicResolution_ = reinterpret_cast<std::uint8_t*>(
+				reinterpret_cast<std::byte*>(a_effect) + kImageSpaceEffectUseDynamicResolutionOffset);
+			originalUseDynamicResolution_ = *useDynamicResolution_;
+			*useDynamicResolution_ = 0;
+		}
+
+		~ScopedImageSpaceEffectNativeParams()
+		{
+			if (useDynamicResolution_) {
+				*useDynamicResolution_ = originalUseDynamicResolution_;
+			}
+		}
+
+		ScopedImageSpaceEffectNativeParams(const ScopedImageSpaceEffectNativeParams&) = delete;
+		ScopedImageSpaceEffectNativeParams& operator=(const ScopedImageSpaceEffectNativeParams&) = delete;
+
+	private:
+		std::uint8_t* useDynamicResolution_{ nullptr };
+		std::uint8_t originalUseDynamicResolution_{ 0 };
+	};
+
+	class ScopedENBHDRFinalCompositeEffects
+	{
+	public:
+		ScopedENBHDRFinalCompositeEffects(void* a_effect, int32_t a_effectIndex) :
+			previousEffects_(g_enbHDRFinalCompositeEffects)
+		{
+			if (!a_effect || g_enbNativeImageSpaceParamScopeDepth <= 0 || a_effectIndex != 3) {
+				return;
+			}
+
+			// ImageSpaceEffectHDR owns its final tonemap variants in child slots 2
+			// and 3. The engine selects one immediately before the final dispatch.
+			const auto childEffects = *reinterpret_cast<void***>(
+				reinterpret_cast<std::byte*>(a_effect) + 0x18);
+			if (!childEffects) {
+				return;
+			}
+
+			g_enbHDRFinalCompositeEffects = { childEffects[2], childEffects[3] };
+			active_ = true;
+		}
+
+		~ScopedENBHDRFinalCompositeEffects()
+		{
+			if (active_) {
+				g_enbHDRFinalCompositeEffects = previousEffects_;
+			}
+		}
+
+		ScopedENBHDRFinalCompositeEffects(const ScopedENBHDRFinalCompositeEffects&) = delete;
+		ScopedENBHDRFinalCompositeEffects& operator=(const ScopedENBHDRFinalCompositeEffects&) = delete;
+
+	private:
+		std::array<void*, 2> previousEffects_{};
+		bool active_{ false };
+	};
+
+	bool IsENBHDRFinalCompositeEffect(const void* a_effect)
+	{
+		return a_effect &&
+			(a_effect == g_enbHDRFinalCompositeEffects[0] ||
+				a_effect == g_enbHDRFinalCompositeEffects[1]);
+	}
+
+	class ScopedENBNativePauseBlurShaders
+	{
+	public:
+		ScopedENBNativePauseBlurShaders(void* a_effect, int32_t a_effectIndex) :
+			previousShaders_(g_enbNativePauseBlurShaders),
+			previousCount_(g_enbNativePauseBlurShaderCount)
+		{
+			if (!a_effect || g_enbNativeImageSpaceParamScopeDepth <= 0 ||
+				(a_effectIndex != 8 && a_effectIndex != 9)) {
+				return;
+			}
+
+			const auto effectCount = *reinterpret_cast<const uint16_t*>(
+				reinterpret_cast<const std::byte*>(a_effect) + kImageSpaceEffectCountOffset);
+			const auto effectList = *reinterpret_cast<void***>(
+				reinterpret_cast<std::byte*>(a_effect) + kImageSpaceEffectListOffset);
+			if (effectCount == 0 || !effectList) {
+				return;
+			}
+
+			g_enbNativePauseBlurShaders.fill(nullptr);
+			g_enbNativePauseBlurShaderCount = std::min<std::size_t>(
+				effectCount,
+				g_enbNativePauseBlurShaders.size());
+			std::copy_n(
+				effectList,
+				g_enbNativePauseBlurShaderCount,
+				g_enbNativePauseBlurShaders.begin());
+			active_ = true;
+		}
+
+		~ScopedENBNativePauseBlurShaders()
+		{
+			if (active_) {
+				g_enbNativePauseBlurShaders = previousShaders_;
+				g_enbNativePauseBlurShaderCount = previousCount_;
+			}
+		}
+
+		ScopedENBNativePauseBlurShaders(const ScopedENBNativePauseBlurShaders&) = delete;
+		ScopedENBNativePauseBlurShaders& operator=(const ScopedENBNativePauseBlurShaders&) = delete;
+
+	private:
+		std::array<void*, 0x20> previousShaders_{};
+		std::size_t previousCount_{ 0 };
+		bool active_{ false };
+	};
+
+	bool IsENBNativePauseBlurShader(const void* a_shader)
+	{
+		return a_shader && std::find(
+			g_enbNativePauseBlurShaders.begin(),
+			g_enbNativePauseBlurShaders.begin() + g_enbNativePauseBlurShaderCount,
+			a_shader) != g_enbNativePauseBlurShaders.begin() + g_enbNativePauseBlurShaderCount;
+	}
+
+	class ScopedENBRefractionCompositeEffect
+	{
+	public:
+		ScopedENBRefractionCompositeEffect(void* a_effect, int32_t a_effectIndex) :
+			previousEffect_(g_enbRefractionCompositeEffect)
+		{
+			if (!a_effect || g_enbNativeImageSpaceParamScopeDepth <= 0 || a_effectIndex != 5) {
+				return;
+			}
+
+			const auto effectCount = *reinterpret_cast<const uint16_t*>(
+				reinterpret_cast<const std::byte*>(a_effect) + kImageSpaceEffectCountOffset);
+			const auto effectList = *reinterpret_cast<void***>(
+				reinterpret_cast<std::byte*>(a_effect) + kImageSpaceEffectListOffset);
+			if (effectCount == 0 || !effectList || !effectList[0]) {
+				return;
+			}
+
+			g_enbRefractionCompositeEffect = effectList[0];
+			active_ = true;
+		}
+
+		~ScopedENBRefractionCompositeEffect()
+		{
+			if (active_) {
+				g_enbRefractionCompositeEffect = previousEffect_;
+			}
+		}
+
+		ScopedENBRefractionCompositeEffect(const ScopedENBRefractionCompositeEffect&) = delete;
+		ScopedENBRefractionCompositeEffect& operator=(const ScopedENBRefractionCompositeEffect&) = delete;
+
+	private:
+		void* previousEffect_{ nullptr };
+		bool active_{ false };
+	};
+
+	class ScopedBSImagespaceShaderNativeParams
+	{
+	public:
+		explicit ScopedBSImagespaceShaderNativeParams(void* a_shader)
+		{
+			if (!a_shader) {
+				return;
+			}
+
+			useDynamicResolution_ = reinterpret_cast<uint8_t*>(
+				reinterpret_cast<std::byte*>(a_shader) + kImageSpaceEffectUseDynamicResolutionOffset);
+			originalUseDynamicResolution_ = *useDynamicResolution_;
+			*useDynamicResolution_ = 0;
+		}
+
+		~ScopedBSImagespaceShaderNativeParams()
+		{
+			if (useDynamicResolution_) {
+				*useDynamicResolution_ = originalUseDynamicResolution_;
+			}
+		}
+
+		ScopedBSImagespaceShaderNativeParams(const ScopedBSImagespaceShaderNativeParams&) = delete;
+		ScopedBSImagespaceShaderNativeParams& operator=(const ScopedBSImagespaceShaderNativeParams&) = delete;
+
+	private:
+		uint8_t* useDynamicResolution_{ nullptr };
+		uint8_t originalUseDynamicResolution_{ 0 };
+	};
+
+	void* GetNativeImageSpaceGeometry()
+	{
+		auto* imageSpaceManager = RE::ImageSpaceManager::GetSingleton();
+		if (!imageSpaceManager) {
+			return nullptr;
+		}
+
+		return *reinterpret_cast<void**>(
+			reinterpret_cast<std::byte*>(imageSpaceManager) + kImageSpaceManagerNativeGeometryOffset);
+	}
+
+	uint32_t GetRenderPassFlags(const RE::BSRenderPass* a_renderPass)
+	{
+		if (!a_renderPass) {
+			return 0;
+		}
+
+		return *reinterpret_cast<const uint32_t*>(reinterpret_cast<const std::byte*>(a_renderPass) + 0x48);
+	}
+
+	HMODULE FindENBModule()
+	{
+		static HMODULE cached = nullptr;
+		if (cached) {
+			return cached;
+		}
+
+		DWORD cbNeeded = 0;
+		std::array<HMODULE, 1000> modules{};
+		if (!EnumProcessModules(
+				GetCurrentProcess(),
+				modules.data(),
+				static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
+				&cbNeeded)) {
+			return nullptr;
+		}
+
+		const auto count = std::min<std::size_t>(modules.size(), cbNeeded / sizeof(HMODULE));
+		for (std::size_t i = 0; i < count; ++i) {
+			if (modules[i] && GetProcAddress(modules[i], "ENBGetSDKVersion")) {
+				cached = modules[i];
+				break;
+			}
+		}
+		return cached;
+	}
+
+	std::optional<bool> TryGetENBBool(const char* a_category, const char* a_key)
+	{
+		if (!enbLoaded) {
+			return std::nullopt;
+		}
+
+		const auto enbModule = FindENBModule();
+		if (!enbModule) {
+			return std::nullopt;
+		}
+
+		const auto getParameter = reinterpret_cast<ENB_SDK::_ENBGetParameterA>(GetProcAddress(enbModule, "ENBGetParameter"));
+		if (!getParameter) {
+			return std::nullopt;
+		}
+
+		ENB_SDK::ENBParameter param{};
+		const bool found =
+			getParameter("enbseries.ini", a_category, a_key, &param) ||
+			getParameter(nullptr, a_category, a_key, &param);
+		if (!found || param.Type != ENB_SDK::ENBParameterType::ENBParam_BOOL || param.Size < sizeof(BOOL)) {
+			return std::nullopt;
+		}
+
+		return *reinterpret_cast<BOOL*>(param.Data) != FALSE;
+	}
+
+	bool IsENBCompositeFeatureActive()
+	{
+		if (!TryGetENBBool("GLOBAL", "UseEffect").value_or(false)) {
+			return false;
+		}
+
+		constexpr std::array<const char*, 8> features{
+			"EnablePrepass",
+			"EnableSubSurfaceScattering",
+			"EnableSSAO",
+			"EnableWater",
+			"EnableReflections",
+			"EnablePuddleReflections",
+			"EnableDepthOfField",
+			"EnableBloom"
+		};
+
+		for (const auto* feature : features) {
+			if (TryGetENBBool("EFFECT", feature).value_or(false)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	bool IsTemporalSuperResolutionMethod(Upscaling::UpscaleMethod a_upscaleMethod)
+	{
+		return a_upscaleMethod == Upscaling::UpscaleMethod::kDLSS ||
+			a_upscaleMethod == Upscaling::UpscaleMethod::kFSR;
+	}
+
+	bool IsENBUseEffectActive()
+	{
+		return enbLoaded && TryGetENBBool("GLOBAL", "UseEffect").value_or(false);
+	}
+
+	bool ShouldBypassDynamicResolutionHooksForInactiveENB()
+	{
+		const auto useEffect = TryGetENBBool("GLOBAL", "UseEffect");
+		return enbLoaded && useEffect.has_value() && !*useEffect;
+	}
+
+	bool IsENBSRCompatibilityActive(Upscaling::UpscaleMethod a_upscaleMethod)
+	{
+		return IsENBUseEffectActive() &&
+			IsTemporalSuperResolutionMethod(a_upscaleMethod);
+	}
+
+	bool ShouldLeaveENBDeferredCompositeFeaturePassNative(RE::BSRenderPass* a_renderPass, Upscaling::UpscaleMethod a_upscaleMethod)
+	{
+		if (!IsENBUseEffectActive() ||
+			!IsTemporalSuperResolutionMethod(a_upscaleMethod) ||
+			!IsENBCompositeFeatureActive()) {
+			return false;
+		}
+
+		constexpr uint32_t kBSDFCompositeEnvmap = 1u << 5;
+		constexpr uint32_t kBSDFCompositeDecal = 1u << 8;
+		constexpr uint32_t kBSDFCompositeSSLR = 1u << 11;
+		const auto flags = GetRenderPassFlags(a_renderPass);
+		// ENB's feature composite pass is view/content dependent. It appears as
+		// Envmap|Decal|SSLR with Tilelight only when tiled lighting is active.
+		constexpr uint32_t kENBHalfResFeaturePass =
+			kBSDFCompositeEnvmap |
+			kBSDFCompositeDecal |
+			kBSDFCompositeSSLR;
+		return (flags & kENBHalfResFeaturePass) == kENBHalfResFeaturePass;
+	}
 
 	bool TryGetSettingsWriteTime(FILETIME& a_writeTime)
 	{
@@ -119,73 +580,6 @@ namespace
 		return ratio.get();
 	}
 
-	bool GetIniBoolAnySection(CSimpleIniA& a_ini, const char* a_key, bool a_default)
-	{
-		CSimpleIniA::TNamesDepend sections;
-		a_ini.GetAllSections(sections);
-		for (const auto& section : sections) {
-			if (a_ini.GetBoolValue(section.pItem, a_key, a_default) != a_default) {
-				return !a_default;
-			}
-		}
-
-		return a_ini.GetBoolValue(nullptr, a_key, a_default);
-	}
-
-	bool ShouldInstallHighFPSPhysicsFixLoadingScreenCompat()
-	{
-		const bool moduleLoaded = GetModuleHandleW(L"HighFPSPhysicsFix.dll") != nullptr;
-		const bool dllExists = GetFileAttributesW(L"Data\\F4SE\\Plugins\\HighFPSPhysicsFix.dll") != INVALID_FILE_ATTRIBUTES;
-		if (!moduleLoaded && !dllExists) {
-			return false;
-		}
-
-		CSimpleIniA ini;
-		ini.SetUnicode();
-		if (ini.LoadFile("Data\\F4SE\\Plugins\\HighFPSPhysicsFix.ini") < 0) {
-			logger::warn("[Upscaling] HighFPSPhysicsFix.dll detected, but HighFPSPhysicsFix.ini could not be read");
-			return false;
-		}
-
-		const bool enabled = GetIniBoolAnySection(ini, "DisableAnimationOnLoadingScreens", false);
-		if (enabled) {
-			logger::info("[Upscaling] HighFPSPhysicsFix loading screen animation patch detected; installing safe loading-screen detour");
-		}
-		return enabled;
-	}
-
-	struct JobListManager_ServingThread_DisplayLoadingScreen
-	{
-		static void thunk(void* a_this)
-		{
-			if (!a_this) {
-				return;
-			}
-
-			// HFPF's inner patch turns the original function into a one-shot
-			// loading-screen pump. Keep that first pump so Scaleform/UI render
-			// state is initialized, then preserve the vanilla wait contract.
-			func(a_this);
-
-			auto* state = reinterpret_cast<volatile std::uint32_t*>(
-				reinterpret_cast<std::byte*>(a_this) + kServingThreadStateOffset);
-			auto nextPump = std::chrono::steady_clock::now() + kLoadingScreenPumpInterval;
-			while (*state == 2) {
-				const auto now = std::chrono::steady_clock::now();
-				if (now >= nextPump) {
-					func(a_this);
-					nextPump = now + kLoadingScreenPumpInterval;
-				} else if (nextPump - now > std::chrono::milliseconds(1)) {
-					Sleep(1);
-				} else {
-					SwitchToThread();
-				}
-			}
-		}
-
-		static inline void (*func)(void*);
-	};
-
 	float* GetGlobalDynamicHeightRatio()
 	{
 		static REL::Relocation<float*> ratio{
@@ -205,6 +599,769 @@ namespace
 
 		*GetGlobalDynamicWidthRatio() = a_widthRatio;
 		*GetGlobalDynamicHeightRatio() = a_heightRatio;
+	}
+
+	void ApplyCurrentViewportDefault(RE::BSGraphics::RenderTargetManager* a_renderTargetManager)
+	{
+		using SetCurrentViewportDefault_t = void (*)(RE::BSGraphics::RenderTargetManager*);
+		static REL::Relocation<SetCurrentViewportDefault_t> setCurrentViewportDefault{ REL::ID{ 158420, 2277192 } };
+		setCurrentViewportDefault(a_renderTargetManager);
+	}
+
+	void ApplyFullFrameViewport()
+	{
+		static auto rendererData = RE::BSGraphics::GetRendererData();
+		static auto gameViewport = Util::State_GetSingleton();
+		if (!rendererData || !rendererData->context || !gameViewport) {
+			return;
+		}
+
+		gameViewport->frameBufferViewport = {
+			0.0f,
+			static_cast<float>(gameViewport->screenWidth),
+			0.0f,
+			static_cast<float>(gameViewport->screenHeight)
+		};
+
+		D3D11_VIEWPORT viewport{};
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = static_cast<float>(gameViewport->screenWidth);
+		viewport.Height = static_cast<float>(gameViewport->screenHeight);
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		reinterpret_cast<ID3D11DeviceContext*>(rendererData->context)->RSSetViewports(1, &viewport);
+	}
+
+	bool EnsureENBScaleCopyResources(ID3D11Device* a_device)
+	{
+		if (!a_device) {
+			return false;
+		}
+		if (g_enbScaleCopyVS && g_enbScaleCopyPS && g_enbScaleCopySampler &&
+			g_enbScaleCopyBlendState && g_enbScaleCopyDepthStencilState && g_enbScaleCopyRasterizerState) {
+			return true;
+		}
+
+		constexpr const char* shaderSource = R"(
+Texture2D sourceTexture : register(t0);
+SamplerState sourceSampler : register(s0);
+
+struct VSOut
+{
+	float4 position : SV_Position;
+	float2 uv : TEXCOORD0;
+};
+
+VSOut VSMain(uint vertexID : SV_VertexID)
+{
+	float2 positions[3] = {
+		float2(-1.0,  1.0),
+		float2( 3.0,  1.0),
+		float2(-1.0, -3.0)
+	};
+	float2 uvs[3] = {
+		float2(0.0, 0.0),
+		float2(2.0, 0.0),
+		float2(0.0, 2.0)
+	};
+
+	VSOut output;
+	output.position = float4(positions[vertexID], 0.0, 1.0);
+	output.uv = uvs[vertexID];
+	return output;
+}
+
+float4 PSMain(VSOut input) : SV_Target
+{
+	return sourceTexture.SampleLevel(sourceSampler, input.uv, 0.0);
+}
+)";
+
+		winrt::com_ptr<ID3DBlob> vertexShaderBlob;
+		winrt::com_ptr<ID3DBlob> pixelShaderBlob;
+		winrt::com_ptr<ID3DBlob> errors;
+		const auto compileFlags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+		auto hr = D3DCompile(
+			shaderSource,
+			std::strlen(shaderSource),
+			"ENBScaleCopy",
+			nullptr,
+			nullptr,
+			"VSMain",
+			"vs_5_0",
+			compileFlags,
+			0,
+			vertexShaderBlob.put(),
+			errors.put());
+		if (FAILED(hr)) {
+			logger::warn("[Upscaling] Failed to compile ENB scale-copy VS: {}", errors ? static_cast<char*>(errors->GetBufferPointer()) : "unknown error");
+			return false;
+		}
+
+		errors = nullptr;
+		hr = D3DCompile(
+			shaderSource,
+			std::strlen(shaderSource),
+			"ENBScaleCopy",
+			nullptr,
+			nullptr,
+			"PSMain",
+			"ps_5_0",
+			compileFlags,
+			0,
+			pixelShaderBlob.put(),
+			errors.put());
+		if (FAILED(hr)) {
+			logger::warn("[Upscaling] Failed to compile ENB scale-copy PS: {}", errors ? static_cast<char*>(errors->GetBufferPointer()) : "unknown error");
+			return false;
+		}
+
+		if (FAILED(a_device->CreateVertexShader(vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize(), nullptr, g_enbScaleCopyVS.put())) ||
+			FAILED(a_device->CreatePixelShader(pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize(), nullptr, g_enbScaleCopyPS.put()))) {
+			logger::warn("[Upscaling] Failed to create ENB scale-copy shaders");
+			return false;
+		}
+
+		D3D11_SAMPLER_DESC samplerDesc{};
+		samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+		samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+		samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+		if (FAILED(a_device->CreateSamplerState(&samplerDesc, g_enbScaleCopySampler.put()))) {
+			logger::warn("[Upscaling] Failed to create ENB scale-copy sampler");
+			return false;
+		}
+
+		D3D11_BLEND_DESC blendDesc{};
+		blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+		if (FAILED(a_device->CreateBlendState(&blendDesc, g_enbScaleCopyBlendState.put()))) {
+			logger::warn("[Upscaling] Failed to create ENB scale-copy blend state");
+			return false;
+		}
+
+		D3D11_DEPTH_STENCIL_DESC depthDesc{};
+		depthDesc.DepthEnable = FALSE;
+		depthDesc.StencilEnable = FALSE;
+		if (FAILED(a_device->CreateDepthStencilState(&depthDesc, g_enbScaleCopyDepthStencilState.put()))) {
+			logger::warn("[Upscaling] Failed to create ENB scale-copy depth state");
+			return false;
+		}
+
+		D3D11_RASTERIZER_DESC rasterizerDesc{};
+		rasterizerDesc.FillMode = D3D11_FILL_SOLID;
+		rasterizerDesc.CullMode = D3D11_CULL_NONE;
+		rasterizerDesc.DepthClipEnable = TRUE;
+		if (FAILED(a_device->CreateRasterizerState(&rasterizerDesc, g_enbScaleCopyRasterizerState.put()))) {
+			logger::warn("[Upscaling] Failed to create ENB scale-copy rasterizer state");
+			return false;
+		}
+
+		return true;
+	}
+
+	bool ScaleCopyRenderTarget(
+		ID3D11Device* a_device,
+		ID3D11DeviceContext* a_context,
+		ID3D11ShaderResourceView* a_sourceSRV,
+		ID3D11RenderTargetView* a_destinationRTV,
+		ID3D11Texture2D* a_destinationTexture)
+	{
+		if (!EnsureENBScaleCopyResources(a_device)) {
+			return false;
+		}
+
+		if (!a_context || !a_sourceSRV || !a_destinationRTV || !a_destinationTexture) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC destinationDesc{};
+		a_destinationTexture->GetDesc(&destinationDesc);
+		if (destinationDesc.Width == 0 || destinationDesc.Height == 0) {
+			return false;
+		}
+
+		winrt::com_ptr<ID3D11VertexShader> savedVS;
+		winrt::com_ptr<ID3D11PixelShader> savedPS;
+		winrt::com_ptr<ID3D11GeometryShader> savedGS;
+		winrt::com_ptr<ID3D11HullShader> savedHS;
+		winrt::com_ptr<ID3D11DomainShader> savedDS;
+		a_context->VSGetShader(savedVS.put(), nullptr, nullptr);
+		a_context->PSGetShader(savedPS.put(), nullptr, nullptr);
+		a_context->GSGetShader(savedGS.put(), nullptr, nullptr);
+		a_context->HSGetShader(savedHS.put(), nullptr, nullptr);
+		a_context->DSGetShader(savedDS.put(), nullptr, nullptr);
+
+		winrt::com_ptr<ID3D11InputLayout> savedInputLayout;
+		D3D11_PRIMITIVE_TOPOLOGY savedTopology{};
+		a_context->IAGetInputLayout(savedInputLayout.put());
+		a_context->IAGetPrimitiveTopology(&savedTopology);
+
+		winrt::com_ptr<ID3D11SamplerState> savedSampler;
+		winrt::com_ptr<ID3D11ShaderResourceView> savedSRV;
+		a_context->PSGetSamplers(0, 1, savedSampler.put());
+		a_context->PSGetShaderResources(0, 1, savedSRV.put());
+
+		ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+		ID3D11DepthStencilView* savedDSV = nullptr;
+		a_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
+
+		winrt::com_ptr<ID3D11BlendState> savedBlendState;
+		float savedBlendFactor[4]{};
+		UINT savedSampleMask = 0;
+		a_context->OMGetBlendState(savedBlendState.put(), savedBlendFactor, &savedSampleMask);
+
+		winrt::com_ptr<ID3D11DepthStencilState> savedDepthStencilState;
+		UINT savedStencilRef = 0;
+		a_context->OMGetDepthStencilState(savedDepthStencilState.put(), &savedStencilRef);
+
+		winrt::com_ptr<ID3D11RasterizerState> savedRasterizerState;
+		a_context->RSGetState(savedRasterizerState.put());
+
+		UINT savedViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+		D3D11_VIEWPORT savedViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
+		a_context->RSGetViewports(&savedViewportCount, savedViewports);
+
+		ID3D11ShaderResourceView* nullSRV = nullptr;
+		a_context->PSSetShaderResources(0, 1, &nullSRV);
+		a_context->OMSetRenderTargets(1, &a_destinationRTV, nullptr);
+
+		D3D11_VIEWPORT viewport{};
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = static_cast<float>(destinationDesc.Width);
+		viewport.Height = static_cast<float>(destinationDesc.Height);
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		a_context->RSSetViewports(1, &viewport);
+
+		const float blendFactor[4]{};
+		a_context->OMSetBlendState(g_enbScaleCopyBlendState.get(), blendFactor, 0xffffffff);
+		a_context->OMSetDepthStencilState(g_enbScaleCopyDepthStencilState.get(), 0);
+		a_context->RSSetState(g_enbScaleCopyRasterizerState.get());
+		a_context->IASetInputLayout(nullptr);
+		a_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		a_context->VSSetShader(g_enbScaleCopyVS.get(), nullptr, 0);
+		a_context->PSSetShader(g_enbScaleCopyPS.get(), nullptr, 0);
+		a_context->GSSetShader(nullptr, nullptr, 0);
+		a_context->HSSetShader(nullptr, nullptr, 0);
+		a_context->DSSetShader(nullptr, nullptr, 0);
+		ID3D11SamplerState* scaleCopySampler = g_enbScaleCopySampler.get();
+		a_context->PSSetSamplers(0, 1, &scaleCopySampler);
+		a_context->PSSetShaderResources(0, 1, &a_sourceSRV);
+		a_context->Draw(3, 0);
+
+		a_context->PSSetShaderResources(0, 1, &nullSRV);
+		a_context->VSSetShader(savedVS.get(), nullptr, 0);
+		a_context->PSSetShader(savedPS.get(), nullptr, 0);
+		a_context->GSSetShader(savedGS.get(), nullptr, 0);
+		a_context->HSSetShader(savedHS.get(), nullptr, 0);
+		a_context->DSSetShader(savedDS.get(), nullptr, 0);
+		a_context->IASetInputLayout(savedInputLayout.get());
+		a_context->IASetPrimitiveTopology(savedTopology);
+		ID3D11SamplerState* restoreSampler = savedSampler.get();
+		ID3D11ShaderResourceView* restoreSRV = savedSRV.get();
+		a_context->PSSetSamplers(0, 1, &restoreSampler);
+		a_context->PSSetShaderResources(0, 1, &restoreSRV);
+		a_context->OMSetBlendState(savedBlendState.get(), savedBlendFactor, savedSampleMask);
+		a_context->OMSetDepthStencilState(savedDepthStencilState.get(), savedStencilRef);
+		a_context->RSSetState(savedRasterizerState.get());
+		if (savedViewportCount > 0) {
+			a_context->RSSetViewports(savedViewportCount, savedViewports);
+		}
+		a_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
+
+		for (auto* rtv : savedRTVs) {
+			if (rtv) {
+				rtv->Release();
+			}
+		}
+		if (savedDSV) {
+			savedDSV->Release();
+		}
+
+		return true;
+	}
+
+	std::uintptr_t FindLiveENBPrepass(HMODULE a_module)
+	{
+		if (!a_module) {
+			return 0;
+		}
+
+		constexpr std::array<std::uint8_t, 50> signature{
+			0x48, 0x8B, 0xC4,
+			0x44, 0x89, 0x48, 0x20,
+			0x44, 0x89, 0x40, 0x18,
+			0x89, 0x50, 0x10,
+			0x55, 0x56, 0x57,
+			0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+			0x48, 0x81, 0xEC, 0xE0, 0x04, 0x00, 0x00,
+			0x48, 0xC7, 0x44, 0x24, 0x70, 0xFE, 0xFF, 0xFF, 0xFF,
+			0x48, 0x89, 0x58, 0x08,
+			0x4C, 0x8B, 0xF1,
+			0x83, 0x3D
+		};
+
+		const auto base = reinterpret_cast<std::uintptr_t>(a_module);
+		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			return 0;
+		}
+		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) {
+			return 0;
+		}
+
+		const auto section = IMAGE_FIRST_SECTION(nt);
+		for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+			if ((section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+				continue;
+			}
+
+			const auto sectionBegin = reinterpret_cast<const std::uint8_t*>(base + section[i].VirtualAddress);
+			const auto sectionSize = static_cast<std::size_t>(section[i].Misc.VirtualSize);
+			if (sectionSize < signature.size()) {
+				continue;
+			}
+			const auto match = std::search(
+				sectionBegin,
+				sectionBegin + sectionSize,
+				signature.begin(),
+				signature.end());
+			if (match != sectionBegin + sectionSize) {
+				return reinterpret_cast<std::uintptr_t>(match);
+			}
+		}
+		return 0;
+	}
+
+	std::uintptr_t FindENBModuleString(HMODULE a_module, std::string_view a_value)
+	{
+		if (!a_module || a_value.empty()) {
+			return 0;
+		}
+
+		const auto base = reinterpret_cast<std::uintptr_t>(a_module);
+		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			return 0;
+		}
+		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) {
+			return 0;
+		}
+
+		const auto section = IMAGE_FIRST_SECTION(nt);
+		for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+			const auto sectionBegin = reinterpret_cast<const char*>(base + section[i].VirtualAddress);
+			const auto sectionSize = static_cast<std::size_t>(section[i].Misc.VirtualSize);
+			if (sectionSize < a_value.size()) {
+				continue;
+			}
+
+			const auto match = std::search(
+				sectionBegin,
+				sectionBegin + sectionSize,
+				a_value.begin(),
+				a_value.end());
+			if (match != sectionBegin + sectionSize) {
+				return reinterpret_cast<std::uintptr_t>(match);
+			}
+		}
+
+		return 0;
+	}
+
+	bool ENBModuleContainsString(HMODULE a_module, std::string_view a_value)
+	{
+		return FindENBModuleString(a_module, a_value) != 0;
+	}
+
+	std::uintptr_t ResolveENBRIPRelativeAddress(const std::uint8_t* a_instruction)
+	{
+		std::int32_t displacement = 0;
+		std::memcpy(&displacement, a_instruction + 3, sizeof(displacement));
+		return reinterpret_cast<std::uintptr_t>(a_instruction) + 7 + displacement;
+	}
+
+	std::vector<std::uintptr_t> FindENBPrepassVariableSRVSlots(
+		std::uintptr_t a_prepass,
+		std::uintptr_t a_variableName)
+	{
+		std::vector<std::uintptr_t> slots;
+		if (!a_prepass || !a_variableName) {
+			return slots;
+		}
+
+		// ENB assigns an effect texture variable with a RIP-relative SRV load
+		// followed by a RIP-relative load of the variable name. Resolve the
+		// resource slots from that contract so wrapper RVAs can vary by version.
+		constexpr std::size_t kVariableBindingScanSize = 0x800;
+		const auto function = reinterpret_cast<const std::uint8_t*>(a_prepass);
+		for (std::size_t offset = 0; offset + 14 <= kVariableBindingScanSize; ++offset) {
+			const auto load = function + offset;
+			const auto name = load + 7;
+			if (load[0] != 0x4C || load[1] != 0x8B || load[2] != 0x05 ||
+				name[0] != 0x48 || name[1] != 0x8D || name[2] != 0x15 ||
+				ResolveENBRIPRelativeAddress(name) != a_variableName) {
+				continue;
+			}
+
+			const auto slot = ResolveENBRIPRelativeAddress(load);
+			if (std::find(slots.begin(), slots.end(), slot) == slots.end()) {
+				slots.push_back(slot);
+			}
+			offset += 13;
+		}
+		return slots;
+	}
+
+	class ScopedENBPrepassDepthSRVBindings
+	{
+	public:
+		ScopedENBPrepassDepthSRVBindings()
+		{
+			auto* nativeDepth = g_enbNativeDepthSRV.get();
+			if (!nativeDepth ||
+				std::ranges::any_of(g_enbPrepassDepthSRVAddresses, [](const auto address) { return address == 0; })) {
+				return;
+			}
+
+			for (std::size_t i = 0; i < g_enbPrepassDepthSRVAddresses.size(); ++i) {
+				auto** slot = reinterpret_cast<ID3D11ShaderResourceView**>(g_enbPrepassDepthSRVAddresses[i]);
+				original_[i] = *slot;
+				*slot = nativeDepth;
+			}
+			active_ = true;
+		}
+
+		~ScopedENBPrepassDepthSRVBindings()
+		{
+			if (!active_) {
+				return;
+			}
+
+			for (std::size_t i = 0; i < g_enbPrepassDepthSRVAddresses.size(); ++i) {
+				auto** slot = reinterpret_cast<ID3D11ShaderResourceView**>(g_enbPrepassDepthSRVAddresses[i]);
+				*slot = original_[i];
+			}
+		}
+
+		ScopedENBPrepassDepthSRVBindings(const ScopedENBPrepassDepthSRVBindings&) = delete;
+		ScopedENBPrepassDepthSRVBindings& operator=(const ScopedENBPrepassDepthSRVBindings&) = delete;
+
+	private:
+		std::array<ID3D11ShaderResourceView*, 2> original_{};
+		bool active_{ false };
+	};
+
+	struct ENBPrepassDepthBridge
+	{
+		static bool thunk(
+			ID3D11DeviceContext* a_context,
+			UINT a_indexCount,
+			UINT a_startIndexLocation,
+			INT a_baseVertexLocation)
+		{
+			if (g_enbPrepassDepthBridgeScopeDepth <= 0) {
+				return func(a_context, a_indexCount, a_startIndexLocation, a_baseVertexLocation);
+			}
+
+			const ScopedENBPrepassDepthSRVBindings depthBindings;
+			return func(a_context, a_indexCount, a_startIndexLocation, a_baseVertexLocation);
+		}
+
+		static inline bool (*func)(ID3D11DeviceContext*, UINT, UINT, INT) = nullptr;
+	};
+
+	void ResolveENBPrepassResourceSlots()
+	{
+		if (!enbLoaded || g_enbTextureOriginalSRVAddress) {
+			return;
+		}
+
+		const auto module = FindENBModule();
+		if (!ENBModuleContainsString(module, "EnablePrepass")) {
+			return;
+		}
+		const auto prepass = FindLiveENBPrepass(module);
+		if (!prepass) {
+			return;
+		}
+
+		const auto textureOriginalName = FindENBModuleString(module, "TextureOriginal");
+		const auto textureDepthName = FindENBModuleString(module, "TextureDepth");
+		const auto textureOriginalSlots = FindENBPrepassVariableSRVSlots(prepass, textureOriginalName);
+		const auto textureDepthSlots = FindENBPrepassVariableSRVSlots(prepass, textureDepthName);
+		if (textureOriginalSlots.empty()) {
+			return;
+		}
+		g_enbTextureOriginalSRVAddress = textureOriginalSlots.front();
+
+		if (textureDepthSlots.size() != g_enbPrepassDepthSRVAddresses.size()) {
+			return;
+		}
+		std::ranges::copy(textureDepthSlots, g_enbPrepassDepthSRVAddresses.begin());
+
+		const auto trampoline = Detours::X64::DetourFunction(
+			prepass,
+			reinterpret_cast<std::uintptr_t>(&ENBPrepassDepthBridge::thunk));
+		if (!trampoline) {
+			return;
+		}
+		ENBPrepassDepthBridge::func = reinterpret_cast<decltype(ENBPrepassDepthBridge::func)>(trampoline);
+	}
+
+	ID3D11Texture2D* GetENBPrepassTexture(std::ptrdiff_t a_textureOffset)
+	{
+		if (!g_enbTextureOriginalSRVAddress) {
+			return nullptr;
+		}
+
+		constexpr std::ptrdiff_t kTextureOriginalTextureFromSRV = -0x10;
+		const auto textureSlot = g_enbTextureOriginalSRVAddress + kTextureOriginalTextureFromSRV + a_textureOffset;
+		return *reinterpret_cast<ID3D11Texture2D**>(textureSlot);
+	}
+
+	ID3D11RenderTargetView* GetENBPrepassRTV(std::ptrdiff_t a_textureOffset)
+	{
+		if (!g_enbTextureOriginalSRVAddress) {
+			return nullptr;
+		}
+
+		constexpr std::ptrdiff_t kTextureOriginalRTVFromSRV = -0x08;
+		const auto rtvSlot = g_enbTextureOriginalSRVAddress + kTextureOriginalRTVFromSRV + a_textureOffset;
+		return *reinterpret_cast<ID3D11RenderTargetView**>(rtvSlot);
+	}
+
+	bool PrimeENBPrepassNativeColor(
+		ID3D11Device* a_device,
+		ID3D11DeviceContext* a_context,
+		ID3D11ShaderResourceView* a_nativeScene)
+	{
+		if (!a_device || !a_context || !a_nativeScene) {
+			return false;
+		}
+
+		auto* textureOriginal = GetENBPrepassTexture(0x00);
+		auto* textureOriginalRTV = GetENBPrepassRTV(0x00);
+		auto* textureColorA = GetENBPrepassTexture(0x18);
+		auto* textureColorARTV = GetENBPrepassRTV(0x18);
+		auto* textureColorB = GetENBPrepassTexture(0x30);
+		auto* textureColorBRTV = GetENBPrepassRTV(0x30);
+		if (!textureOriginal || !textureOriginalRTV ||
+			!textureColorA || !textureColorARTV ||
+			!textureColorB || !textureColorBRTV) {
+			return false;
+		}
+
+		return ScaleCopyRenderTarget(
+				a_device,
+				a_context,
+				a_nativeScene,
+				textureOriginalRTV,
+				textureOriginal) &&
+			ScaleCopyRenderTarget(
+				a_device,
+				a_context,
+				a_nativeScene,
+				textureColorARTV,
+				textureColorA) &&
+			ScaleCopyRenderTarget(
+				a_device,
+				a_context,
+				a_nativeScene,
+				textureColorBRTV,
+				textureColorB);
+	}
+
+	bool PrepareENBSuperResolutionInput(
+		ID3D11Device* a_device,
+		ID3D11DeviceContext* a_context,
+		ID3D11ShaderResourceView* a_nativeSource,
+		Texture2D* a_upscalingInput,
+		uint32_t a_renderWidth,
+		uint32_t a_renderHeight)
+	{
+		if (!a_device || !a_context || !a_nativeSource || !a_upscalingInput ||
+			!a_upscalingInput->resource || !a_upscalingInput->uav ||
+			a_renderWidth == 0 || a_renderHeight == 0) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC inputDesc{};
+		a_upscalingInput->resource->GetDesc(&inputDesc);
+		if (a_renderWidth > inputDesc.Width || a_renderHeight > inputDesc.Height) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC renderRectDesc{};
+		renderRectDesc.Width = a_renderWidth;
+		renderRectDesc.Height = a_renderHeight;
+		renderRectDesc.MipLevels = 1;
+		renderRectDesc.ArraySize = 1;
+		renderRectDesc.Format = inputDesc.Format;
+		renderRectDesc.SampleDesc.Count = 1;
+		renderRectDesc.Usage = D3D11_USAGE_DEFAULT;
+		renderRectDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+		bool recreateRenderRect = !g_enbSRInputRenderRect || !g_enbSRInputRenderRectRTV;
+		if (!recreateRenderRect) {
+			D3D11_TEXTURE2D_DESC currentDesc{};
+			g_enbSRInputRenderRect->GetDesc(&currentDesc);
+			recreateRenderRect =
+				currentDesc.Width != renderRectDesc.Width ||
+				currentDesc.Height != renderRectDesc.Height ||
+				currentDesc.Format != renderRectDesc.Format ||
+				currentDesc.SampleDesc.Count != renderRectDesc.SampleDesc.Count;
+		}
+
+		if (recreateRenderRect) {
+			g_enbSRInputRenderRectRTV = nullptr;
+			g_enbSRInputRenderRect = nullptr;
+			if (FAILED(a_device->CreateTexture2D(&renderRectDesc, nullptr, g_enbSRInputRenderRect.put())) ||
+				FAILED(a_device->CreateRenderTargetView(g_enbSRInputRenderRect.get(), nullptr, g_enbSRInputRenderRectRTV.put()))) {
+				g_enbSRInputRenderRectRTV = nullptr;
+				g_enbSRInputRenderRect = nullptr;
+				return false;
+			}
+		}
+
+		if (!ScaleCopyRenderTarget(
+				a_device,
+				a_context,
+				a_nativeSource,
+				g_enbSRInputRenderRectRTV.get(),
+				g_enbSRInputRenderRect.get())) {
+			return false;
+		}
+
+		const float clearColor[4]{};
+		a_context->ClearUnorderedAccessViewFloat(a_upscalingInput->uav.get(), clearColor);
+		const D3D11_BOX sourceBox{ 0, 0, 0, a_renderWidth, a_renderHeight, 1 };
+		a_context->CopySubresourceRegion(
+			a_upscalingInput->resource.get(),
+			0,
+			0,
+			0,
+			0,
+			g_enbSRInputRenderRect.get(),
+			0,
+			&sourceBox);
+		return true;
+	}
+
+	bool PrepareENBNativeDepth(
+		ID3D11Device* a_device,
+		ID3D11DeviceContext* a_context,
+		ID3D11ShaderResourceView* a_renderDepth,
+		uint32_t a_nativeWidth,
+		uint32_t a_nativeHeight)
+	{
+		if (!a_device || !a_context || !a_renderDepth || a_nativeWidth == 0 || a_nativeHeight == 0) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC desired{};
+		desired.Width = a_nativeWidth;
+		desired.Height = a_nativeHeight;
+		desired.MipLevels = 1;
+		desired.ArraySize = 1;
+		desired.Format = DXGI_FORMAT_R32_FLOAT;
+		desired.SampleDesc.Count = 1;
+		desired.Usage = D3D11_USAGE_DEFAULT;
+		desired.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+		bool recreate = !g_enbNativeDepth || !g_enbNativeDepthSRV || !g_enbNativeDepthRTV;
+		if (!recreate) {
+			D3D11_TEXTURE2D_DESC current{};
+			g_enbNativeDepth->GetDesc(&current);
+			recreate = current.Width != desired.Width ||
+				current.Height != desired.Height ||
+				current.Format != desired.Format;
+		}
+
+		if (recreate) {
+			g_enbNativeDepthRTV = nullptr;
+			g_enbNativeDepthSRV = nullptr;
+			g_enbNativeDepth = nullptr;
+			if (FAILED(a_device->CreateTexture2D(&desired, nullptr, g_enbNativeDepth.put())) ||
+				FAILED(a_device->CreateShaderResourceView(g_enbNativeDepth.get(), nullptr, g_enbNativeDepthSRV.put())) ||
+				FAILED(a_device->CreateRenderTargetView(g_enbNativeDepth.get(), nullptr, g_enbNativeDepthRTV.put()))) {
+				g_enbNativeDepthRTV = nullptr;
+				g_enbNativeDepthSRV = nullptr;
+				g_enbNativeDepth = nullptr;
+				return false;
+			}
+		}
+
+		return ScaleCopyRenderTarget(
+			a_device,
+			a_context,
+			a_renderDepth,
+			g_enbNativeDepthRTV.get(),
+			g_enbNativeDepth.get());
+	}
+
+	bool ScaleCopyProxyRenderTargetToOriginal(ID3D11Device* a_device, ID3D11DeviceContext* a_context, int a_sourceTarget, int a_destinationTarget)
+	{
+		auto upscaling = Upscaling::GetSingleton();
+		if (a_sourceTarget < 0 || a_destinationTarget < 0 ||
+			a_sourceTarget >= static_cast<int>(std::size(upscaling->proxyRenderTargets)) ||
+			a_destinationTarget >= static_cast<int>(std::size(upscaling->originalRenderTargets))) {
+			return false;
+		}
+
+		return ScaleCopyRenderTarget(
+			a_device,
+			a_context,
+			reinterpret_cast<ID3D11ShaderResourceView*>(upscaling->proxyRenderTargets[a_sourceTarget].srView),
+			reinterpret_cast<ID3D11RenderTargetView*>(upscaling->originalRenderTargets[a_destinationTarget].rtView),
+			reinterpret_cast<ID3D11Texture2D*>(upscaling->originalRenderTargets[a_destinationTarget].texture));
+	}
+
+	void ScaleProxyTargetsToOriginalNative(std::initializer_list<int> a_targets)
+	{
+		static auto rendererData = RE::BSGraphics::GetRendererData();
+		auto* context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+		if (!context) {
+			return;
+		}
+
+		auto* device = reinterpret_cast<ID3D11Device*>(rendererData->device);
+		ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+		ID3D11DepthStencilView* savedDSV = nullptr;
+		context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
+
+		ID3D11ShaderResourceView* savedSRVs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+		context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, savedSRVs);
+
+		ID3D11ShaderResourceView* nullSRVs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+		context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, nullSRVs);
+		context->OMSetRenderTargets(0, nullptr, nullptr);
+
+		for (const auto targetIndex : a_targets) {
+			ScaleCopyProxyRenderTargetToOriginal(device, context, targetIndex, targetIndex);
+		}
+
+		context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, savedSRVs);
+		context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
+
+		for (auto* srv : savedSRVs) {
+			if (srv) {
+				srv->Release();
+			}
+		}
+		for (auto* rtv : savedRTVs) {
+			if (rtv) {
+				rtv->Release();
+			}
+		}
+		if (savedDSV) {
+			savedDSV->Release();
+		}
 	}
 
 	float GetUpscaleRatioFromQualityMode(uint a_qualityMode)
@@ -227,15 +1384,7 @@ namespace
 
 	uint GetEffectiveQualityMode(Upscaling::UpscaleMethod a_upscaleMethod, uint a_qualityMode)
 	{
-		// ENB does not support this plugin's render-resolution scaling, but native AA
-		// still runs at 1.0 scale and can feed frame generation.
-		if (enbLoaded && a_qualityMode != 0 &&
-			(a_upscaleMethod == Upscaling::UpscaleMethod::kFSR ||
-				a_upscaleMethod == Upscaling::UpscaleMethod::kDLSS ||
-				a_upscaleMethod == Upscaling::UpscaleMethod::kSpatialFallback)) {
-			return 0;
-		}
-
+		(void)a_upscaleMethod;
 		return a_qualityMode;
 	}
 
@@ -477,6 +1626,7 @@ struct DrawWorld_Imagespace_RenderEffectRange
 
 		auto originalOffsetX = gameViewport->offsetX;
 		auto originalOffsetY = gameViewport->offsetY;
+		const auto originalFrameBufferViewport = gameViewport->frameBufferViewport;
 
 		// Disable removal of jitter in some passes
 		if (upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDisabled){
@@ -486,20 +1636,82 @@ struct DrawWorld_Imagespace_RenderEffectRange
 
 		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
 		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
+		const auto frameDynamicHeightRatio = originalDynamicHeightRatio;
+		const auto frameDynamicWidthRatio = originalDynamicWidthRatio;
+		const bool enbCompatibilityActive =
+			requiresOverride && IsENBSRCompatibilityActive(upscaling->upscaleMethod);
+
+		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
+			func(This, a2, a3, a4, a5);
+			gameViewport->offsetX = originalOffsetX;
+			gameViewport->offsetY = originalOffsetY;
+			return;
+		}
 
 		if (requiresOverride) {
+			if (enbCompatibilityActive) {
+				const std::initializer_list<int> kENBBridgeTargets{
+					0, 20, 57, 24, 25, 23, 58, 59, 28, 3, 9, 60, 61, 4, 29, 1, 2, 36, 37, 22, 10, 11, 7, 8, 64, 14, 16
+				};
 
-			// HDR shaders
+				upscaling->OverrideDepth(true);
+				static auto rendererData = RE::BSGraphics::GetRendererData();
+				auto* device = reinterpret_cast<ID3D11Device*>(rendererData->device);
+				auto* context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+				const bool nativeDepthReady = PrepareENBNativeDepth(
+					device,
+					context,
+					upscaling->depthOverrideTexture ? upscaling->depthOverrideTexture->srv.get() : nullptr,
+					static_cast<uint32_t>(gameViewport->screenWidth),
+					static_cast<uint32_t>(gameViewport->screenHeight));
+
+				// Use the proxies only to extract the valid render rectangle. Running
+				// effect 3 here would let ENB observe an 853x480 dispatch before its
+				// native invocation and cache the wrong prepass dimensions.
+				upscaling->OverrideRenderTargets(kENBBridgeTargets);
+				upscaling->ResetRenderTargets({}, false);
+				ScaleProxyTargetsToOriginalNative(kENBBridgeTargets);
+				if (nativeDepthReady) {
+					rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth =
+						reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(g_enbNativeDepthSRV.get());
+				}
+
+				SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
+				ApplyFullFrameViewport();
+
+				const bool shouldPrimeENBPrepass =
+					TryGetENBBool("EFFECT", "EnablePrepass").value_or(false);
+				if (shouldPrimeENBPrepass) {
+					auto* nativeScene = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->renderTargets[4].srView);
+					PrimeENBPrepassNativeColor(device, context, nativeScene);
+				}
+				{
+					const ScopedENBPrepassDepthBridgeActivation bridgeENBPrepassDepth(shouldPrimeENBPrepass);
+					const ScopedENBNativeImageSpaceParams forceNativeImageSpaceParams;
+					func(This, a2, a3, a4, a5);
+				}
+				upscaling->ResetDepth();
+				SetDynamicResolutionRatio(renderTargetManager, frameDynamicWidthRatio, frameDynamicHeightRatio);
+				originalDynamicWidthRatio = frameDynamicWidthRatio;
+				originalDynamicHeightRatio = frameDynamicHeightRatio;
+				gameViewport->frameBufferViewport = originalFrameBufferViewport;
+				ApplyCurrentViewportDefault(renderTargetManager);
+
+				gameViewport->offsetX = originalOffsetX;
+				gameViewport->offsetY = originalOffsetY;
+				return;
+			}
+
+			// Preserve the original non-ENB dynamic-resolution path.
 			func(This, 0, 3, 1, 1);
-			upscaling->OverrideRenderTargets({1, 4, 29, 16});
+
+			upscaling->OverrideRenderTargets({ 1, 4, 29, 16 });
 			upscaling->OverrideDepth(true);
 			SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
 
-			// LDR shaders
 			func(This, 4, 13, 1, 1);
 			upscaling->ResetDepth();
 			upscaling->ResetRenderTargets({ 1, 2, 4 });
-
 			SetDynamicResolutionRatio(renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio);
 		} else {
 			func(This, a2, a3, a4, a5);
@@ -519,12 +1731,42 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 		auto upscaling = Upscaling::GetSingleton();
 
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+		static auto gameViewport = Util::State_GetSingleton();
+		const auto originalFrameBufferViewport = gameViewport->frameBufferViewport;
 
 		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
 		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
+		const auto frameDynamicHeightRatio = originalDynamicHeightRatio;
+		const auto frameDynamicWidthRatio = originalDynamicWidthRatio;
+
+		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
+			func(This, a2, a3, a4, a5);
+			if (upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDisabled) {
+				upscaling->Upscale(static_cast<int>(a5));
+			} else {
+				upscaling->CaptureDLSSGInputs(static_cast<int>(a5));
+			}
+			return;
+		}
 
 		if (upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDisabled &&
 			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f)) {
+			if (IsENBSRCompatibilityActive(upscaling->upscaleMethod)) {
+				SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
+				ApplyFullFrameViewport();
+				{
+					const ScopedENBNativeImageSpaceParams forceNativeImageSpaceParams;
+					func(This, a2, a3, a4, a5);
+				}
+				SetDynamicResolutionRatio(renderTargetManager, frameDynamicWidthRatio, frameDynamicHeightRatio);
+				originalDynamicWidthRatio = frameDynamicWidthRatio;
+				originalDynamicHeightRatio = frameDynamicHeightRatio;
+				gameViewport->frameBufferViewport = originalFrameBufferViewport;
+				ApplyCurrentViewportDefault(renderTargetManager);
+				upscaling->Upscale(static_cast<int>(a5));
+				return;
+			}
+
 			upscaling->OverrideRenderTargets({ static_cast<int>(a4) });
 			upscaling->OverrideDepth(true);
 			SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
@@ -588,6 +1830,34 @@ struct DrawWorld_Imagespace_SetUseDynamicResolutionViewportAsDefaultViewport
 		viewport.MaxDepth = 1.0f;
 		context->RSSetViewports(1, &viewport);
 	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
+
+struct BSImagespaceShader_Render_ENBFinalComposite
+{
+	static void thunk(void* This, void* a_geometry, void* a_shaderParams)
+	{
+		const bool nativeENBScope = g_enbNativeImageSpaceParamScopeDepth > 0;
+		const bool isHDRFinalComposite = IsENBHDRFinalCompositeEffect(This);
+		const bool isRefractionComposite = This && This == g_enbRefractionCompositeEffect;
+		const bool isPauseBlur = IsENBNativePauseBlurShader(This);
+		if (!nativeENBScope || (!isHDRFinalComposite && !isRefractionComposite && !isPauseBlur)) {
+			func(This, a_geometry, a_shaderParams);
+			return;
+		}
+
+		// RenderEffect selects the alternate +0x40 geometry in the tiled path,
+		// even when the effect is marked non-dynamic. BSImagespaceShader only
+		// substitutes the normal +0x38 dynamic geometry, so pass the manager's
+		// native +0x28 geometry explicitly for the ENB-intercepted draw.
+		{
+			const ScopedBSImagespaceShaderNativeParams forceNativeParams(This);
+			auto* nativeGeometry = GetNativeImageSpaceGeometry();
+			func(This, nativeGeometry ? nativeGeometry : a_geometry, a_shaderParams);
+		}
+
+	}
+
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
@@ -696,21 +1966,103 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately
 
 		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
 		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
+		const bool enbCompatibilityActive = IsENBSRCompatibilityActive(upscaling->upscaleMethod);
+		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
+			func(This, a2, a3);
+			return;
+		}
+
+		if (requiresOverride && ShouldLeaveENBDeferredCompositeFeaturePassNative(This, upscaling->upscaleMethod)) {
+			func(This, a2, a3);
+			return;
+		}
 
 		if (requiresOverride) {
 			upscaling->OverrideRenderTargets({20, 25, 57, 24, 23, 58, 59, 3, 9, 60, 61, 28});
 			upscaling->OverrideDepth(true);
 			SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
+			if (enbCompatibilityActive) {
+				ApplyCurrentViewportDefault(renderTargetManager);
+			}
 		}
-
 		func(This, a2, a3);
 
 		if (requiresOverride) {
 			upscaling->ResetRenderTargets({4});
 			upscaling->ResetDepth();
 			SetDynamicResolutionRatio(renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio);
+			if (enbCompatibilityActive) {
+				ApplyCurrentViewportDefault(renderTargetManager);
+			}
 		}
 	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
+
+/** @brief Keep the primary BSDFComposite output in the ENB proxy domain. */
+struct DrawWorld_DeferredComposite_RenderPassImmediately_First
+	{
+		static void thunk(RE::BSRenderPass* This, uint a2, bool a3)
+		{
+			auto upscaling = Upscaling::GetSingleton();
+			static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+
+		const bool useENBProxyDomain =
+			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f) &&
+			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
+
+		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
+			func(This, a2, a3);
+			return;
+		}
+
+		if (useENBProxyDomain) {
+			upscaling->OverrideRenderTargetsSelective({ 3 });
+		}
+
+		func(This, a2, a3);
+
+		if (useENBProxyDomain) {
+			upscaling->ResetRenderTargetsSelective({ 3 }, { 3 });
+		}
+	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
+
+struct ImageSpaceManager_RenderEffect
+{
+	static void thunk(void* This, void* a_effect, int a_targetA, int a_targetB, void* a_params)
+	{
+		const auto effectIndex = FindEffectIndex(This, a_effect);
+		const ScopedImageSpaceEffectNativeParams forceNativeParams(a_effect, effectIndex);
+		const ScopedENBHDRFinalCompositeEffects hdrFinalCompositeEffects(a_effect, effectIndex);
+		const ScopedENBRefractionCompositeEffect refractionCompositeEffect(a_effect, effectIndex);
+		const ScopedENBNativePauseBlurShaders pauseBlurShaders(a_effect, effectIndex);
+		func(This, a_effect, a_targetA, a_targetB, a_params);
+	}
+
+	static int32_t FindEffectIndex(const void* a_manager, const void* a_effect)
+	{
+		if (!a_manager || !a_effect) {
+			return -1;
+		}
+
+		const auto effectArray = *reinterpret_cast<const void* const* const*>(reinterpret_cast<const std::byte*>(a_manager) + 0x18);
+		if (!effectArray) {
+			return -1;
+		}
+
+		const auto count = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const std::byte*>(a_manager) + 0x22);
+		const auto boundedCount = std::min<uint16_t>(count, 0x48);
+		for (uint16_t i = 0; i < boundedCount; ++i) {
+			if (effectArray[i] == a_effect) {
+				return i;
+			}
+		}
+
+		return -1;
+	}
+
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
@@ -821,47 +2173,62 @@ void Upscaling::InstallHooks()
 		REL::ID{ 338205, 2318315 }.address() + (isOG ? 0x253 : 0x53D));
 
 	// This hook also owns native-AA evaluation and frame-generation input capture.
-	// Keep it installed with ENB; the dynamic-resolution branches stay inactive at 1.0 scale.
 	stl::write_thunk_call<DrawWorld_Imagespace_LateRenderEffectRange>(
 		REL::ID{ 587723, 2318322 }.address() + (isOG ? 0xD3 : 0xB7));
 
-	if (ShouldInstallHighFPSPhysicsFixLoadingScreenCompat()) {
-		stl::detour_thunk<JobListManager_ServingThread_DisplayLoadingScreen>(REL::ID{ 132841, 2227631 });
+	// Fix dynamic resolution for BSDFComposite
+	stl::write_thunk_call<DrawWorld_DeferredComposite_RenderPassImmediately>(
+		REL::ID{ 728427, 2318313 }.address() + (isOG ? 0x8DC : 0x915));
+	if (isOG && enbLoaded) {
+		stl::write_thunk_call<DrawWorld_DeferredComposite_RenderPassImmediately_First>(REL::ID{ 728427 }.address() + 0x1F4);
+		stl::detour_thunk<ImageSpaceManager_RenderEffect>(REL::ID{ 325252 });
+		stl::detour_thunk<BSImagespaceShader_Render_ENBFinalComposite>(REL::ID{ 1388477 });
+	}
+	// Fix dynamic resolution for Lens Flare visibility
+	stl::detour_thunk<BSImagespaceShaderLensFlare_RenderLensFlare>(REL::ID{ 676108, 2317547 });
+
+	// Fix dynamic resolution for Screenspace Reflections
+	stl::write_thunk_call<BSImagespaceShaderSSLRRaytracing_SetupTechnique_BeginTechnique>(
+		REL::ID{ 779077, 2317302 }.address() + 0x1C);
+
+	// Fix dynamic resolution for post processing
+	stl::write_thunk_call<DrawWorld_Imagespace_RenderEffectRange>(
+		REL::ID{ 587723, 2318322 }.address() + (isOG ? 0x9F : 0x83));
+
+	// Fix dynamic resolution for HBAO
+	if (isOG) {
+		stl::write_thunk_call<DrawWorld_Render_PreUI_NVHBAO>(REL::ID{ 984743 }.address() + 0x1BA);
 	}
 
-	// These hooks are not needed when using ENB because dynamic resolution is not supported
-	if (!enbLoaded) {
-		// Fix dynamic resolution for BSDFComposite
-		stl::write_thunk_call<DrawWorld_DeferredComposite_RenderPassImmediately>(
-			REL::ID{ 728427, 2318313 }.address() + (isOG ? 0x8DC : 0x915));
+	// Fix VATs line thickness
+	stl::write_thunk_call<ImageSpaceEffectVatsTarget_UpdateParams_SetPixelConstant>(
+		REL::ID{ 1042583, 2317983 }.address() + (isOG ? 0xBB : 0x110));
 
-		// Fix dynamic resolution for Lens Flare visibility
-		stl::detour_thunk<BSImagespaceShaderLensFlare_RenderLensFlare>(REL::ID{ 676108, 2317547 });
+	// Fix jitter in LoadingMenu
+	stl::write_thunk_call<LoadingMenu_Render_UpdateTemporalData>(
+		REL::ID{ 135719, 2249225 }.address() + (isOG ? 0x2BD : 0x275));
 
-		// Fix dynamic resolution for Screenspace Reflections
-		stl::write_thunk_call<BSImagespaceShaderSSLRRaytracing_SetupTechnique_BeginTechnique>(
-			REL::ID{ 779077, 2317302 }.address() + 0x1C);
-
-		// Fix dynamic resolution for post processing
-		stl::write_thunk_call<DrawWorld_Imagespace_RenderEffectRange>(
-			REL::ID{ 587723, 2318322 }.address() + (isOG ? 0x9F : 0x83));
-
-		// Fix dynamic resolution for HBAO
-		if (isOG) {
-			stl::write_thunk_call<DrawWorld_Render_PreUI_NVHBAO>(REL::ID{ 984743 }.address() + 0x1BA);
-		}
-		
-		// Fix VATs line thickness
-		stl::write_thunk_call<ImageSpaceEffectVatsTarget_UpdateParams_SetPixelConstant>(
-			REL::ID{ 1042583, 2317983 }.address() + (isOG ? 0xBB : 0x110));
-
-		// Fix jitter in LoadingMenu
-		stl::write_thunk_call<LoadingMenu_Render_UpdateTemporalData>(
-			REL::ID{ 135719, 2249225 }.address() + (isOG ? 0x2BD : 0x275));
-
-		// Fix dynamic resolution after upscaling
-		stl::detour_thunk<DrawWorld_Imagespace>(REL::ID{ 587723, 2318322 });
+	// Fix dynamic resolution after upscaling
+	stl::detour_thunk<DrawWorld_Imagespace>(REL::ID{ 587723, 2318322 });
+	if (isOG && enbLoaded) {
+		ResolveENBPrepassResourceSlots();
 	}
+}
+
+void Upscaling::InstallHighFPSPhysicsFixCompatibility()
+{
+	static bool installed = false;
+	if (installed || !REX::FModule::IsRuntimeOG()) {
+		return;
+	}
+
+	const auto displayLoadingScreen = REL::ID{ 132841 }.address();
+	if (!HasHFPFDisableLoadingAnimationPatch(displayLoadingScreen)) {
+		return;
+	}
+
+	stl::detour_thunk<JobListManager_ServingThread_DisplayLoadingScreen>(REL::ID{ 132841 });
+	installed = true;
 }
 
 struct SamplerStates
@@ -1202,10 +2569,6 @@ void Upscaling::OverrideRenderTargets(std::initializer_list<int> a_indicesToCopy
 
 	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 
-	// Update render target metadata to match the scaled resolution.
-	// The proxy texture has scaled dimensions, and code paths with dynamic
-	// viewport disabled need these dimensions to avoid rendering a native-size
-	// viewport into the top-left of the proxy.
 	for (int i = 0; i < 100; i++) {
 		originalRenderTargetData[i] = renderTargetManager->renderTargetData[i];
 		renderTargetManager->renderTargetData[i].width = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[i].width) * renderTargetManager->dynamicWidthRatio);
@@ -1248,13 +2611,91 @@ void Upscaling::OverrideRenderTargets(std::initializer_list<int> a_indicesToCopy
 	DrawWorld_Imagespace_SetUseDynamicResolutionViewportAsDefaultViewport::func(renderTargetManager, false);
 }
 
-void Upscaling::ResetRenderTargets(std::initializer_list<int> a_indicesToCopy)
+void Upscaling::OverrideRenderTargetsSelective(std::initializer_list<int> a_targetIndices, std::initializer_list<int> a_indicesToCopy)
+{
+	for (const auto targetIndex : a_targetIndices) {
+		const bool shouldCopy = std::find(a_indicesToCopy.begin(), a_indicesToCopy.end(), targetIndex) != a_indicesToCopy.end();
+		OverrideRenderTarget(targetIndex, shouldCopy);
+	}
+
+	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+	for (const auto targetIndex : a_targetIndices) {
+		originalRenderTargetData[targetIndex] = renderTargetManager->renderTargetData[targetIndex];
+		renderTargetManager->renderTargetData[targetIndex].width = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[targetIndex].width) * renderTargetManager->dynamicWidthRatio);
+		renderTargetManager->renderTargetData[targetIndex].height = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[targetIndex].height) * renderTargetManager->dynamicHeightRatio);
+	}
+
+	static auto rendererData = RE::BSGraphics::GetRendererData();
+	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+
+	ID3D11ShaderResourceView* boundSRVs[16] = {};
+	context->PSGetShaderResources(0, 16, boundSRVs);
+
+	for (int srvSlot = 0; srvSlot < 16; srvSlot++) {
+		if (!boundSRVs[srvSlot]) {
+			continue;
+		}
+
+		for (const auto targetIndex : a_targetIndices) {
+			auto& originalRT = originalRenderTargets[targetIndex];
+			auto& proxyRT = proxyRenderTargets[targetIndex];
+			if (boundSRVs[srvSlot] == reinterpret_cast<ID3D11ShaderResourceView*>(originalRT.srView) && proxyRT.srView) {
+				auto proxySRV = reinterpret_cast<ID3D11ShaderResourceView*>(proxyRT.srView);
+				context->PSSetShaderResources(srvSlot, 1, &proxySRV);
+				break;
+			}
+		}
+
+		boundSRVs[srvSlot]->Release();
+	}
+
+	ID3D11RenderTargetView* boundRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	ID3D11DepthStencilView* boundDSV = nullptr;
+	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, boundRTVs, &boundDSV);
+
+	ID3D11RenderTargetView* reboundRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	bool rebindOM = false;
+	for (int slot = 0; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++slot) {
+		reboundRTVs[slot] = boundRTVs[slot];
+		if (!boundRTVs[slot]) {
+			continue;
+		}
+
+		for (const auto targetIndex : a_targetIndices) {
+			auto& originalRT = originalRenderTargets[targetIndex];
+			auto& proxyRT = proxyRenderTargets[targetIndex];
+			if (boundRTVs[slot] == reinterpret_cast<ID3D11RenderTargetView*>(originalRT.rtView) && proxyRT.rtView) {
+				reboundRTVs[slot] = reinterpret_cast<ID3D11RenderTargetView*>(proxyRT.rtView);
+				rebindOM = true;
+				break;
+			}
+		}
+	}
+
+	if (rebindOM) {
+		context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, reboundRTVs, boundDSV);
+	}
+	for (auto* rtv : boundRTVs) {
+		if (rtv) {
+			rtv->Release();
+		}
+	}
+	if (boundDSV) {
+		boundDSV->Release();
+	}
+
+	DrawWorld_Imagespace_SetUseDynamicResolutionViewportAsDefaultViewport::func(renderTargetManager, false);
+}
+
+void Upscaling::ResetRenderTargets(
+	std::initializer_list<int> a_indicesToCopy,
+	bool a_copyAllWhenEmpty)
 {
 	// Restore all original full-resolution render targets
 	for (int i = 0; i < ARRAYSIZE(renderTargetsPatch); i++) {
 		int targetIndex = renderTargetsPatch[i];
 		// If indices array is empty, copy all. Otherwise, only copy if in the array
-		bool shouldCopy = a_indicesToCopy.size() == 0 ||
+		bool shouldCopy = (a_copyAllWhenEmpty && a_indicesToCopy.size() == 0) ||
 			std::find(a_indicesToCopy.begin(), a_indicesToCopy.end(), targetIndex) != a_indicesToCopy.end();
 		ResetRenderTarget(targetIndex, shouldCopy);
 	}
@@ -1298,7 +2739,119 @@ void Upscaling::ResetRenderTargets(std::initializer_list<int> a_indicesToCopy)
 		boundSRVs[srvSlot]->Release();
 	}
 
+	ID3D11RenderTargetView* boundRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	ID3D11DepthStencilView* boundDSV = nullptr;
+	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, boundRTVs, &boundDSV);
+
+	ID3D11RenderTargetView* reboundRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	bool rebindOM = false;
+	for (int slot = 0; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++slot) {
+		reboundRTVs[slot] = boundRTVs[slot];
+		if (!boundRTVs[slot]) {
+			continue;
+		}
+
+		for (int rtIndex = 0; rtIndex < ARRAYSIZE(renderTargetsPatch); ++rtIndex) {
+			const int targetIndex = renderTargetsPatch[rtIndex];
+			auto& originalRT = originalRenderTargets[targetIndex];
+			auto& proxyRT = proxyRenderTargets[targetIndex];
+			if (boundRTVs[slot] == reinterpret_cast<ID3D11RenderTargetView*>(proxyRT.rtView) && originalRT.rtView) {
+				reboundRTVs[slot] = reinterpret_cast<ID3D11RenderTargetView*>(originalRT.rtView);
+				rebindOM = true;
+				break;
+			}
+		}
+	}
+
+	if (rebindOM) {
+		context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, reboundRTVs, boundDSV);
+	}
+	for (auto* rtv : boundRTVs) {
+		if (rtv) {
+			rtv->Release();
+		}
+	}
+	if (boundDSV) {
+		boundDSV->Release();
+	}
+
 	// Enable dynamic resolution again
+	DrawWorld_Imagespace_SetUseDynamicResolutionViewportAsDefaultViewport::func(renderTargetManager, true);
+}
+
+void Upscaling::ResetRenderTargetsSelective(std::initializer_list<int> a_targetIndices, std::initializer_list<int> a_indicesToCopy)
+{
+	for (const auto targetIndex : a_targetIndices) {
+		const bool shouldCopy =
+			a_indicesToCopy.size() == 0 ||
+			std::find(a_indicesToCopy.begin(), a_indicesToCopy.end(), targetIndex) != a_indicesToCopy.end();
+		ResetRenderTarget(targetIndex, shouldCopy);
+	}
+
+	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+	for (const auto targetIndex : a_targetIndices) {
+		renderTargetManager->renderTargetData[targetIndex] = originalRenderTargetData[targetIndex];
+	}
+
+	static auto rendererData = RE::BSGraphics::GetRendererData();
+	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+
+	ID3D11ShaderResourceView* boundSRVs[16] = {};
+	context->PSGetShaderResources(0, 16, boundSRVs);
+
+	for (int srvSlot = 0; srvSlot < 16; srvSlot++) {
+		if (!boundSRVs[srvSlot]) {
+			continue;
+		}
+
+		for (const auto targetIndex : a_targetIndices) {
+			auto& originalRT = originalRenderTargets[targetIndex];
+			auto& proxyRT = proxyRenderTargets[targetIndex];
+			if (boundSRVs[srvSlot] == reinterpret_cast<ID3D11ShaderResourceView*>(proxyRT.srView) && originalRT.srView) {
+				auto originalSRV = reinterpret_cast<ID3D11ShaderResourceView*>(originalRT.srView);
+				context->PSSetShaderResources(srvSlot, 1, &originalSRV);
+				break;
+			}
+		}
+
+		boundSRVs[srvSlot]->Release();
+	}
+
+	ID3D11RenderTargetView* boundRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	ID3D11DepthStencilView* boundDSV = nullptr;
+	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, boundRTVs, &boundDSV);
+
+	ID3D11RenderTargetView* reboundRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	bool rebindOM = false;
+	for (int slot = 0; slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++slot) {
+		reboundRTVs[slot] = boundRTVs[slot];
+		if (!boundRTVs[slot]) {
+			continue;
+		}
+
+		for (const auto targetIndex : a_targetIndices) {
+			auto& originalRT = originalRenderTargets[targetIndex];
+			auto& proxyRT = proxyRenderTargets[targetIndex];
+			if (boundRTVs[slot] == reinterpret_cast<ID3D11RenderTargetView*>(proxyRT.rtView) && originalRT.rtView) {
+				reboundRTVs[slot] = reinterpret_cast<ID3D11RenderTargetView*>(originalRT.rtView);
+				rebindOM = true;
+				break;
+			}
+		}
+	}
+
+	if (rebindOM) {
+		context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, reboundRTVs, boundDSV);
+	}
+	for (auto* rtv : boundRTVs) {
+		if (rtv) {
+			rtv->Release();
+		}
+	}
+	if (boundDSV) {
+		boundDSV->Release();
+	}
+
 	DrawWorld_Imagespace_SetUseDynamicResolutionViewportAsDefaultViewport::func(renderTargetManager, true);
 }
 
@@ -1307,7 +2860,8 @@ void Upscaling::OverrideDepth(bool a_doCopy)
 	static auto rendererData = RE::BSGraphics::GetRendererData();
 
 	// Save the original depth SRV (with dynamic resolution)
-	originalDepthView = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth);
+	originalDepthView = reinterpret_cast<ID3D11ShaderResourceView*>(
+		rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth);
 
 	// Optionally perform expensive copy operation
 	if (a_doCopy) {
@@ -1320,16 +2874,47 @@ void Upscaling::OverrideDepth(bool a_doCopy)
 		previousFrame = gameViewport->frameCount;
 	}
 
-	// Replace with our dynamic resolution depth texture for post-processing effects
-	rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth = reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(depthOverrideTexture->srv.get());
+	rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth =
+		reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(depthOverrideTexture->srv.get());
 }
 
 void Upscaling::ResetDepth()
 {
 	static auto rendererData = RE::BSGraphics::GetRendererData();
 
-	// Restore the original depth SRV with dynamic resolution
-	rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth = reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(originalDepthView);
+	rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth =
+		reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(originalDepthView);
+
+	if (!IsENBSRCompatibilityActive(upscaleMethod)) {
+		return;
+	}
+
+	if (!originalDepthView || !depthOverrideTexture || !depthOverrideTexture->srv) {
+		return;
+	}
+
+	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+	if (!context) {
+		return;
+	}
+
+	ID3D11ShaderResourceView* boundSRVs[16] = {};
+	context->PSGetShaderResources(0, 16, boundSRVs);
+
+	auto originalSRV = originalDepthView;
+	auto* overrideSRV = depthOverrideTexture->srv.get();
+	auto* nativeENBSRV = g_enbNativeDepthSRV.get();
+	for (UINT srvSlot = 0; srvSlot < 16; ++srvSlot) {
+		if (!boundSRVs[srvSlot]) {
+			continue;
+		}
+
+		if (boundSRVs[srvSlot] == overrideSRV || boundSRVs[srvSlot] == nativeENBSRV) {
+			context->PSSetShaderResources(srvSlot, 1, &originalSRV);
+		}
+
+		boundSRVs[srvSlot]->Release();
+	}
 }
 
 void Upscaling::UpdateSamplerStates(float a_currentMipBias)
@@ -2380,12 +3965,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	ID3D11Resource* frameBufferResource;
 	frameBufferSRV->GetResource(&frameBufferResource);
 
-	D3D11_TEXTURE2D_DESC frameBufferDesc{};
-	static_cast<ID3D11Texture2D*>(frameBufferResource)->GetDesc(&frameBufferDesc);
-
-	// Copy frame buffer to upscaling texture (input for DLSS/FSR)
-	context->CopyResource(upscalingTexture->resource.get(), frameBufferResource);
-
 	static auto gameViewport = Util::State_GetSingleton();
 
 	D3D11_TEXTURE2D_DESC upscaleDesc{};
@@ -2396,6 +3975,27 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	osdRenderSize = renderSize;
 	osdNativeSize = displaySize;
 
+	bool preparedENBInput = false;
+	const bool requiresENBInputConversion =
+		IsENBSRCompatibilityActive(upscaleMethod) &&
+		(originalDynamicWidthRatio != 1.0f || originalDynamicHeightRatio != 1.0f);
+	if (requiresENBInputConversion) {
+		auto* device = reinterpret_cast<ID3D11Device*>(rendererData->device);
+		preparedENBInput = PrepareENBSuperResolutionInput(
+			device,
+			context,
+			frameBufferSRV,
+			upscalingTexture.get(),
+			std::max(1u, static_cast<uint32_t>(renderSize.x)),
+			std::max(1u, static_cast<uint32_t>(renderSize.y)));
+
+	}
+
+	if (!preparedENBInput) {
+		// Native and non-ENB paths already provide a render-rect input.
+		context->CopyResource(upscalingTexture->resource.get(), frameBufferResource);
+	}
+
 	for (auto* rtv : currentRTVs) {
 		if (rtv) {
 			rtv->Release();
@@ -2403,35 +4003,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	}
 	if (currentDSV) {
 		currentDSV->Release();
-	}
-
-	static uint32_t previousViewportWidth = 0;
-	static uint32_t previousViewportHeight = 0;
-	static uint32_t previousFrameBufferWidth = 0;
-	static uint32_t previousFrameBufferHeight = 0;
-	static uint32_t previousUpscaleWidth = 0;
-	static uint32_t previousUpscaleHeight = 0;
-	if (previousViewportWidth != gameViewport->screenWidth ||
-		previousViewportHeight != gameViewport->screenHeight ||
-		previousFrameBufferWidth != frameBufferDesc.Width ||
-		previousFrameBufferHeight != frameBufferDesc.Height ||
-		previousUpscaleWidth != upscaleDesc.Width ||
-		previousUpscaleHeight != upscaleDesc.Height) {
-		logger::info("[Upscaling] sizes viewport={}x{} framebuffer={}x{} upscale={}x{} render={}x{}",
-			gameViewport->screenWidth,
-			gameViewport->screenHeight,
-			frameBufferDesc.Width,
-			frameBufferDesc.Height,
-			upscaleDesc.Width,
-			upscaleDesc.Height,
-			static_cast<uint32_t>(renderSize.x),
-			static_cast<uint32_t>(renderSize.y));
-		previousViewportWidth = gameViewport->screenWidth;
-		previousViewportHeight = gameViewport->screenHeight;
-		previousFrameBufferWidth = frameBufferDesc.Width;
-		previousFrameBufferHeight = frameBufferDesc.Height;
-		previousUpscaleWidth = upscaleDesc.Width;
-		previousUpscaleHeight = upscaleDesc.Height;
 	}
 
 	// Dilate motion vectors and strip projection jitter before temporal upscalers or DLSS-G consume them.
@@ -2525,14 +4096,43 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		!fsrFrameGenerationActive ||
 		DX12SwapChain::GetSingleton()->EnsureFidelityFXFrameGenerationSwapChain();
 	bool d3d12FSRInputsReady = false;
+	bool presentOverrideUIPrepared = false;
 	auto fsrJitter = jitter;
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
+	auto prepareD3D12PresentOverrideUI = [&]() {
+		if (presentOverrideUIPrepared) {
+			return true;
+		}
+
+		if (auto* rtv = reinterpret_cast<ID3D11RenderTargetView*>(rendererData->renderTargets[a_renderTargetIndex].rtView)) {
+			const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+			context->ClearRenderTargetView(rtv, clearColor);
+		}
+
+		presentOverrideUIPrepared = true;
+		return true;
+	};
+	auto setD3D12PresentOverride = [&](ID3D12Resource* a_finalColor) {
+		if (!a_finalColor) {
+			return false;
+		}
+
+		dx12SwapChain->SetPresentOverride(a_finalColor);
+		return true;
+	};
 	auto setD3D12DLSSPresentFinal = [&](ID3D12Resource* a_finalColor) {
 		const auto frameIndex = dx12SwapChain->GetFrameIndex();
 		if (frameIndex >= dlssD3D12PresentFinal.size()) {
 			return;
 		}
 		dlssD3D12PresentFinal[frameIndex].copy_from(a_finalColor);
+	};
+	auto getD3D12FSROutput = [&]() -> ID3D12Resource* {
+		const auto frameIndex = dx12SwapChain->GetFrameIndex();
+		if (frameIndex < fsrOutputD3D12.size()) {
+			return fsrOutputD3D12[frameIndex].get();
+		}
+		return nullptr;
 	};
 	auto getD3D12DLSSOutput = [&]() -> ID3D12Resource* {
 		const auto frameIndex = dx12SwapChain->GetFrameIndex();
@@ -2650,9 +4250,12 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			}
 			runSpatialFallbackNow("D3D12 FSR input failure");
 		} else if (!fsrFrameGenerationActive) {
-			const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(false, true, false, true);
+			const auto usePresentOverride = getD3D12FSROutput() != nullptr;
+			const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(false, true, false, !usePresentOverride);
 			if (d3d12Result.fsr) {
-				if (!copyD3D12FSROutputToD3D11()) {
+				if (usePresentOverride && prepareD3D12PresentOverrideUI() && setD3D12PresentOverride(getD3D12FSROutput())) {
+					// The upscaled scene stays on D3D12; late D3D11 rendering is UI-only.
+				} else if (!copyD3D12FSROutputToD3D11()) {
 					runSpatialFallbackNow("D3D12 FSR copyback failure");
 				}
 			} else {
@@ -2712,13 +4315,25 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		}
 		const bool requestedD3D12FSR = d3d12FSRInputsReady && fsrFrameGenerationActive;
 		const bool requestedD3D12DLSS = useD3D12DLSS;
+		const auto frameIndex = dx12SwapChain->GetFrameIndex();
+		const bool dlssPresentOverrideReady =
+			requestedD3D12DLSS &&
+			frameIndex < dlssD3D12InputsReady.size() &&
+			dlssD3D12InputsReady[frameIndex] &&
+			getD3D12DLSSOutput();
+		const bool hasPresentOverrideOutput =
+			dlssPresentOverrideReady ||
+			(requestedD3D12FSR && getD3D12FSROutput());
+		const auto usePresentOverride = hasPresentOverrideOutput;
 		const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(
 			requestedD3D12DLSS,
 			requestedD3D12FSR,
 			fsrFrameGenerationActive && fsrFrameGenerationSwapChainReady,
-			true);
+			!usePresentOverride);
 		if (d3d12Result.fsr) {
-			if (!copyD3D12FSROutputToD3D11()) {
+			if (usePresentOverride && prepareD3D12PresentOverrideUI() && setD3D12PresentOverride(getD3D12FSROutput())) {
+				// The upscaled scene stays on D3D12; late D3D11 rendering is UI-only.
+			} else if (!copyD3D12FSROutputToD3D11()) {
 				runSpatialFallbackNow("D3D12 FSR copyback failure");
 			}
 		} else if (requestedD3D12FSR) {
@@ -2727,7 +4342,9 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		if (d3d12Result.dlss) {
 			auto* dlssOutput = getD3D12DLSSOutput();
 			setD3D12DLSSPresentFinal(dlssOutput);
-			if (!copyD3D12DLSSOutputToD3D11()) {
+			if (usePresentOverride && prepareD3D12PresentOverrideUI() && setD3D12PresentOverride(dlssOutput)) {
+				// The upscaled scene stays on D3D12; late D3D11 rendering is UI-only.
+			} else if (!copyD3D12DLSSOutputToD3D11()) {
 				runSpatialFallbackNow("D3D12 DLSS copyback failure");
 			}
 		} else if (requestedD3D12DLSS) {
