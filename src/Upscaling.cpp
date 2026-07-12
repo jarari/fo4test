@@ -98,6 +98,7 @@ namespace
 	ENBScreenEffectRender_t g_enbDetailedShadowRender = nullptr;
 	ENBScreenEffectRender_t g_enbDepthOfFieldRender = nullptr;
 	REL::Trampoline g_enbDeferMixTrampoline{ "ENB DeferMix"sv };
+	bool g_enbDeferMixInstalled = false;
 	ID3D11ShaderResourceView** g_enbDepthTextureSRVSlot = nullptr;
 	thread_local int g_enbPrimaryCompositeScopeDepth = 0;
 	thread_local int g_enbNativeImageSpaceParamScopeDepth = 0;
@@ -516,6 +517,10 @@ namespace
 		if (!IsENBUseEffectActive() ||
 			!IsTemporalSuperResolutionMethod(a_upscaleMethod)) {
 			return false;
+		}
+
+		if (TryGetENBBool("EFFECT", "EnableSubSurfaceScattering").value_or(false)) {
+			return true;
 		}
 
 		constexpr uint32_t kBSDFCompositeEnvmap = 1u << 5;
@@ -1093,7 +1098,7 @@ float4 PSMain(VSOut input) : SV_Target
 		}
 		const auto detailedShadow = FindENBSettingStorage(module, *code, "EnableDetailedShadow");
 		if (!detailedShadow) {
-			logger::warn("[ENB SR] Cannot resolve EnableDetailedShadow storage");
+			// Older ENB builds (including 0.307) do not implement this pass.
 			return;
 		}
 
@@ -1155,17 +1160,29 @@ float4 PSMain(VSOut input) : SV_Target
 		const ENBCodeRange& a_code,
 		std::uintptr_t a_ssaoSetting)
 	{
-		constexpr std::array<std::uint8_t, 9> kEntryPrefix{
-			0x40, 0x57,                         // push rdi
-			0x48, 0x81, 0xEC, 0xF0, 0x01, 0x00, 0x00  // sub rsp, 0x1F0
+		if (!a_ssaoSetting) {
+			return 0;
+		}
+
+		// The renderer's stack frame grew from 0x130 (0.307), through 0x1C0
+		// (0.420), to 0x1F0 (0.496). The stable contract is its push-rdi /
+		// large-frame prologue followed immediately by the EnableSSAO gate.
+		constexpr std::array<std::uint8_t, 5> kEntryPrefix{
+			0x40, 0x57, 0x48, 0x81, 0xEC  // push rdi; sub rsp, imm32
 		};
-		for (std::size_t offset = 0; offset + kEntryPrefix.size() + 7 <= a_code.size; ++offset) {
+		for (std::size_t offset = 0; offset + 16 <= a_code.size; ++offset) {
 			const auto entry = a_code.begin + offset;
 			if (!std::equal(kEntryPrefix.begin(), kEntryPrefix.end(), entry)) {
 				continue;
 			}
 
-			const auto settingRead = entry + kEntryPrefix.size();
+			std::uint32_t stackSize = 0;
+			std::memcpy(&stackSize, entry + 5, sizeof(stackSize));
+			if (stackSize < 0x100 || stackSize > 0x400 || (stackSize & 0xF) != 0) {
+				continue;
+			}
+
+			const auto settingRead = entry + 9;
 			if (settingRead[0] == 0x83 && settingRead[1] == 0x3D && settingRead[6] == 0x00 &&
 				ResolveENBRIPRelativeAddress(settingRead, 2, 7) == a_ssaoSetting) {
 				return reinterpret_cast<std::uintptr_t>(entry);
@@ -1178,6 +1195,10 @@ float4 PSMain(VSOut input) : SV_Target
 		const ENBCodeRange& a_code,
 		std::uintptr_t a_ssaoEntry)
 	{
+		if (!a_ssaoEntry) {
+			return 0;
+		}
+
 		// The BSDF-composite wrapper calls the SSAO renderer directly. Its first
 		// predicate is the target-compatibility flag written by ENB's
 		// OMSetRenderTargets hook.
@@ -1185,6 +1206,13 @@ float4 PSMain(VSOut input) : SV_Target
 			0x48, 0x89, 0x5C, 0x24, 0x20,       // mov [rsp+20h], rbx
 			0x55, 0x56, 0x57,                   // push rbp/rsi/rdi
 			0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00  // sub rsp, 0xC0
+		};
+		constexpr std::array<std::uint8_t, 23> kLegacyWrapperPrefix{
+			0x48, 0x89, 0x5C, 0x24, 0x10,       // mov [rsp+10h], rbx
+			0x48, 0x89, 0x6C, 0x24, 0x18,       // mov [rsp+18h], rbp
+			0x48, 0x89, 0x74, 0x24, 0x20,       // mov [rsp+20h], rsi
+			0x57,                               // push rdi
+			0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00  // sub rsp, 0x80
 		};
 
 		for (std::size_t callOffset = 0; callOffset + 5 <= a_code.size; ++callOffset) {
@@ -1196,15 +1224,19 @@ float4 PSMain(VSOut input) : SV_Target
 
 			const auto scanBegin = callOffset > 0x400 ? callOffset - 0x400 : 0;
 			for (std::size_t wrapperOffset = callOffset; wrapperOffset-- > scanBegin;) {
-				if (wrapperOffset + kWrapperPrefix.size() + 7 > a_code.size) {
-					continue;
-				}
 				const auto wrapper = a_code.begin + wrapperOffset;
-				if (!std::equal(kWrapperPrefix.begin(), kWrapperPrefix.end(), wrapper)) {
+				std::size_t prefixSize = 0;
+				if (wrapperOffset + kWrapperPrefix.size() + 7 <= a_code.size &&
+					std::equal(kWrapperPrefix.begin(), kWrapperPrefix.end(), wrapper)) {
+					prefixSize = kWrapperPrefix.size();
+				} else if (wrapperOffset + kLegacyWrapperPrefix.size() + 7 <= a_code.size &&
+					std::equal(kLegacyWrapperPrefix.begin(), kLegacyWrapperPrefix.end(), wrapper)) {
+					prefixSize = kLegacyWrapperPrefix.size();
+				} else {
 					continue;
 				}
 
-				const auto gateRead = wrapper + kWrapperPrefix.size();
+				const auto gateRead = wrapper + prefixSize;
 				if (gateRead[0] != 0x83 || gateRead[1] != 0x3D || gateRead[6] != 0x00) {
 					continue;
 				}
@@ -1224,8 +1256,7 @@ float4 PSMain(VSOut input) : SV_Target
 		//   mov rax,[rcx]
 		//   lea edx,[r8+6]
 		//   call qword ptr [rax+68h]  ; ID3D11DeviceContext::Draw
-		constexpr std::array<std::uint8_t, 20> kDeferMixDraw{
-			0x48, 0x8B, 0x8F, 0x20, 0x6C, 0x00, 0x00,
+		constexpr std::array<std::uint8_t, 13> kDeferMixDrawTail{
 			0x45, 0x33, 0xC0,
 			0x48, 0x8B, 0x01,
 			0x41, 0x8D, 0x50, 0x06,
@@ -1240,10 +1271,16 @@ float4 PSMain(VSOut input) : SV_Target
 
 		const auto scanEnd = std::min(codeEnd, a_compositeWrapper + 0x1000);
 		for (auto cursor = a_compositeWrapper;
-			cursor + kDeferMixDraw.size() <= scanEnd;
+			cursor + 20 <= scanEnd;
 			++cursor) {
 			const auto* instruction = reinterpret_cast<const std::uint8_t*>(cursor);
-			if (std::equal(kDeferMixDraw.begin(), kDeferMixDraw.end(), instruction)) {
+			// 0.307 keeps the wrapper object in rbp; later builds use rdi.
+			// Accept any non-SIB base register while preserving rcx and +0x6C20.
+			if (instruction[0] == 0x48 && instruction[1] == 0x8B &&
+				(instruction[2] & 0xF8) == 0x88 && instruction[2] != 0x8C &&
+				instruction[3] == 0x20 && instruction[4] == 0x6C &&
+				instruction[5] == 0x00 && instruction[6] == 0x00 &&
+				std::equal(kDeferMixDrawTail.begin(), kDeferMixDrawTail.end(), instruction + 7)) {
 				// Return the address of `call qword ptr [rax+68h]`, not the
 				// instruction after it. The following `inc esi` is deliberately
 				// included in the five-byte call-site replacement.
@@ -1258,25 +1295,45 @@ float4 PSMain(VSOut input) : SV_Target
 		const ENBCodeRange& a_code,
 		std::uintptr_t a_detailedShadowSetting)
 	{
-		constexpr std::array<std::uint8_t, 23> kEntryPrefix{
+		if (!a_detailedShadowSetting) {
+			return 0;
+		}
+
+		constexpr std::array<std::uint8_t, 7> kEntryPrefix{
 			0x48, 0x8B, 0xC4,                   // mov rax, rsp
-			0x48, 0x89, 0x58, 0x20,             // mov [rax+0x20], rbx
-			0x55,                               // push rbp
-			0x41, 0x54,                         // push r12
-			0x41, 0x55,                         // push r13
-			0x41, 0x56,                         // push r14
-			0x41, 0x57,                         // push r15
+			0x48, 0x89, 0x58, 0x20              // mov [rax+0x20], rbx
+		};
+		constexpr std::array<std::uint8_t, 7> kStackFrame{
 			0x48, 0x81, 0xEC, 0x30, 0x04, 0x00, 0x00  // sub rsp, 0x430
 		};
-		for (std::size_t offset = 0; offset + kEntryPrefix.size() <= a_code.size; ++offset) {
+		for (std::size_t offset = 0; offset + 32 <= a_code.size; ++offset) {
 			const auto entry = a_code.begin + offset;
 			if (!std::equal(kEntryPrefix.begin(), kEntryPrefix.end(), entry)) {
 				continue;
 			}
 
+			// Register allocation changed between 0.420 and 0.496. Skip the
+			// one- and two-byte nonvolatile push sequence and anchor the frame.
+			std::size_t cursor = kEntryPrefix.size();
+			std::size_t pushCount = 0;
+			while (cursor < 24 && pushCount < 8) {
+				if (entry[cursor] >= 0x50 && entry[cursor] <= 0x57) {
+					++cursor;
+					++pushCount;
+				} else if (entry[cursor] == 0x41 && entry[cursor + 1] >= 0x50 && entry[cursor + 1] <= 0x57) {
+					cursor += 2;
+					++pushCount;
+				} else {
+					break;
+				}
+			}
+			if (pushCount < 4 || !std::equal(kStackFrame.begin(), kStackFrame.end(), entry + cursor)) {
+				continue;
+			}
+
 			const auto scanEnd = std::min(a_code.size, offset + 0x500);
-			for (std::size_t cursor = offset + kEntryPrefix.size(); cursor + 7 <= scanEnd; ++cursor) {
-				const auto settingRead = a_code.begin + cursor;
+			for (std::size_t scan = offset + cursor + kStackFrame.size(); scan + 7 <= scanEnd; ++scan) {
+				const auto settingRead = a_code.begin + scan;
 				if (settingRead[0] == 0x83 && settingRead[1] == 0x3D && settingRead[6] == 0x01 &&
 					ResolveENBRIPRelativeAddress(settingRead, 2, 7) == a_detailedShadowSetting) {
 					return reinterpret_cast<std::uintptr_t>(entry);
@@ -1741,7 +1798,7 @@ float4 PSMain(VSOut input) : SV_Target
 
 	void InstallENBScreenEffectRenderHooks()
 	{
-		if (!enbLoaded || g_enbDetailedShadowRender || g_enbDepthOfFieldRender) {
+		if (!enbLoaded) {
 			return;
 		}
 
@@ -1754,52 +1811,58 @@ float4 PSMain(VSOut input) : SV_Target
 		const auto ssaoSetting = FindENBSettingStorage(module, *code, "EnableSSAO");
 		const auto detailedShadowSetting = FindENBSettingStorage(module, *code, "EnableDetailedShadow");
 		const auto depthOfFieldSetting = FindENBSettingStorage(module, *code, "EnableDepthOfField");
-		const auto ssaoEntry = FindENBSSAORenderEntry(*code, ssaoSetting);
-		const auto detailedShadowEntry = FindENBDetailedShadowRenderEntry(*code, detailedShadowSetting);
-		const auto depthOfFieldEntry = FindENBDepthOfFieldRenderEntry(*code, depthOfFieldSetting);
-		const auto textureDepthName = FindENBModuleString(module, "TextureDepth");
-		const auto depthTextureSRVSlot = FindENBDepthTextureSRVSlot(depthOfFieldEntry, textureDepthName);
-		const auto compositeWrapperEntry = FindENBSSAOCompositeWrapper(*code, ssaoEntry);
-		const auto deferMixDrawCallAddress =
-			FindENBDeferMixDrawCallAddress(*code, compositeWrapperEntry);
-		if (!ssaoEntry || !detailedShadowEntry || !depthOfFieldEntry || !depthTextureSRVSlot ||
-			!compositeWrapperEntry ||
-			!deferMixDrawCallAddress) {
-			logger::warn(
-				"[ENB SR] Cannot resolve screen-effect renderer entries "
-				"(CompositeWrapper={}, SSAO={}, DetailedShadow={}, DepthOfField={}, "
-				"DepthTexture={}, DeferMixDraw={})",
-				compositeWrapperEntry != 0,
-				ssaoEntry != 0,
-				detailedShadowEntry != 0,
-				depthOfFieldEntry != 0,
-				depthTextureSRVSlot != nullptr,
-				deferMixDrawCallAddress != 0);
-			return;
-		}
-		if (!InstallENBDeferMixDrawCallHook(deferMixDrawCallAddress)) {
-			logger::warn("[ENB SR] DeferMix Draw call-site hook is unavailable");
+
+		if (!g_enbDeferMixInstalled && ssaoSetting) {
+			const auto ssaoEntry = FindENBSSAORenderEntry(*code, ssaoSetting);
+			const auto compositeWrapperEntry = FindENBSSAOCompositeWrapper(*code, ssaoEntry);
+			const auto deferMixDrawCallAddress =
+				FindENBDeferMixDrawCallAddress(*code, compositeWrapperEntry);
+			if (!ssaoEntry || !compositeWrapperEntry || !deferMixDrawCallAddress) {
+				logger::warn("[ENB SR] Cannot resolve the DeferMix Draw handoff");
+			} else if (!InstallENBDeferMixDrawCallHook(deferMixDrawCallAddress)) {
+				logger::warn("[ENB SR] DeferMix Draw call-site hook is unavailable");
+			} else {
+				g_enbDeferMixInstalled = true;
+			}
 		}
 
-		const auto detailedShadowTrampoline = Detours::X64::DetourFunction(
-			detailedShadowEntry,
-			reinterpret_cast<std::uintptr_t>(&ENBDetailedShadowRenderThunk));
-		if (!detailedShadowTrampoline) {
-			logger::warn("[ENB SR] Failed to install DetailedShadow projection hook");
-			return;
+		if (!g_enbDetailedShadowRender && detailedShadowSetting) {
+			const auto detailedShadowEntry =
+				FindENBDetailedShadowRenderEntry(*code, detailedShadowSetting);
+			if (!detailedShadowEntry) {
+				logger::warn("[ENB SR] Cannot resolve the DetailedShadow renderer");
+			} else {
+				const auto trampoline = Detours::X64::DetourFunction(
+					detailedShadowEntry,
+					reinterpret_cast<std::uintptr_t>(&ENBDetailedShadowRenderThunk));
+				if (trampoline) {
+					g_enbDetailedShadowRender = reinterpret_cast<ENBScreenEffectRender_t>(trampoline);
+				} else {
+					logger::warn("[ENB SR] Failed to install DetailedShadow projection hook");
+				}
+			}
 		}
-		g_enbDetailedShadowRender = reinterpret_cast<ENBScreenEffectRender_t>(detailedShadowTrampoline);
 
-		g_enbDepthTextureSRVSlot = depthTextureSRVSlot;
-		const auto depthOfFieldTrampoline = Detours::X64::DetourFunction(
-			depthOfFieldEntry,
-			reinterpret_cast<std::uintptr_t>(&ENBDepthOfFieldRenderThunk));
-		if (!depthOfFieldTrampoline) {
-			g_enbDepthTextureSRVSlot = nullptr;
-			logger::warn("[ENB SR] Failed to install DepthOfField depth bridge hook");
-			return;
+		if (!g_enbDepthOfFieldRender && depthOfFieldSetting) {
+			const auto depthOfFieldEntry = FindENBDepthOfFieldRenderEntry(*code, depthOfFieldSetting);
+			const auto textureDepthName = FindENBModuleString(module, "TextureDepth");
+			const auto depthTextureSRVSlot =
+				FindENBDepthTextureSRVSlot(depthOfFieldEntry, textureDepthName);
+			if (!depthOfFieldEntry || !depthTextureSRVSlot) {
+				logger::warn("[ENB SR] Cannot resolve the DepthOfField depth bridge");
+			} else {
+				g_enbDepthTextureSRVSlot = depthTextureSRVSlot;
+				const auto trampoline = Detours::X64::DetourFunction(
+					depthOfFieldEntry,
+					reinterpret_cast<std::uintptr_t>(&ENBDepthOfFieldRenderThunk));
+				if (trampoline) {
+					g_enbDepthOfFieldRender = reinterpret_cast<ENBScreenEffectRender_t>(trampoline);
+				} else {
+					g_enbDepthTextureSRVSlot = nullptr;
+					logger::warn("[ENB SR] Failed to install DepthOfField depth bridge hook");
+				}
+			}
 		}
-		g_enbDepthOfFieldRender = reinterpret_cast<ENBScreenEffectRender_t>(depthOfFieldTrampoline);
 	}
 
 	std::vector<std::uintptr_t> FindENBPrepassVariableSRVSlots(
@@ -1914,12 +1977,9 @@ float4 PSMain(VSOut input) : SV_Target
 		if (textureOriginalSlots.empty()) {
 			return;
 		}
-		g_enbTextureOriginalSRVAddress = textureOriginalSlots.front();
-
 		if (textureDepthSlots.size() != g_enbPrepassDepthSRVAddresses.size()) {
 			return;
 		}
-		std::ranges::copy(textureDepthSlots, g_enbPrepassDepthSRVAddresses.begin());
 
 		const auto trampoline = Detours::X64::DetourFunction(
 			prepass,
@@ -1927,6 +1987,8 @@ float4 PSMain(VSOut input) : SV_Target
 		if (!trampoline) {
 			return;
 		}
+		g_enbTextureOriginalSRVAddress = textureOriginalSlots.front();
+		std::ranges::copy(textureDepthSlots, g_enbPrepassDepthSRVAddresses.begin());
 		ENBPrepassDepthBridge::func = reinterpret_cast<decltype(ENBPrepassDepthBridge::func)>(trampoline);
 	}
 
@@ -3001,10 +3063,13 @@ void Upscaling::InstallHooks()
 	// Fix dynamic resolution for BSDFComposite
 	stl::write_thunk_call<DrawWorld_DeferredComposite_RenderPassImmediately>(
 		REL::ID{ 728427, 2318313 }.address() + (isOG ? 0x8DC : 0x915));
-	if (isOG && enbLoaded) {
-		stl::write_thunk_call<DrawWorld_DeferredComposite_RenderPassImmediately_First>(REL::ID{ 728427 }.address() + 0x1F4);
-		stl::detour_thunk<ImageSpaceManager_RenderEffect>(REL::ID{ 325252 });
-		stl::detour_thunk<BSImagespaceShader_Render_ENBFinalComposite>(REL::ID{ 1388477 });
+	if (enbLoaded) {
+		// The first BSDF composite RenderPassImmediately call is the primary P3
+		// handoff on both runtimes; AE gained one byte before the call site.
+		stl::write_thunk_call<DrawWorld_DeferredComposite_RenderPassImmediately_First>(
+			REL::ID{ 728427, 2318313 }.address() + (isOG ? 0x1F4 : 0x1F5));
+		stl::detour_thunk<ImageSpaceManager_RenderEffect>(REL::ID{ 325252, 2316597 });
+		stl::detour_thunk<BSImagespaceShader_Render_ENBFinalComposite>(REL::ID{ 1388477, 2319297 });
 	}
 	// Fix dynamic resolution for Lens Flare visibility
 	stl::detour_thunk<BSImagespaceShaderLensFlare_RenderLensFlare>(REL::ID{ 676108, 2317547 });
@@ -3032,7 +3097,7 @@ void Upscaling::InstallHooks()
 
 	// Fix dynamic resolution after upscaling
 	stl::detour_thunk<DrawWorld_Imagespace>(REL::ID{ 587723, 2318322 });
-	if (isOG && enbLoaded) {
+	if (enbLoaded) {
 		ResolveENBRenderResolutionGlobals();
 		InstallENBScreenEffectRenderHooks();
 		ResolveENBPrepassResourceSlots();
