@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <optional>
 #include <SimpleIni.h>
+#include <utility>
 #include <vector>
 
 #include "DX12SwapChain.h"
@@ -54,7 +56,7 @@ struct Interface3D_Renderer_Create
 		auto renderer = func(a_name, a_depth, a_fov, a_alwaysRenderWhenEnabled);
 		if (renderer &&
 			Upscaling::GetSingleton()->upscaleMethod != Upscaling::UpscaleMethod::kDisabled &&
-			(a_name == "WorkbenchItem3D" || a_name == "Container3D")) {
+			(a_name == "WorkbenchItem3D" || a_name == "Container3D" || a_name == "PipboyMenu")) {
 			renderer->postAA = true;
 			renderer->useFullPremultAlpha = true;
 		}
@@ -89,14 +91,23 @@ namespace
 	winrt::com_ptr<ID3D11RenderTargetView> g_enbNativeDepthRTV;
 	std::uintptr_t g_enbTextureOriginalSRVAddress = 0;
 	std::array<std::uintptr_t, 2> g_enbPrepassDepthSRVAddresses{};
-	std::uint32_t* g_enbCompositeWidth = nullptr;
-	std::uint32_t* g_enbCompositeHeight = nullptr;
+	std::uint32_t* g_enbFullWidth = nullptr;
+	std::uint32_t* g_enbFullHeight = nullptr;
+	using ENBScreenEffectRender_t = int (*)(void*, std::uint32_t, std::uint32_t, std::uint32_t);
+	using D3D11Draw_t = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
+	ENBScreenEffectRender_t g_enbDetailedShadowRender = nullptr;
+	ENBScreenEffectRender_t g_enbDepthOfFieldRender = nullptr;
+	REL::Trampoline g_enbDeferMixTrampoline{ "ENB DeferMix"sv };
+	ID3D11ShaderResourceView** g_enbDepthTextureSRVSlot = nullptr;
+	thread_local int g_enbPrimaryCompositeScopeDepth = 0;
 	thread_local int g_enbNativeImageSpaceParamScopeDepth = 0;
 	thread_local int g_enbPrepassDepthBridgeScopeDepth = 0;
+	float* GetGlobalDynamicWidthRatio();
+	float* GetGlobalDynamicHeightRatio();
 	thread_local std::array<void*, 2> g_enbHDRFinalCompositeEffects{};
 	thread_local void* g_enbRefractionCompositeEffect = nullptr;
-	thread_local std::array<void*, 0x20> g_enbNativePauseBlurShaders{};
-	thread_local std::size_t g_enbNativePauseBlurShaderCount = 0;
+	thread_local std::array<void*, 0x20> g_enbNativeImageSpaceShaders{};
+	thread_local std::size_t g_enbNativeImageSpaceShaderCount = 0;
 
 	constexpr std::ptrdiff_t kImageSpaceEffectUseDynamicResolutionOffset = 0xA8;
 	constexpr std::ptrdiff_t kImageSpaceEffectListOffset = 0x18;
@@ -151,7 +162,7 @@ namespace
 	bool ShouldForceENBNativeImageSpaceParams(int32_t a_effectIndex)
 	{
 		return g_enbNativeImageSpaceParamScopeDepth > 0 &&
-			(a_effectIndex == 3 || a_effectIndex == 8 || a_effectIndex == 9 || a_effectIndex == 15);
+			(a_effectIndex == 8 || a_effectIndex == 9 || a_effectIndex == 11 || a_effectIndex == 12 || a_effectIndex == 13 || a_effectIndex == 15);
 	}
 
 	struct JobListManager_ServingThread_DisplayLoadingScreen
@@ -269,15 +280,27 @@ namespace
 				a_effect == g_enbHDRFinalCompositeEffects[1]);
 	}
 
-	class ScopedENBNativePauseBlurShaders
+	class ScopedENBNativeImageSpaceShaders
 	{
 	public:
-		ScopedENBNativePauseBlurShaders(void* a_effect, int32_t a_effectIndex) :
-			previousShaders_(g_enbNativePauseBlurShaders),
-			previousCount_(g_enbNativePauseBlurShaderCount)
+		ScopedENBNativeImageSpaceShaders(void* a_effect, int32_t a_effectIndex) :
+			previousShaders_(g_enbNativeImageSpaceShaders),
+			previousCount_(g_enbNativeImageSpaceShaderCount)
 		{
 			if (!a_effect || g_enbNativeImageSpaceParamScopeDepth <= 0 ||
-				(a_effectIndex != 8 && a_effectIndex != 9)) {
+				(a_effectIndex != 8 && a_effectIndex != 9 && a_effectIndex != 11 && 
+					a_effectIndex != 12 && a_effectIndex != 13 && a_effectIndex != 15)) {
+				return;
+			}
+
+			g_enbNativeImageSpaceShaders.fill(nullptr);
+			if (a_effectIndex == 15) {
+				// GammaCorrectLUT is itself a BSImagespaceShader rather than a
+				// container effect. Track the effect object directly so the tiled
+				// RenderEffect path cannot substitute its +0x40 geometry.
+				g_enbNativeImageSpaceShaders[0] = a_effect;
+				g_enbNativeImageSpaceShaderCount = 1;
+				active_ = true;
 				return;
 			}
 
@@ -289,27 +312,26 @@ namespace
 				return;
 			}
 
-			g_enbNativePauseBlurShaders.fill(nullptr);
-			g_enbNativePauseBlurShaderCount = std::min<std::size_t>(
+			g_enbNativeImageSpaceShaderCount = std::min<std::size_t>(
 				effectCount,
-				g_enbNativePauseBlurShaders.size());
+				g_enbNativeImageSpaceShaders.size());
 			std::copy_n(
 				effectList,
-				g_enbNativePauseBlurShaderCount,
-				g_enbNativePauseBlurShaders.begin());
+				g_enbNativeImageSpaceShaderCount,
+				g_enbNativeImageSpaceShaders.begin());
 			active_ = true;
 		}
 
-		~ScopedENBNativePauseBlurShaders()
+		~ScopedENBNativeImageSpaceShaders()
 		{
 			if (active_) {
-				g_enbNativePauseBlurShaders = previousShaders_;
-				g_enbNativePauseBlurShaderCount = previousCount_;
+				g_enbNativeImageSpaceShaders = previousShaders_;
+				g_enbNativeImageSpaceShaderCount = previousCount_;
 			}
 		}
 
-		ScopedENBNativePauseBlurShaders(const ScopedENBNativePauseBlurShaders&) = delete;
-		ScopedENBNativePauseBlurShaders& operator=(const ScopedENBNativePauseBlurShaders&) = delete;
+		ScopedENBNativeImageSpaceShaders(const ScopedENBNativeImageSpaceShaders&) = delete;
+		ScopedENBNativeImageSpaceShaders& operator=(const ScopedENBNativeImageSpaceShaders&) = delete;
 
 	private:
 		std::array<void*, 0x20> previousShaders_{};
@@ -317,12 +339,12 @@ namespace
 		bool active_{ false };
 	};
 
-	bool IsENBNativePauseBlurShader(const void* a_shader)
+	bool IsENBNativeImageSpaceShader(const void* a_shader)
 	{
 		return a_shader && std::find(
-			g_enbNativePauseBlurShaders.begin(),
-			g_enbNativePauseBlurShaders.begin() + g_enbNativePauseBlurShaderCount,
-			a_shader) != g_enbNativePauseBlurShaders.begin() + g_enbNativePauseBlurShaderCount;
+			g_enbNativeImageSpaceShaders.begin(),
+			g_enbNativeImageSpaceShaders.begin() + g_enbNativeImageSpaceShaderCount,
+			a_shader) != g_enbNativeImageSpaceShaders.begin() + g_enbNativeImageSpaceShaderCount;
 	}
 
 	class ScopedENBRefractionCompositeEffect
@@ -466,33 +488,6 @@ namespace
 		return *reinterpret_cast<BOOL*>(param.Data) != FALSE;
 	}
 
-	bool IsENBCompositeFeatureActive()
-	{
-		if (!TryGetENBBool("GLOBAL", "UseEffect").value_or(false)) {
-			return false;
-		}
-
-		constexpr std::array<const char*, 9> features{
-			"EnablePrepass",
-			"EnableSubSurfaceScattering",
-			"EnableSSAO",
-			"EnableDetailedShadow",
-			"EnableWater",
-			"EnableReflections",
-			"EnablePuddleReflections",
-			"EnableDepthOfField",
-			"EnableBloom"
-		};
-
-		for (const auto* feature : features) {
-			if (TryGetENBBool("EFFECT", feature).value_or(false)) {
-				return true;
-			}
-		}
-
-		return false;
-	}
-
 	bool IsTemporalSuperResolutionMethod(Upscaling::UpscaleMethod a_upscaleMethod)
 	{
 		return a_upscaleMethod == Upscaling::UpscaleMethod::kDLSS ||
@@ -519,8 +514,7 @@ namespace
 	bool ShouldLeaveENBDeferredCompositeFeaturePassNative(RE::BSRenderPass* a_renderPass, Upscaling::UpscaleMethod a_upscaleMethod)
 	{
 		if (!IsENBUseEffectActive() ||
-			!IsTemporalSuperResolutionMethod(a_upscaleMethod) ||
-			!IsENBCompositeFeatureActive()) {
+			!IsTemporalSuperResolutionMethod(a_upscaleMethod)) {
 			return false;
 		}
 
@@ -1085,19 +1079,21 @@ float4 PSMain(VSOut input) : SV_Target
 			protection == PAGE_EXECUTE_WRITECOPY;
 	}
 
-	void ResolveENBCompositeResolutionGlobals()
+	void ResolveENBRenderResolutionGlobals()
 	{
-		if (!enbLoaded || g_enbCompositeWidth || g_enbCompositeHeight) {
+		if (!enbLoaded || g_enbFullWidth || g_enbFullHeight) {
 			return;
 		}
 
 		const auto module = FindENBModule();
 		const auto code = GetENBExecutableCode(module);
 		if (!code) {
+			logger::warn("[ENB SR] Cannot inspect ENB executable code for resolution globals");
 			return;
 		}
 		const auto detailedShadow = FindENBSettingStorage(module, *code, "EnableDetailedShadow");
 		if (!detailedShadow) {
+			logger::warn("[ENB SR] Cannot resolve EnableDetailedShadow storage");
 			return;
 		}
 
@@ -1135,51 +1131,676 @@ float4 PSMain(VSOut input) : SV_Target
 					continue;
 				}
 
-				g_enbCompositeWidth = reinterpret_cast<std::uint32_t*>(lower);
-				g_enbCompositeHeight = reinterpret_cast<std::uint32_t*>(upper);
+				auto* fullWidth = reinterpret_cast<std::uint32_t*>(lower);
+				auto* fullHeight = reinterpret_cast<std::uint32_t*>(upper);
+				auto* halfWidthA = reinterpret_cast<std::uint32_t*>(lower + 0x38);
+				auto* halfHeightA = reinterpret_cast<std::uint32_t*>(lower + 0x3C);
+				auto* halfWidthB = reinterpret_cast<std::uint32_t*>(lower + 0x40);
+				auto* halfHeightB = reinterpret_cast<std::uint32_t*>(lower + 0x44);
+				if (!IsWritableProcessAddress(halfWidthA) || !IsWritableProcessAddress(halfHeightA) ||
+					!IsWritableProcessAddress(halfWidthB) || !IsWritableProcessAddress(halfHeightB)) {
+					continue;
+				}
+
+				g_enbFullWidth = fullWidth;
+				g_enbFullHeight = fullHeight;
 				return;
 			}
 		}
+
+		logger::warn("[ENB SR] Failed to resolve a coherent full/half ENB resolution family");
 	}
 
-	class ScopedENBCompositeResolution
+	std::uintptr_t FindENBSSAORenderEntry(
+		const ENBCodeRange& a_code,
+		std::uintptr_t a_ssaoSetting)
+	{
+		constexpr std::array<std::uint8_t, 9> kEntryPrefix{
+			0x40, 0x57,                         // push rdi
+			0x48, 0x81, 0xEC, 0xF0, 0x01, 0x00, 0x00  // sub rsp, 0x1F0
+		};
+		for (std::size_t offset = 0; offset + kEntryPrefix.size() + 7 <= a_code.size; ++offset) {
+			const auto entry = a_code.begin + offset;
+			if (!std::equal(kEntryPrefix.begin(), kEntryPrefix.end(), entry)) {
+				continue;
+			}
+
+			const auto settingRead = entry + kEntryPrefix.size();
+			if (settingRead[0] == 0x83 && settingRead[1] == 0x3D && settingRead[6] == 0x00 &&
+				ResolveENBRIPRelativeAddress(settingRead, 2, 7) == a_ssaoSetting) {
+				return reinterpret_cast<std::uintptr_t>(entry);
+			}
+		}
+		return 0;
+	}
+
+	std::uintptr_t FindENBSSAOCompositeWrapper(
+		const ENBCodeRange& a_code,
+		std::uintptr_t a_ssaoEntry)
+	{
+		// The BSDF-composite wrapper calls the SSAO renderer directly. Its first
+		// predicate is the target-compatibility flag written by ENB's
+		// OMSetRenderTargets hook.
+		constexpr std::array<std::uint8_t, 15> kWrapperPrefix{
+			0x48, 0x89, 0x5C, 0x24, 0x20,       // mov [rsp+20h], rbx
+			0x55, 0x56, 0x57,                   // push rbp/rsi/rdi
+			0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00  // sub rsp, 0xC0
+		};
+
+		for (std::size_t callOffset = 0; callOffset + 5 <= a_code.size; ++callOffset) {
+			const auto call = a_code.begin + callOffset;
+			if (call[0] != 0xE8 ||
+				ResolveENBRIPRelativeAddress(call, 1, 5) != a_ssaoEntry) {
+				continue;
+			}
+
+			const auto scanBegin = callOffset > 0x400 ? callOffset - 0x400 : 0;
+			for (std::size_t wrapperOffset = callOffset; wrapperOffset-- > scanBegin;) {
+				if (wrapperOffset + kWrapperPrefix.size() + 7 > a_code.size) {
+					continue;
+				}
+				const auto wrapper = a_code.begin + wrapperOffset;
+				if (!std::equal(kWrapperPrefix.begin(), kWrapperPrefix.end(), wrapper)) {
+					continue;
+				}
+
+				const auto gateRead = wrapper + kWrapperPrefix.size();
+				if (gateRead[0] != 0x83 || gateRead[1] != 0x3D || gateRead[6] != 0x00) {
+					continue;
+				}
+				return reinterpret_cast<std::uintptr_t>(wrapper);
+			}
+		}
+		return 0;
+	}
+
+	std::uintptr_t FindENBDeferMixDrawCallAddress(
+		const ENBCodeRange& a_code,
+		std::uintptr_t a_compositeWrapper)
+	{
+		// The post-SSAO handoff is the wrapper's only Draw(6, 0):
+		//   mov rcx,[rdi+6C20h]
+		//   xor r8d,r8d
+		//   mov rax,[rcx]
+		//   lea edx,[r8+6]
+		//   call qword ptr [rax+68h]  ; ID3D11DeviceContext::Draw
+		constexpr std::array<std::uint8_t, 20> kDeferMixDraw{
+			0x48, 0x8B, 0x8F, 0x20, 0x6C, 0x00, 0x00,
+			0x45, 0x33, 0xC0,
+			0x48, 0x8B, 0x01,
+			0x41, 0x8D, 0x50, 0x06,
+			0xFF, 0x50, 0x68
+		};
+
+		const auto codeBegin = reinterpret_cast<std::uintptr_t>(a_code.begin);
+		const auto codeEnd = codeBegin + a_code.size;
+		if (a_compositeWrapper < codeBegin || a_compositeWrapper >= codeEnd) {
+			return 0;
+		}
+
+		const auto scanEnd = std::min(codeEnd, a_compositeWrapper + 0x1000);
+		for (auto cursor = a_compositeWrapper;
+			cursor + kDeferMixDraw.size() <= scanEnd;
+			++cursor) {
+			const auto* instruction = reinterpret_cast<const std::uint8_t*>(cursor);
+			if (std::equal(kDeferMixDraw.begin(), kDeferMixDraw.end(), instruction)) {
+				// Return the address of `call qword ptr [rax+68h]`, not the
+				// instruction after it. The following `inc esi` is deliberately
+				// included in the five-byte call-site replacement.
+				return cursor + 17;
+			}
+		}
+		return 0;
+	}
+
+
+	std::uintptr_t FindENBDetailedShadowRenderEntry(
+		const ENBCodeRange& a_code,
+		std::uintptr_t a_detailedShadowSetting)
+	{
+		constexpr std::array<std::uint8_t, 23> kEntryPrefix{
+			0x48, 0x8B, 0xC4,                   // mov rax, rsp
+			0x48, 0x89, 0x58, 0x20,             // mov [rax+0x20], rbx
+			0x55,                               // push rbp
+			0x41, 0x54,                         // push r12
+			0x41, 0x55,                         // push r13
+			0x41, 0x56,                         // push r14
+			0x41, 0x57,                         // push r15
+			0x48, 0x81, 0xEC, 0x30, 0x04, 0x00, 0x00  // sub rsp, 0x430
+		};
+		for (std::size_t offset = 0; offset + kEntryPrefix.size() <= a_code.size; ++offset) {
+			const auto entry = a_code.begin + offset;
+			if (!std::equal(kEntryPrefix.begin(), kEntryPrefix.end(), entry)) {
+				continue;
+			}
+
+			const auto scanEnd = std::min(a_code.size, offset + 0x500);
+			for (std::size_t cursor = offset + kEntryPrefix.size(); cursor + 7 <= scanEnd; ++cursor) {
+				const auto settingRead = a_code.begin + cursor;
+				if (settingRead[0] == 0x83 && settingRead[1] == 0x3D && settingRead[6] == 0x01 &&
+					ResolveENBRIPRelativeAddress(settingRead, 2, 7) == a_detailedShadowSetting) {
+					return reinterpret_cast<std::uintptr_t>(entry);
+				}
+			}
+		}
+		return 0;
+	}
+
+	std::uintptr_t FindENBDepthOfFieldRenderEntry(
+		const ENBCodeRange& a_code,
+		std::uintptr_t a_depthOfFieldSetting)
+	{
+		constexpr std::array<std::uint8_t, 32> kEntryPrefix{
+			0x48, 0x8B, 0xC4,                   // mov rax,rsp
+			0x44, 0x89, 0x48, 0x20,             // mov [rax+20h],r9d
+			0x44, 0x89, 0x40, 0x18,             // mov [rax+18h],r8d
+			0x89, 0x50, 0x10,                   // mov [rax+10h],edx
+			0x55, 0x56, 0x57,                   // push rbp/rsi/rdi
+			0x41, 0x54, 0x41, 0x55,             // push r12/r13
+			0x41, 0x56, 0x41, 0x57,             // push r14/r15
+			0x48, 0x81, 0xEC, 0xD0, 0x05, 0x00, 0x00  // sub rsp,5D0h
+		};
+		for (std::size_t offset = 0; offset + kEntryPrefix.size() <= a_code.size; ++offset) {
+			const auto entry = a_code.begin + offset;
+			if (!std::equal(kEntryPrefix.begin(), kEntryPrefix.end(), entry)) {
+				continue;
+			}
+
+			const auto scanEnd = std::min(a_code.size, offset + 0x100);
+			for (std::size_t cursor = offset + kEntryPrefix.size(); cursor + 7 <= scanEnd; ++cursor) {
+				const auto settingRead = a_code.begin + cursor;
+				if (settingRead[0] == 0x83 && settingRead[1] == 0x3D && settingRead[6] == 0x00 &&
+					ResolveENBRIPRelativeAddress(settingRead, 2, 7) == a_depthOfFieldSetting) {
+					return reinterpret_cast<std::uintptr_t>(entry);
+				}
+			}
+		}
+		return 0;
+	}
+
+	ID3D11ShaderResourceView** FindENBDepthTextureSRVSlot(
+		std::uintptr_t a_depthOfFieldEntry,
+		std::uintptr_t a_textureDepthName)
+	{
+		if (!a_depthOfFieldEntry || !a_textureDepthName) {
+			return nullptr;
+		}
+
+		const auto* function = reinterpret_cast<const std::uint8_t*>(a_depthOfFieldEntry);
+		constexpr std::size_t kBindingScanSize = 0x400;
+		for (std::size_t offset = 0; offset + 14 <= kBindingScanSize; ++offset) {
+			const auto load = function + offset;
+			// mov r8,[depth SRV]; lea rdx,"TextureDepth"
+			if (load[0] != 0x4C || load[1] != 0x8B || load[2] != 0x05 ||
+				load[7] != 0x48 || load[8] != 0x8D || load[9] != 0x15 ||
+				ResolveENBRIPRelativeAddress(load + 7, 3, 7) != a_textureDepthName) {
+				continue;
+			}
+
+			auto** slot = reinterpret_cast<ID3D11ShaderResourceView**>(
+				ResolveENBRIPRelativeAddress(load, 3, 7));
+			if (IsWritableProcessAddress(slot)) {
+				return slot;
+			}
+		}
+		return nullptr;
+	}
+
+	bool ShouldUseENBProxyCompatibility()
+	{
+		auto upscaling = Upscaling::GetSingleton();
+		auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+		return upscaling && renderTargetManager &&
+			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f) &&
+			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
+	}
+
+
+	class ScopedENBDeferMixNativeViewport
 	{
 	public:
-		ScopedENBCompositeResolution(bool a_active, float a_widthRatio, float a_heightRatio)
+		explicit ScopedENBDeferMixNativeViewport(ID3D11DeviceContext* a_context, bool a_active)
 		{
-			if (!a_active || !g_enbCompositeWidth || !g_enbCompositeHeight ||
-				a_widthRatio <= 0.0f || a_heightRatio <= 0.0f) {
+			if (!a_active) {
 				return;
 			}
 
-			originalWidth_ = *g_enbCompositeWidth;
-			originalHeight_ = *g_enbCompositeHeight;
-			if (originalWidth_ < 64 || originalHeight_ < 64 ||
-				originalWidth_ > 16384 || originalHeight_ > 16384) {
+			auto* upscaling = Upscaling::GetSingleton();
+			context_ = a_context;
+			auto* nativeP3 = upscaling ?
+				reinterpret_cast<ID3D11Texture2D*>(upscaling->originalRenderTargets[3].texture) : nullptr;
+			if (!context_ || !nativeP3) {
+				context_ = nullptr;
 				return;
 			}
 
-			*g_enbCompositeWidth = std::max(1u, static_cast<std::uint32_t>(originalWidth_ * a_widthRatio));
-			*g_enbCompositeHeight = std::max(1u, static_cast<std::uint32_t>(originalHeight_ * a_heightRatio));
+			viewportCount_ = static_cast<UINT>(viewports_.size());
+			context_->RSGetViewports(&viewportCount_, viewports_.data());
+			if (viewportCount_ == 0) {
+				context_ = nullptr;
+				return;
+			}
+
+			D3D11_TEXTURE2D_DESC nativeDesc{};
+			nativeP3->GetDesc(&nativeDesc);
+			auto nativeViewport = viewports_[0];
+			nativeViewport.TopLeftX = 0.0f;
+			nativeViewport.TopLeftY = 0.0f;
+			nativeViewport.Width = static_cast<float>(nativeDesc.Width);
+			nativeViewport.Height = static_cast<float>(nativeDesc.Height);
+			context_->RSSetViewports(1, &nativeViewport);
 			active_ = true;
 		}
 
-		~ScopedENBCompositeResolution()
+		~ScopedENBDeferMixNativeViewport()
 		{
 			if (active_) {
-				*g_enbCompositeWidth = originalWidth_;
-				*g_enbCompositeHeight = originalHeight_;
+				context_->RSSetViewports(viewportCount_, viewports_.data());
 			}
 		}
 
-		ScopedENBCompositeResolution(const ScopedENBCompositeResolution&) = delete;
-		ScopedENBCompositeResolution& operator=(const ScopedENBCompositeResolution&) = delete;
+		ScopedENBDeferMixNativeViewport(const ScopedENBDeferMixNativeViewport&) = delete;
+		ScopedENBDeferMixNativeViewport& operator=(const ScopedENBDeferMixNativeViewport&) = delete;
 
 	private:
-		std::uint32_t originalWidth_{ 0 };
-		std::uint32_t originalHeight_{ 0 };
+		ID3D11DeviceContext* context_{ nullptr };
+		std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_{};
+		UINT viewportCount_{ 0 };
 		bool active_{ false };
 	};
+
+	void STDMETHODCALLTYPE ENBDeferMixDrawSiteThunk(
+		ID3D11DeviceContext* a_context,
+		UINT a_vertexCount,
+		UINT a_startVertexLocation,
+		D3D11Draw_t a_draw)
+	{
+		const bool isENBDeferMixHandoff =
+			g_enbPrimaryCompositeScopeDepth > 0 &&
+			a_vertexCount == 6 &&
+			a_startVertexLocation == 0;
+
+		// ENB's private scene color and AO textures retain native allocations but
+		// contain the current frame in the upper-left render rectangle. DeferMix
+		// restores native P3 and samples those textures with normalized UVs. If it
+		// draws through Fallout's 2293x960 DRS viewport, that valid rectangle is
+		// contracted once more to 1529x640. Use P3's native viewport for this draw
+		// only; all SSAO/DetailedShadow passes and the engine viewport stay intact.
+		const ScopedENBDeferMixNativeViewport nativeViewport(a_context, isENBDeferMixHandoff);
+		a_draw(a_context, a_vertexCount, a_startVertexLocation);
+	}
+
+	bool InstallENBDeferMixDrawCallHook(std::uintptr_t a_drawCall)
+	{
+		// Replace:
+		//   call qword ptr [rax+68h]  ; FF 50 68
+		//   inc esi                   ; FF C6
+		// with a five-byte call to a generated stub. The stub loads the same
+		// vtable target into r9, calls our four-argument helper, reproduces the
+		// increment, and returns to the original cmp at drawCall+5.
+		constexpr std::array<std::uint8_t, 5> kExpected{ 0xFF, 0x50, 0x68, 0xFF, 0xC6 };
+		if (!a_drawCall || !std::equal(
+				kExpected.begin(), kExpected.end(),
+				reinterpret_cast<const std::uint8_t*>(a_drawCall))) {
+			logger::warn("[ENB SR] DeferMix Draw call-site bytes do not match");
+			return false;
+		}
+
+		// The process-wide F4SE trampoline is allocated near Fallout/the plugin and
+		// can be more than 2 GiB from ENB's deliberately low 0x180... image. Give
+		// this call site its own page anchored at the ENB instruction so CALL rel32
+		// can reach the generated stub without a far branch island.
+		if (g_enbDeferMixTrampoline.empty()) {
+			g_enbDeferMixTrampoline.create(4096, reinterpret_cast<void*>(a_drawCall));
+		}
+		auto& trampoline = g_enbDeferMixTrampoline;
+		constexpr std::size_t kStubSize = 27;
+		auto* stub = static_cast<std::uint8_t*>(trampoline.allocate(kStubSize));
+		const std::array<std::uint8_t, kStubSize> stubTemplate{
+			0x4C, 0x8B, 0x48, 0x68,                         // mov r9,[rax+68h]
+			0x48, 0x83, 0xEC, 0x28,                         // sub rsp,28h
+			0x48, 0xB8,                                     // mov rax,imm64
+			0, 0, 0, 0, 0, 0, 0, 0,
+			0xFF, 0xD0,                                     // call rax
+			0x48, 0x83, 0xC4, 0x28,                         // add rsp,28h
+			0xFF, 0xC6,                                     // inc esi
+			0xC3                                            // ret
+		};
+		std::memcpy(stub, stubTemplate.data(), stubTemplate.size());
+		const auto helper = reinterpret_cast<std::uintptr_t>(&ENBDeferMixDrawSiteThunk);
+		std::memcpy(stub + 10, &helper, sizeof(helper));
+
+		const auto displacement64 =
+			reinterpret_cast<std::int64_t>(stub) - static_cast<std::int64_t>(a_drawCall + 5);
+		if (displacement64 < std::numeric_limits<std::int32_t>::min() ||
+			displacement64 > std::numeric_limits<std::int32_t>::max()) {
+			logger::warn("[ENB SR] DeferMix call-site trampoline is outside rel32 range");
+			return false;
+		}
+
+		std::array<std::uint8_t, 5> callPatch{ 0xE8, 0, 0, 0, 0 };
+		const auto displacement = static_cast<std::int32_t>(displacement64);
+		std::memcpy(callPatch.data() + 1, &displacement, sizeof(displacement));
+		if (!REL::WriteSafeData(a_drawCall, callPatch)) {
+			logger::warn("[ENB SR] Failed to patch the DeferMix Draw call site");
+			return false;
+		}
+
+		return true;
+	}
+
+	bool CopyENBInputToRenderProxy(int a_target)
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		auto* rendererData = RE::BSGraphics::GetRendererData();
+		if (!upscaling || !rendererData || a_target < 0 ||
+			a_target >= static_cast<int>(std::size(upscaling->proxyRenderTargets))) {
+			return false;
+		}
+
+		auto* source = reinterpret_cast<ID3D11Texture2D*>(upscaling->originalRenderTargets[a_target].texture);
+		auto* destination = reinterpret_cast<ID3D11Texture2D*>(upscaling->proxyRenderTargets[a_target].texture);
+		auto* destinationSRV = reinterpret_cast<ID3D11ShaderResourceView*>(upscaling->proxyRenderTargets[a_target].srView);
+		auto* context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+		if (!source || !destination || !destinationSRV || !context) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC sourceDesc{};
+		D3D11_TEXTURE2D_DESC destinationDesc{};
+		source->GetDesc(&sourceDesc);
+		destination->GetDesc(&destinationDesc);
+		if (sourceDesc.Format != destinationDesc.Format ||
+			sourceDesc.SampleDesc.Count != destinationDesc.SampleDesc.Count ||
+			destinationDesc.Width > sourceDesc.Width || destinationDesc.Height > sourceDesc.Height) {
+			return false;
+		}
+
+		// Fallout's native allocation contains the current frame in its upper-left
+		// render rectangle. Copy that rectangle 1:1 into the render-sized proxy.
+		// ENB can then sample the complete current frame with normalized UVs while
+		// retaining its native private output family. This is deliberately not a
+		// stretch and does not alter the renderer's active target or metadata.
+		const D3D11_BOX sourceBox{
+			0, 0, 0,
+			destinationDesc.Width,
+			destinationDesc.Height,
+			1
+		};
+		context->CopySubresourceRegion(destination, 0, 0, 0, 0, source, 0, &sourceBox);
+		return true;
+	}
+
+
+	class ScopedENBDetailedShadowProjection
+	{
+	public:
+		explicit ScopedENBDetailedShadowProjection(void* a_this)
+		{
+			const float ratioX = originalDynamicWidthRatio;
+			const float ratioY = originalDynamicHeightRatio;
+			if (!a_this || !ShouldUseENBProxyCompatibility() ||
+				!std::isfinite(ratioX) || !std::isfinite(ratioY) ||
+				ratioX <= 0.0f || ratioY <= 0.0f ||
+				(ratioX == 1.0f && ratioY == 1.0f)) {
+				return;
+			}
+
+			// Fallout's cb1[0].xy contains 1/renderSize, but ENB's PS_DShadow only
+			// keeps that value for Y. Its "NEW GAME" path overwrites r1.x with
+			// v0.x / nativeWidth while r1.z remains 1 - v0.y / renderHeight.
+			// GPU cb1 reconstruction therefore needs an X-only correction. ENB also
+			// inverts the CPU mirror into Matrix03, whose output samples native Depth
+			// P2; that separate path needs both X and Y mapped into the native
+			// allocation subrect. Keep distinct GPU and CPU matrix variants.
+			auto* fields = reinterpret_cast<std::uintptr_t*>(a_this);
+			const auto bufferState = fields[19];
+			auto** cpuDataSlot = reinterpret_cast<std::byte**>(bufferState + 48);
+			auto** gpuBufferSlot = reinterpret_cast<ID3D11Buffer**>(bufferState + 64);
+			auto** contextSlot = reinterpret_cast<ID3D11DeviceContext**>(
+				reinterpret_cast<std::byte*>(a_this) + 0x6C20);
+			if (!bufferState || !IsWritableProcessAddress(cpuDataSlot) || !*cpuDataSlot ||
+				!IsWritableProcessAddress(gpuBufferSlot) || !*gpuBufferSlot ||
+				!IsWritableProcessAddress(contextSlot) || !*contextSlot) {
+				return;
+			}
+
+			buffer_ = *gpuBufferSlot;
+			context_ = *contextSlot;
+			buffer_->GetDesc(&bufferDesc_);
+			if (bufferDesc_.ByteWidth < 448 || bufferDesc_.ByteWidth > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16 ||
+				!IsWritableProcessAddress(*cpuDataSlot + bufferDesc_.ByteWidth - 1)) {
+				buffer_ = nullptr;
+				context_ = nullptr;
+				return;
+			}
+
+			cpuData_ = *cpuDataSlot;
+			matrix_ = reinterpret_cast<float*>(*cpuDataSlot + 320);
+			if (!IsWritableProcessAddress(matrix_) ||
+				!IsWritableProcessAddress(matrix_ + matrixBackup_.size() - 1)) {
+				cpuData_ = nullptr;
+				matrix_ = nullptr;
+				buffer_ = nullptr;
+				context_ = nullptr;
+				return;
+			}
+
+			std::copy_n(matrix_, matrixBackup_.size(), matrixBackup_.begin());
+			gpuData_.resize(bufferDesc_.ByteWidth);
+			std::memcpy(gpuData_.data(), cpuData_, bufferDesc_.ByteWidth);
+			float nativeToRenderX = 1.0f / ratioX;
+			float nativeToRenderY = 1.0f / ratioY;
+			const auto frameBufferState = fields[9];
+			auto** frameCpuDataSlot = reinterpret_cast<std::byte**>(frameBufferState + 48);
+			if (frameBufferState && IsWritableProcessAddress(frameCpuDataSlot) && *frameCpuDataSlot &&
+				IsWritableProcessAddress(*frameCpuDataSlot + sizeof(float)) &&
+				g_enbFullWidth && g_enbFullHeight && *g_enbFullWidth > 0 && *g_enbFullHeight > 0) {
+				const auto* reciprocalRenderSize = reinterpret_cast<const float*>(*frameCpuDataSlot);
+				const auto reciprocalRenderWidth = reciprocalRenderSize[0];
+				const auto reciprocalRenderHeight = reciprocalRenderSize[1];
+				const auto exactScale = static_cast<float>(*g_enbFullWidth) * reciprocalRenderWidth;
+				const auto exactScaleY = static_cast<float>(*g_enbFullHeight) * reciprocalRenderHeight;
+				if (std::isfinite(exactScale) && exactScale > 0.0f) {
+					nativeToRenderX = exactScale;
+				}
+				if (std::isfinite(exactScaleY) && exactScaleY > 0.0f) {
+					nativeToRenderY = exactScaleY;
+				}
+			}
+
+			// The GPU buffer supplies cb1[20..27] to view reconstruction. Patch X
+			// in both the normal and near-depth inverse projections, but preserve Y.
+			ComposeNativeToRender(
+				reinterpret_cast<float*>(gpuData_.data() + 320), nativeToRenderX, 1.0f);
+			ComposeNativeToRender(
+				reinterpret_cast<float*>(gpuData_.data() + 384), nativeToRenderX, 1.0f);
+
+			// ENB copies only cb1[20..23] from the CPU mirror and inverts it into
+			// Matrix03. Its projected UV samples a native allocation, so this copy
+			// needs the full render-NDC -> native-subrect conversion on both axes.
+			ComposeNativeToRender(matrix_, nativeToRenderX, nativeToRenderY);
+			if (!Upload(gpuData_.data())) {
+				std::copy(matrixBackup_.begin(), matrixBackup_.end(), matrix_);
+				gpuData_.clear();
+				cpuData_ = nullptr;
+				matrix_ = nullptr;
+				buffer_ = nullptr;
+				context_ = nullptr;
+				return;
+			}
+			active_ = true;
+		}
+
+		~ScopedENBDetailedShadowProjection()
+		{
+			if (active_) {
+				std::copy(matrixBackup_.begin(), matrixBackup_.end(), matrix_);
+				Upload(cpuData_);
+			}
+		}
+
+		ScopedENBDetailedShadowProjection(const ScopedENBDetailedShadowProjection&) = delete;
+		ScopedENBDetailedShadowProjection& operator=(const ScopedENBDetailedShadowProjection&) = delete;
+
+	private:
+		static void ComposeNativeToRender(float* a_matrix, float a_scaleX, float a_scaleY)
+		{
+			const float translateX = a_scaleX - 1.0f;
+			const float translateY = 1.0f - a_scaleY;
+			for (std::size_t row = 0; row < 4; ++row) {
+				const auto offset = row * 4;
+				const float column0 = a_matrix[offset];
+				const float column1 = a_matrix[offset + 1];
+				a_matrix[offset] = column0 * a_scaleX;
+				a_matrix[offset + 1] = column1 * a_scaleY;
+				a_matrix[offset + 3] += translateX * column0 + translateY * column1;
+			}
+		}
+
+		bool Upload(const void* a_data) const
+		{
+			if (!context_ || !buffer_ || !a_data) {
+				return false;
+			}
+			if (bufferDesc_.Usage == D3D11_USAGE_DYNAMIC &&
+				(bufferDesc_.CPUAccessFlags & D3D11_CPU_ACCESS_WRITE) != 0) {
+				D3D11_MAPPED_SUBRESOURCE mapped{};
+				if (FAILED(context_->Map(buffer_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+					return false;
+				}
+				std::memcpy(mapped.pData, a_data, bufferDesc_.ByteWidth);
+				context_->Unmap(buffer_, 0);
+				return true;
+			}
+			if (bufferDesc_.Usage == D3D11_USAGE_DEFAULT) {
+				context_->UpdateSubresource(buffer_, 0, nullptr, a_data, 0, 0);
+				return true;
+			}
+			return false;
+		}
+
+		ID3D11DeviceContext* context_ = nullptr;
+		ID3D11Buffer* buffer_ = nullptr;
+		std::byte* cpuData_ = nullptr;
+		D3D11_BUFFER_DESC bufferDesc_{};
+		float* matrix_ = nullptr;
+		std::array<float, 16> matrixBackup_{};
+		std::vector<std::byte> gpuData_{};
+		bool active_ = false;
+	};
+
+	int ENBDetailedShadowRenderThunk(void* a_this, std::uint32_t a2, std::uint32_t a3, std::uint32_t a4)
+	{
+		const ScopedENBDetailedShadowProjection projection(a_this);
+		// Keep Texture0 (+0xD38) bound to Fallout's native Depth P2 SRV. The
+		// allocation and E70 producer are already pixel-aligned; only ENB's
+		// reconstruction matrix lacks Fallout's render-rectangle transform.
+		const auto result = g_enbDetailedShadowRender(a_this, a2, a3, a4);
+		return result;
+	}
+
+	class ScopedENBDepthOfFieldDepth
+	{
+	public:
+		ScopedENBDepthOfFieldDepth()
+		{
+			auto* upscaling = Upscaling::GetSingleton();
+			if (g_enbNativeImageSpaceParamScopeDepth <= 0 ||
+				(originalDynamicWidthRatio == 1.0f && originalDynamicHeightRatio == 1.0f) ||
+				!upscaling || !IsENBSRCompatibilityActive(upscaling->upscaleMethod) ||
+				!g_enbDepthTextureSRVSlot || !g_enbNativeDepthSRV) {
+				return;
+			}
+
+			original_ = *g_enbDepthTextureSRVSlot;
+			*g_enbDepthTextureSRVSlot = g_enbNativeDepthSRV.get();
+			active_ = true;
+		}
+
+		~ScopedENBDepthOfFieldDepth()
+		{
+			if (active_) {
+				*g_enbDepthTextureSRVSlot = original_;
+			}
+		}
+
+		ScopedENBDepthOfFieldDepth(const ScopedENBDepthOfFieldDepth&) = delete;
+		ScopedENBDepthOfFieldDepth& operator=(const ScopedENBDepthOfFieldDepth&) = delete;
+
+	private:
+		ID3D11ShaderResourceView* original_ = nullptr;
+		bool active_ = false;
+	};
+
+	int ENBDepthOfFieldRenderThunk(void* a_this, std::uint32_t a2, std::uint32_t a3, std::uint32_t a4)
+	{
+		const ScopedENBDepthOfFieldDepth depthBridge;
+		return g_enbDepthOfFieldRender(a_this, a2, a3, a4);
+	}
+
+	void InstallENBScreenEffectRenderHooks()
+	{
+		if (!enbLoaded || g_enbDetailedShadowRender || g_enbDepthOfFieldRender) {
+			return;
+		}
+
+		const auto module = FindENBModule();
+		const auto code = GetENBExecutableCode(module);
+		if (!module || !code) {
+			logger::warn("[ENB SR] Cannot inspect ENB code for screen-effect renderer hooks");
+			return;
+		}
+		const auto ssaoSetting = FindENBSettingStorage(module, *code, "EnableSSAO");
+		const auto detailedShadowSetting = FindENBSettingStorage(module, *code, "EnableDetailedShadow");
+		const auto depthOfFieldSetting = FindENBSettingStorage(module, *code, "EnableDepthOfField");
+		const auto ssaoEntry = FindENBSSAORenderEntry(*code, ssaoSetting);
+		const auto detailedShadowEntry = FindENBDetailedShadowRenderEntry(*code, detailedShadowSetting);
+		const auto depthOfFieldEntry = FindENBDepthOfFieldRenderEntry(*code, depthOfFieldSetting);
+		const auto textureDepthName = FindENBModuleString(module, "TextureDepth");
+		const auto depthTextureSRVSlot = FindENBDepthTextureSRVSlot(depthOfFieldEntry, textureDepthName);
+		const auto compositeWrapperEntry = FindENBSSAOCompositeWrapper(*code, ssaoEntry);
+		const auto deferMixDrawCallAddress =
+			FindENBDeferMixDrawCallAddress(*code, compositeWrapperEntry);
+		if (!ssaoEntry || !detailedShadowEntry || !depthOfFieldEntry || !depthTextureSRVSlot ||
+			!compositeWrapperEntry ||
+			!deferMixDrawCallAddress) {
+			logger::warn(
+				"[ENB SR] Cannot resolve screen-effect renderer entries "
+				"(CompositeWrapper={}, SSAO={}, DetailedShadow={}, DepthOfField={}, "
+				"DepthTexture={}, DeferMixDraw={})",
+				compositeWrapperEntry != 0,
+				ssaoEntry != 0,
+				detailedShadowEntry != 0,
+				depthOfFieldEntry != 0,
+				depthTextureSRVSlot != nullptr,
+				deferMixDrawCallAddress != 0);
+			return;
+		}
+		if (!InstallENBDeferMixDrawCallHook(deferMixDrawCallAddress)) {
+			logger::warn("[ENB SR] DeferMix Draw call-site hook is unavailable");
+		}
+
+		const auto detailedShadowTrampoline = Detours::X64::DetourFunction(
+			detailedShadowEntry,
+			reinterpret_cast<std::uintptr_t>(&ENBDetailedShadowRenderThunk));
+		if (!detailedShadowTrampoline) {
+			logger::warn("[ENB SR] Failed to install DetailedShadow projection hook");
+			return;
+		}
+		g_enbDetailedShadowRender = reinterpret_cast<ENBScreenEffectRender_t>(detailedShadowTrampoline);
+
+		g_enbDepthTextureSRVSlot = depthTextureSRVSlot;
+		const auto depthOfFieldTrampoline = Detours::X64::DetourFunction(
+			depthOfFieldEntry,
+			reinterpret_cast<std::uintptr_t>(&ENBDepthOfFieldRenderThunk));
+		if (!depthOfFieldTrampoline) {
+			g_enbDepthTextureSRVSlot = nullptr;
+			logger::warn("[ENB SR] Failed to install DepthOfField depth bridge hook");
+			return;
+		}
+		g_enbDepthOfFieldRender = reinterpret_cast<ENBScreenEffectRender_t>(depthOfFieldTrampoline);
+	}
 
 	std::vector<std::uintptr_t> FindENBPrepassVariableSRVSlots(
 		std::uintptr_t a_prepass,
@@ -1845,8 +2466,8 @@ struct DrawWorld_Imagespace_RenderEffectRange
 
 		if (requiresOverride) {
 			if (enbCompatibilityActive) {
-				const std::initializer_list<int> kENBBridgeTargets{
-					0, 20, 57, 24, 25, 23, 58, 59, 28, 3, 9, 60, 61, 4, 29, 1, 2, 36, 37, 22, 10, 11, 7, 8, 64, 14, 16
+				const std::initializer_list<int> kENBSpatialBridgeTargets{
+					0, 20, 57, 24, 25, 23, 58, 59, 28, 3, 9, 60, 61, 4, 1, 2, 36, 37, 22, 10, 11, 7, 8, 64, 14, 16
 				};
 
 				upscaling->OverrideDepth(true);
@@ -1860,12 +2481,15 @@ struct DrawWorld_Imagespace_RenderEffectRange
 					static_cast<uint32_t>(gameViewport->screenWidth),
 					static_cast<uint32_t>(gameViewport->screenHeight));
 
-				// Use the proxies only to extract the valid render rectangle. Running
-				// effect 3 here would let ENB observe an 853x480 dispatch before its
-				// native invocation and cache the wrong prepass dimensions.
-				upscaling->OverrideRenderTargets(kENBBridgeTargets);
+				// Promote only after the deferred/ENB composites are complete. The
+				// render-sized proxies provide the valid source rectangle; P29 remains
+				// render-sized because motion-vector dilation consumes it directly.
+				// P4's feature pass writes the original native allocation, so refresh
+				// its stale proxy with an exact 1:1 render-rectangle copy first.
+				CopyENBInputToRenderProxy(4);
+				upscaling->OverrideRenderTargets(kENBSpatialBridgeTargets);
 				upscaling->ResetRenderTargets({}, false);
-				ScaleProxyTargetsToOriginalNative(kENBBridgeTargets);
+				ScaleProxyTargetsToOriginalNative(kENBSpatialBridgeTargets);
 				if (nativeDepthReady) {
 					rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth =
 						reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(g_enbNativeDepthSRV.get());
@@ -1958,6 +2582,10 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 				originalDynamicHeightRatio = frameDynamicHeightRatio;
 				gameViewport->frameBufferViewport = originalFrameBufferViewport;
 				ApplyCurrentViewportDefault(renderTargetManager);
+				// ENB's final imagespace work is complete when this late effect
+				// range returns. Upscale and clear here so Fallout's following
+				// Interface3DPostAARenderFn draws a native-resolution overlay for
+				// the D3D12 present composite instead of being baked into DLSS.
 				upscaling->Upscale(static_cast<int>(a5));
 				return;
 			}
@@ -2035,8 +2663,8 @@ struct BSImagespaceShader_Render_ENBFinalComposite
 		const bool nativeENBScope = g_enbNativeImageSpaceParamScopeDepth > 0;
 		const bool isHDRFinalComposite = IsENBHDRFinalCompositeEffect(This);
 		const bool isRefractionComposite = This && This == g_enbRefractionCompositeEffect;
-		const bool isPauseBlur = IsENBNativePauseBlurShader(This);
-		if (!nativeENBScope || (!isHDRFinalComposite && !isRefractionComposite && !isPauseBlur)) {
+		const bool isNativeEffectShader = IsENBNativeImageSpaceShader(This);
+		if (!nativeENBScope || (!isHDRFinalComposite && !isRefractionComposite && !isNativeEffectShader)) {
 			func(This, a_geometry, a_shaderParams);
 			return;
 		}
@@ -2044,10 +2672,15 @@ struct BSImagespaceShader_Render_ENBFinalComposite
 		// RenderEffect selects the alternate +0x40 geometry in the tiled path,
 		// even when the effect is marked non-dynamic. BSImagespaceShader only
 		// substitutes the normal +0x38 dynamic geometry, so pass the manager's
-		// native +0x28 geometry explicitly for the ENB-intercepted draw.
-		{
+		// native +0x28 geometry explicitly for the ENB-intercepted draw. Preserve
+		// the HDR final composite's original dynamic-resolution flag: ENB copies
+		// its seven-vector game parameter block and enbeffect.fx consumes
+		// Params01[6].y as the bloom scale. Only the geometry needs promotion.
+		auto* nativeGeometry = GetNativeImageSpaceGeometry();
+		if (isHDRFinalComposite) {
+			func(This, nativeGeometry ? nativeGeometry : a_geometry, a_shaderParams);
+		} else {
 			const ScopedBSImagespaceShaderNativeParams forceNativeParams(This);
-			auto* nativeGeometry = GetNativeImageSpaceGeometry();
 			func(This, nativeGeometry ? nativeGeometry : a_geometry, a_shaderParams);
 		}
 
@@ -2149,23 +2782,19 @@ struct DrawWorld_Render_PreUI_NVHBAO
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
-/** @brief Hook for BSDFComposite with render target and depth override */
+/** @brief Preserve ENB's native feature-composite path when required. */
 struct DrawWorld_DeferredComposite_RenderPassImmediately
 {
 	static void thunk(RE::BSRenderPass* This, uint a2, bool a3)
 	{
 		auto upscaling = Upscaling::GetSingleton();
-
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 		bool requiresOverride = renderTargetManager->dynamicHeightRatio != 1.0 || renderTargetManager->dynamicWidthRatio != 1.0;
 
 		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
 		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
 		const bool enbCompatibilityActive = IsENBSRCompatibilityActive(upscaling->upscaleMethod);
-		const ScopedENBCompositeResolution enbResolution(
-			requiresOverride && enbCompatibilityActive,
-			originalDynamicWidthRatio,
-			originalDynamicHeightRatio);
+
 		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
 			func(This, a2, a3);
 			return;
@@ -2198,35 +2827,25 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
-/** @brief Keep the primary BSDFComposite output in the ENB proxy domain. */
-struct DrawWorld_DeferredComposite_RenderPassImmediately_First
-	{
-		static void thunk(RE::BSRenderPass* This, uint a2, bool a3)
-		{
-			auto upscaling = Upscaling::GetSingleton();
-			static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 
-		const bool useENBProxyDomain =
+struct DrawWorld_DeferredComposite_RenderPassImmediately_First
+{
+	static void thunk(RE::BSRenderPass* This, uint a2, bool a3)
+	{
+		auto upscaling = Upscaling::GetSingleton();
+		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+		const bool renderDomain =
 			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f) &&
 			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
-		const ScopedENBCompositeResolution enbResolution(
-			useENBProxyDomain,
-			renderTargetManager->dynamicWidthRatio,
-			renderTargetManager->dynamicHeightRatio);
 
-		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
+
+		if (renderDomain) {
+			++g_enbPrimaryCompositeScopeDepth;
 			func(This, a2, a3);
-			return;
-		}
-
-		if (useENBProxyDomain) {
-			upscaling->OverrideRenderTargetsSelective({ 3 });
-		}
-
-		func(This, a2, a3);
-
-		if (useENBProxyDomain) {
-			upscaling->ResetRenderTargetsSelective({ 3 }, { 3 });
+			--g_enbPrimaryCompositeScopeDepth;
+			CopyENBInputToRenderProxy(3);
+		} else {
+			func(This, a2, a3);
 		}
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
@@ -2240,7 +2859,7 @@ struct ImageSpaceManager_RenderEffect
 		const ScopedImageSpaceEffectNativeParams forceNativeParams(a_effect, effectIndex);
 		const ScopedENBHDRFinalCompositeEffects hdrFinalCompositeEffects(a_effect, effectIndex);
 		const ScopedENBRefractionCompositeEffect refractionCompositeEffect(a_effect, effectIndex);
-		const ScopedENBNativePauseBlurShaders pauseBlurShaders(a_effect, effectIndex);
+		const ScopedENBNativeImageSpaceShaders nativeImageSpaceShaders(a_effect, effectIndex);
 		func(This, a_effect, a_targetA, a_targetB, a_params);
 	}
 
@@ -2414,7 +3033,8 @@ void Upscaling::InstallHooks()
 	// Fix dynamic resolution after upscaling
 	stl::detour_thunk<DrawWorld_Imagespace>(REL::ID{ 587723, 2318322 });
 	if (isOG && enbLoaded) {
-		ResolveENBCompositeResolutionGlobals();
+		ResolveENBRenderResolutionGlobals();
+		InstallENBScreenEffectRenderHooks();
 		ResolveENBPrepassResourceSlots();
 	}
 }
@@ -2987,7 +3607,6 @@ void Upscaling::ResetRenderTargetsSelective(std::initializer_list<int> a_targetI
 {
 	for (const auto targetIndex : a_targetIndices) {
 		const bool shouldCopy =
-			a_indicesToCopy.size() == 0 ||
 			std::find(a_indicesToCopy.begin(), a_indicesToCopy.end(), targetIndex) != a_indicesToCopy.end();
 		ResetRenderTarget(targetIndex, shouldCopy);
 	}
@@ -3581,7 +4200,7 @@ void Upscaling::CopyFrameGenerationBuffers()
 bool Upscaling::ShouldBlockTemporalFeatures() const
 {
 	if (const auto ui = RE::UI::GetSingleton()) {
-		if (ui->freezeFramePause > 0) {
+		if (ui->menuMode > 0 || ui->freezeFramePause > 0) {
 			return true;
 		}
 	}
@@ -4168,6 +4787,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 
 	ID3D11Resource* frameBufferResource;
 	frameBufferSRV->GetResource(&frameBufferResource);
+	const auto upscaleInputName = std::format("upscale_target_P{}", a_renderTargetIndex);
 
 	static auto gameViewport = Util::State_GetSingleton();
 
@@ -4192,11 +4812,11 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			upscalingTexture.get(),
 			std::max(1u, static_cast<uint32_t>(renderSize.x)),
 			std::max(1u, static_cast<uint32_t>(renderSize.y)));
-
 	}
 
 	if (!preparedENBInput) {
-		// Native and non-ENB paths already provide a render-rect input.
+		// Non-ENB and native-AA paths already satisfy the ordinary render-rect
+		// contract. ENB+DRS reaches here only if the guarded conversion failed.
 		context->CopyResource(upscalingTexture->resource.get(), frameBufferResource);
 	}
 
