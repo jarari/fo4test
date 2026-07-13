@@ -94,8 +94,10 @@ void main(
     r3.x = ~(int)r1.w;
     if (r1.w == 0) {
       r7.xy = (int2)r5.xy;
-      r7.zw = float2(5.60519386e-45,5.60519386e-45);
-      r1.w = t0.Load(r7.xyz).x;
+      // The vanilla DXBC stores integer 4 in r7.z. 3Dmigoto represented the
+      // raw register bits as the denormal float 5.60519386e-45, which fxc
+      // numerically converted back to mip 0 when recompiling this HLSL.
+      r1.w = t0.Load(int3((int2)r7.xy, 4)).x;
       r3.y = cmp(r1.w < r0.y);
       if (r3.y != 0) {
         r4.zw = float2(0.5,0.5) + r5.xy;

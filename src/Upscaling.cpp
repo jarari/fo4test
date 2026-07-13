@@ -83,6 +83,7 @@ namespace
 	bool g_textureMemoryReserveApplied = false;
 	winrt::com_ptr<ID3D11VertexShader> g_enbScaleCopyVS;
 	winrt::com_ptr<ID3D11PixelShader> g_enbScaleCopyPS;
+	winrt::com_ptr<ID3D11PixelShader> g_enbCropCopyPS;
 	std::array<winrt::com_ptr<ID3D11PixelShader>, 3> g_enbScaleCopyMRTPS;
 	winrt::com_ptr<ID3D11SamplerState> g_enbScaleCopySampler;
 	winrt::com_ptr<ID3D11BlendState> g_enbScaleCopyBlendState;
@@ -108,6 +109,17 @@ namespace
 	};
 	std::optional<ENBDetailedShadowBufferLayout> g_enbDetailedShadowBufferLayout;
 	ENBScreenEffectRender_t g_enbDepthOfFieldRender = nullptr;
+	ENBScreenEffectRender_t g_enbReflectionRender = nullptr;
+	std::optional<std::size_t> g_enbReflectionConstantBufferOffset;
+	struct ENBConstantBufferPatchResources
+	{
+		winrt::com_ptr<ID3D11Device> device;
+		winrt::com_ptr<ID3D11Buffer> proxy;
+		winrt::com_ptr<ID3D11Buffer> patch;
+		UINT byteWidth{ 0 };
+	};
+	ENBConstantBufferPatchResources g_enbReflectionConstantBufferPatch;
+	constexpr std::size_t kENBDeferMixTrampolineSize = 64;
 	REL::Trampoline g_enbDeferMixTrampoline{ "ENB DeferMix"sv };
 	bool g_enbDeferMixInstalled = false;
 	ID3D11ShaderResourceView** g_enbDepthTextureSRVSlot = nullptr;
@@ -156,6 +168,23 @@ namespace
 
 		ScopedENBNativeImageSpaceParams(const ScopedENBNativeImageSpaceParams&) = delete;
 		ScopedENBNativeImageSpaceParams& operator=(const ScopedENBNativeImageSpaceParams&) = delete;
+	};
+
+	class ScopedENBPrimaryCompositeScope
+	{
+	public:
+		ScopedENBPrimaryCompositeScope()
+		{
+			++g_enbPrimaryCompositeScopeDepth;
+		}
+
+		~ScopedENBPrimaryCompositeScope()
+		{
+			--g_enbPrimaryCompositeScopeDepth;
+		}
+
+		ScopedENBPrimaryCompositeScope(const ScopedENBPrimaryCompositeScope&) = delete;
+		ScopedENBPrimaryCompositeScope& operator=(const ScopedENBPrimaryCompositeScope&) = delete;
 	};
 
 	class ScopedENBPrepassDepthBridgeActivation
@@ -567,6 +596,7 @@ namespace
 		kUseEffect,
 		kSubSurfaceScattering,
 		kPrepass,
+		kReflections,
 		kTotal
 	};
 
@@ -630,6 +660,9 @@ namespace
 		case ENBBoolSetting::kPrepass:
 			entry.value = QueryENBBool("EFFECT", "EnablePrepass");
 			break;
+		case ENBBoolSetting::kReflections:
+			entry.value = QueryENBBool("EFFECT", "EnableReflections");
+			break;
 		default:
 			entry.value = std::nullopt;
 			break;
@@ -660,28 +693,34 @@ namespace
 			IsENBUseEffectActive();
 	}
 
-	bool ShouldLeaveENBDeferredCompositeFeaturePassNative(RE::BSRenderPass* a_renderPass, Upscaling::UpscaleMethod a_upscaleMethod)
+	bool IsENBReflectionCompositePass(const RE::BSRenderPass* a_renderPass)
 	{
-		if (!IsTemporalSuperResolutionMethod(a_upscaleMethod) ||
-			!IsENBUseEffectActive()) {
+		constexpr uint32_t kBSDFCompositeEnvmap = 1u << 5;
+		constexpr uint32_t kBSDFCompositeDecal = 1u << 8;
+		constexpr uint32_t kBSDFCompositeSSLR = 1u << 11;
+		constexpr uint32_t kReflectionFlags =
+			kBSDFCompositeEnvmap |
+			kBSDFCompositeDecal |
+			kBSDFCompositeSSLR;
+		return (GetRenderPassFlags(a_renderPass) & kReflectionFlags) == kReflectionFlags;
+	}
+
+	bool ShouldLeaveENBDeferredCompositeFeaturePassNative(
+		const RE::BSRenderPass* a_renderPass,
+		Upscaling::UpscaleMethod a_upscaleMethod)
+	{
+		if (!IsENBSRCompatibilityActive(a_upscaleMethod)) {
 			return false;
 		}
 
+		// SSS shares this deferred-composite interception but is independent of
+		// EnableReflections. Preserve its established native path first.
 		if (TryGetENBBool(ENBBoolSetting::kSubSurfaceScattering).value_or(false)) {
 			return true;
 		}
 
-		constexpr uint32_t kBSDFCompositeEnvmap = 1u << 5;
-		constexpr uint32_t kBSDFCompositeDecal = 1u << 8;
-		constexpr uint32_t kBSDFCompositeSSLR = 1u << 11;
-		const auto flags = GetRenderPassFlags(a_renderPass);
-		// ENB's feature composite pass is view/content dependent. It appears as
-		// Envmap|Decal|SSLR with Tilelight only when tiled lighting is active.
-		constexpr uint32_t kENBHalfResFeaturePass =
-			kBSDFCompositeEnvmap |
-			kBSDFCompositeDecal |
-			kBSDFCompositeSSLR;
-		return (flags & kENBHalfResFeaturePass) == kENBHalfResFeaturePass;
+		return TryGetENBBool(ENBBoolSetting::kReflections).value_or(true) &&
+			IsENBReflectionCompositePass(a_renderPass);
 	}
 
 	bool TryGetSettingsWriteTime(FILETIME& a_writeTime)
@@ -830,7 +869,7 @@ namespace
 		if (!a_device) {
 			return false;
 		}
-		if (g_enbScaleCopyVS && g_enbScaleCopyPS && g_enbScaleCopySampler &&
+		if (g_enbScaleCopyVS && g_enbScaleCopyPS && g_enbCropCopyPS && g_enbScaleCopySampler &&
 			g_enbScaleCopyBlendState && g_enbScaleCopyDepthStencilState && g_enbScaleCopyRasterizerState) {
 			return true;
 		}
@@ -867,6 +906,11 @@ VSOut VSMain(uint vertexID : SV_VertexID)
 float4 PSMain(VSOut input) : SV_Target
 {
 	return sourceTextures[0].SampleLevel(sourceSampler, input.uv, 0.0);
+}
+
+float4 PSMainCrop(VSOut input) : SV_Target
+{
+	return sourceTextures[0].Load(int3(uint2(input.position.xy), 0));
 }
 
 struct PSOut2
@@ -930,6 +974,7 @@ PSOut8 PSMainMRT8(VSOut input)
 
 		winrt::com_ptr<ID3DBlob> vertexShaderBlob;
 		winrt::com_ptr<ID3DBlob> pixelShaderBlob;
+		winrt::com_ptr<ID3DBlob> cropPixelShaderBlob;
 		std::array<winrt::com_ptr<ID3DBlob>, 3> mrtPixelShaderBlobs;
 		winrt::com_ptr<ID3DBlob> errors;
 		const auto compileFlags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
@@ -968,6 +1013,24 @@ PSOut8 PSMainMRT8(VSOut input)
 			return false;
 		}
 
+		errors = nullptr;
+		hr = D3DCompile(
+			shaderSource,
+			std::strlen(shaderSource),
+			"ENBScaleCopy",
+			nullptr,
+			nullptr,
+			"PSMainCrop",
+			"ps_5_0",
+			compileFlags,
+			0,
+			cropPixelShaderBlob.put(),
+			errors.put());
+		if (FAILED(hr)) {
+			logger::warn("[Upscaling] Failed to compile ENB crop-copy PS: {}", errors ? static_cast<char*>(errors->GetBufferPointer()) : "unknown error");
+			return false;
+		}
+
 		constexpr std::array<const char*, 3> mrtEntryPoints{
 			"PSMainMRT2", "PSMainMRT4", "PSMainMRT8"
 		};
@@ -996,6 +1059,7 @@ PSOut8 PSMainMRT8(VSOut input)
 
 		winrt::com_ptr<ID3D11VertexShader> scaleCopyVS;
 		winrt::com_ptr<ID3D11PixelShader> scaleCopyPS;
+		winrt::com_ptr<ID3D11PixelShader> cropCopyPS;
 		std::array<winrt::com_ptr<ID3D11PixelShader>, 3> scaleCopyMRTPS;
 		winrt::com_ptr<ID3D11SamplerState> scaleCopySampler;
 		winrt::com_ptr<ID3D11BlendState> scaleCopyBlendState;
@@ -1003,7 +1067,8 @@ PSOut8 PSMainMRT8(VSOut input)
 		winrt::com_ptr<ID3D11RasterizerState> scaleCopyRasterizerState;
 
 		if (FAILED(a_device->CreateVertexShader(vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize(), nullptr, scaleCopyVS.put())) ||
-			FAILED(a_device->CreatePixelShader(pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize(), nullptr, scaleCopyPS.put()))) {
+			FAILED(a_device->CreatePixelShader(pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize(), nullptr, scaleCopyPS.put())) ||
+			FAILED(a_device->CreatePixelShader(cropPixelShaderBlob->GetBufferPointer(), cropPixelShaderBlob->GetBufferSize(), nullptr, cropCopyPS.put()))) {
 			logger::warn("[Upscaling] Failed to create ENB scale-copy shaders");
 			return false;
 		}
@@ -1056,6 +1121,7 @@ PSOut8 PSMainMRT8(VSOut input)
 
 		g_enbScaleCopyVS = std::move(scaleCopyVS);
 		g_enbScaleCopyPS = std::move(scaleCopyPS);
+		g_enbCropCopyPS = std::move(cropCopyPS);
 		g_enbScaleCopyMRTPS = std::move(scaleCopyMRTPS);
 		g_enbScaleCopySampler = std::move(scaleCopySampler);
 		g_enbScaleCopyBlendState = std::move(scaleCopyBlendState);
@@ -1277,6 +1343,28 @@ PSOut8 PSMainMRT8(VSOut input)
 			return true;
 		}
 
+		bool DrawCrop(
+			ID3D11ShaderResourceView* a_sourceSRV,
+			ID3D11RenderTargetView* a_destinationRTV,
+			ID3D11Texture2D* a_destinationTexture,
+			UINT a_outputWidth = 0,
+			UINT a_outputHeight = 0)
+		{
+			if (!active_ || !g_enbCropCopyPS) {
+				return false;
+			}
+
+			context_->PSSetShader(g_enbCropCopyPS.get(), nullptr, 0);
+			const bool result = Draw(
+				a_sourceSRV,
+				a_destinationRTV,
+				a_destinationTexture,
+				a_outputWidth,
+				a_outputHeight);
+			context_->PSSetShader(g_enbScaleCopyPS.get(), nullptr, 0);
+			return result;
+		}
+
 		bool DrawMRT(const ENBScaleCopyJob* const* a_jobs, std::size_t a_count)
 		{
 			if (!active_ || !a_jobs ||
@@ -1386,6 +1474,308 @@ PSOut8 PSMainMRT8(VSOut input)
 			a_destinationTexture,
 			a_outputWidth,
 			a_outputHeight);
+	}
+
+	void SelectENBCopyDeviceContext(
+		ID3D11Texture2D* a_referenceTexture,
+		ID3D11Device*& a_device,
+		ID3D11DeviceContext*& a_context)
+	{
+		static auto* rendererData = RE::BSGraphics::GetRendererData();
+		a_device = rendererData ? reinterpret_cast<ID3D11Device*>(rendererData->device) : nullptr;
+		a_context = rendererData ? reinterpret_cast<ID3D11DeviceContext*>(rendererData->context) : nullptr;
+		if (a_referenceTexture && EnsureENBNativeD3D11Context(a_referenceTexture) &&
+			CanBypassENBD3D11Context(a_context)) {
+			a_device = g_enbNativeDevice.get();
+			a_context = g_enbNativeContext.get();
+		}
+	}
+
+	bool EnsureENBCompositeRenderTargetProxies(std::initializer_list<int> a_targets)
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		auto* renderTargetManager = Util::RenderTargetManager_GetSingleton();
+		static auto* rendererData = RE::BSGraphics::GetRendererData();
+		if (!upscaling || !renderTargetManager || !rendererData) {
+			return false;
+		}
+
+		const auto widthRatio = renderTargetManager->dynamicWidthRatio;
+		const auto heightRatio = renderTargetManager->dynamicHeightRatio;
+		if (!(widthRatio > 0.0f && widthRatio < 1.0f) ||
+			!(heightRatio > 0.0f && heightRatio < 1.0f)) {
+			return false;
+		}
+
+		for (const auto target : a_targets) {
+			if (target < 0 || target >= static_cast<int>(std::size(upscaling->proxyRenderTargets))) {
+				return false;
+			}
+
+			auto& current = rendererData->renderTargets[target];
+			auto& original = upscaling->originalRenderTargets[target];
+			auto& proxy = upscaling->proxyRenderTargets[target];
+			if (!current.texture) {
+				return false;
+			}
+
+			// RT26/27/30/35 are deliberately not part of the global proxy set: only
+			// these ENB composites need them. Refresh an on-demand proxy when the live
+			// resource or its expected render dimensions change.
+			bool needsUpdate = current.texture != proxy.texture &&
+				(current.texture != original.texture || !proxy.texture);
+			if (!needsUpdate && proxy.texture) {
+				D3D11_TEXTURE2D_DESC currentDesc{};
+				D3D11_TEXTURE2D_DESC proxyDesc{};
+				reinterpret_cast<ID3D11Texture2D*>(current.texture)->GetDesc(&currentDesc);
+				reinterpret_cast<ID3D11Texture2D*>(proxy.texture)->GetDesc(&proxyDesc);
+				const auto expectedWidth = static_cast<UINT>(static_cast<float>(currentDesc.Width) * widthRatio);
+				const auto expectedHeight = static_cast<UINT>(static_cast<float>(currentDesc.Height) * heightRatio);
+				needsUpdate = proxyDesc.Width != expectedWidth || proxyDesc.Height != expectedHeight;
+			}
+			if (needsUpdate) {
+				upscaling->UpdateRenderTarget(target, widthRatio, heightRatio);
+			}
+
+			if (!upscaling->originalRenderTargets[target].texture ||
+				!upscaling->originalRenderTargets[target].srView ||
+				!upscaling->proxyRenderTargets[target].texture ||
+				!upscaling->proxyRenderTargets[target].rtView ||
+				!upscaling->proxyRenderTargets[target].srView) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	struct ENBCompositeOutputs
+	{
+		bool target1{ false };
+		bool target2{ false };
+
+		bool Any() const { return target1 || target2; }
+		int ReferenceTarget() const { return target1 ? 1 : (target2 ? 2 : -1); }
+	};
+
+	ENBCompositeOutputs FindBoundENBCompositeOutputs()
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		static auto* rendererData = RE::BSGraphics::GetRendererData();
+		auto* context = rendererData ? reinterpret_cast<ID3D11DeviceContext*>(rendererData->context) : nullptr;
+		if (!upscaling || !context) {
+			return {};
+		}
+
+		std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> boundRTVs{};
+		context->OMGetRenderTargets(static_cast<UINT>(boundRTVs.size()), boundRTVs.data(), nullptr);
+		ENBCompositeOutputs result{};
+		for (const auto candidate : { 1, 2 }) {
+			auto* original = reinterpret_cast<ID3D11RenderTargetView*>(
+				upscaling->originalRenderTargets[candidate].rtView);
+			if (original && std::ranges::find(boundRTVs, original) != boundRTVs.end()) {
+				if (candidate == 1) {
+					result.target1 = true;
+				} else {
+					result.target2 = true;
+				}
+			}
+		}
+		for (auto* rtv : boundRTVs) {
+			if (rtv) {
+				rtv->Release();
+			}
+		}
+		return result;
+	}
+
+	class ScopedENBCompositeRenderViewport
+	{
+	public:
+		explicit ScopedENBCompositeRenderViewport(int a_outputTarget)
+		{
+			auto* upscaling = Upscaling::GetSingleton();
+			static auto* rendererData = RE::BSGraphics::GetRendererData();
+			context_ = rendererData ? reinterpret_cast<ID3D11DeviceContext*>(rendererData->context) : nullptr;
+			auto* output = upscaling && a_outputTarget >= 0 ?
+				reinterpret_cast<ID3D11Texture2D*>(upscaling->proxyRenderTargets[a_outputTarget].texture) : nullptr;
+			if (!context_ || !output) {
+				context_ = nullptr;
+				return;
+			}
+
+			viewportCount_ = static_cast<UINT>(viewports_.size());
+			context_->RSGetViewports(&viewportCount_, viewports_.data());
+			if (viewportCount_ == 0) {
+				context_ = nullptr;
+				return;
+			}
+
+			D3D11_TEXTURE2D_DESC desc{};
+			output->GetDesc(&desc);
+			if (desc.Width == 0 || desc.Height == 0) {
+				context_ = nullptr;
+				return;
+			}
+
+			width_ = static_cast<float>(desc.Width);
+			height_ = static_cast<float>(desc.Height);
+			auto viewport = viewports_[0];
+			viewport.TopLeftX = 0.0f;
+			viewport.TopLeftY = 0.0f;
+			viewport.Width = width_;
+			viewport.Height = height_;
+			context_->RSSetViewports(1, &viewport);
+			active_ = true;
+		}
+
+		~ScopedENBCompositeRenderViewport()
+		{
+			if (active_) {
+				context_->RSSetViewports(viewportCount_, viewports_.data());
+			}
+		}
+
+		ScopedENBCompositeRenderViewport(const ScopedENBCompositeRenderViewport&) = delete;
+		ScopedENBCompositeRenderViewport& operator=(const ScopedENBCompositeRenderViewport&) = delete;
+
+		bool IsActive() const { return active_; }
+		float Width() const { return width_; }
+		float Height() const { return height_; }
+
+	private:
+		ID3D11DeviceContext* context_{ nullptr };
+		std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_{};
+		UINT viewportCount_{ 0 };
+		float width_{ 0.0f };
+		float height_{ 0.0f };
+		bool active_{ false };
+	};
+
+	bool CropENBCompositeTargetsToRenderDomain(std::initializer_list<int> a_targets)
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		if (!upscaling || a_targets.size() == 0) {
+			return false;
+		}
+
+		ID3D11Texture2D* reference = nullptr;
+		for (const auto target : a_targets) {
+			reference = reinterpret_cast<ID3D11Texture2D*>(
+				upscaling->proxyRenderTargets[target].texture);
+			if (reference) {
+				break;
+			}
+		}
+
+		ID3D11Device* device = nullptr;
+		ID3D11DeviceContext* context = nullptr;
+		SelectENBCopyDeviceContext(reference, device, context);
+		ScopedENBScaleCopyState state(device, context, 16);
+		if (!state.IsActive()) {
+			return false;
+		}
+
+		for (const auto target : a_targets) {
+			auto* sourceTexture = reinterpret_cast<ID3D11Texture2D*>(
+				upscaling->originalRenderTargets[target].texture);
+			auto* sourceSRV = reinterpret_cast<ID3D11ShaderResourceView*>(
+				upscaling->originalRenderTargets[target].srView);
+			auto* destinationTexture = reinterpret_cast<ID3D11Texture2D*>(
+				upscaling->proxyRenderTargets[target].texture);
+			auto* destinationRTV = reinterpret_cast<ID3D11RenderTargetView*>(
+				upscaling->proxyRenderTargets[target].rtView);
+			if (!sourceTexture || !sourceSRV || !destinationTexture || !destinationRTV) {
+				return false;
+			}
+
+			D3D11_TEXTURE2D_DESC sourceDesc{};
+			D3D11_TEXTURE2D_DESC destinationDesc{};
+			D3D11_SHADER_RESOURCE_VIEW_DESC sourceViewDesc{};
+			D3D11_RENDER_TARGET_VIEW_DESC destinationViewDesc{};
+			sourceTexture->GetDesc(&sourceDesc);
+			destinationTexture->GetDesc(&destinationDesc);
+			sourceSRV->GetDesc(&sourceViewDesc);
+			destinationRTV->GetDesc(&destinationViewDesc);
+			if (sourceViewDesc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
+				destinationViewDesc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D ||
+				sourceDesc.SampleDesc.Count != 1 || destinationDesc.SampleDesc.Count != 1 ||
+				destinationDesc.Width > sourceDesc.Width || destinationDesc.Height > sourceDesc.Height ||
+				!state.DrawCrop(sourceSRV, destinationRTV, destinationTexture)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool CopyENBCompositeOutputToNativeSubrect(int a_target)
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		if (!upscaling || a_target < 0 ||
+			a_target >= static_cast<int>(std::size(upscaling->proxyRenderTargets))) {
+			return false;
+		}
+
+		auto* sourceTexture = reinterpret_cast<ID3D11Texture2D*>(
+			upscaling->proxyRenderTargets[a_target].texture);
+		auto* sourceSRV = reinterpret_cast<ID3D11ShaderResourceView*>(
+			upscaling->proxyRenderTargets[a_target].srView);
+		auto* destinationTexture = reinterpret_cast<ID3D11Texture2D*>(
+			upscaling->originalRenderTargets[a_target].texture);
+		auto* destinationRTV = reinterpret_cast<ID3D11RenderTargetView*>(
+			upscaling->originalRenderTargets[a_target].rtView);
+		if (!sourceTexture || !sourceSRV || !destinationTexture || !destinationRTV) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC sourceDesc{};
+		D3D11_TEXTURE2D_DESC destinationDesc{};
+		D3D11_SHADER_RESOURCE_VIEW_DESC sourceViewDesc{};
+		D3D11_RENDER_TARGET_VIEW_DESC destinationViewDesc{};
+		sourceTexture->GetDesc(&sourceDesc);
+		destinationTexture->GetDesc(&destinationDesc);
+		sourceSRV->GetDesc(&sourceViewDesc);
+		destinationRTV->GetDesc(&destinationViewDesc);
+		if (sourceViewDesc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
+			destinationViewDesc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D ||
+			sourceDesc.SampleDesc.Count != 1 || destinationDesc.SampleDesc.Count != 1 ||
+			sourceDesc.Width > destinationDesc.Width || sourceDesc.Height > destinationDesc.Height) {
+			return false;
+		}
+
+		ID3D11Device* device = nullptr;
+		ID3D11DeviceContext* context = nullptr;
+		SelectENBCopyDeviceContext(destinationTexture, device, context);
+		ScopedENBScaleCopyState state(device, context, 16);
+		return state.DrawCrop(
+			sourceSRV,
+			destinationRTV,
+			destinationTexture,
+			sourceDesc.Width,
+			sourceDesc.Height);
+	}
+
+	void FinishENBCompositeTargets(
+		std::initializer_list<int> a_targets,
+		const ENBCompositeOutputs& a_outputs)
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		if (!upscaling) {
+			return;
+		}
+
+		const bool fallbackTarget1 =
+			a_outputs.target1 && !CopyENBCompositeOutputToNativeSubrect(1);
+		const bool fallbackTarget2 =
+			a_outputs.target2 && !CopyENBCompositeOutputToNativeSubrect(2);
+		if (fallbackTarget1 && fallbackTarget2) {
+			upscaling->ResetRenderTargetsSelective(a_targets, { 1, 2 });
+		} else if (fallbackTarget1) {
+			upscaling->ResetRenderTargetsSelective(a_targets, { 1 });
+		} else if (fallbackTarget2) {
+			upscaling->ResetRenderTargetsSelective(a_targets, { 2 });
+		} else {
+			upscaling->ResetRenderTargetsSelective(a_targets);
+		}
 	}
 
 	std::uintptr_t FindLiveENBPrepass(HMODULE a_module)
@@ -1584,6 +1974,206 @@ PSOut8 PSMainMRT8(VSOut input)
 			protection == PAGE_WRITECOPY ||
 			protection == PAGE_EXECUTE_READWRITE ||
 			protection == PAGE_EXECUTE_WRITECOPY;
+	}
+
+	bool IsReadableProcessRange(const void* a_address, std::size_t a_size)
+	{
+		MEMORY_BASIC_INFORMATION memory{};
+		if (!a_address || a_size == 0 ||
+			VirtualQuery(a_address, &memory, sizeof(memory)) != sizeof(memory) ||
+			memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+			return false;
+		}
+
+		const auto begin = reinterpret_cast<std::uintptr_t>(a_address);
+		const auto regionBegin = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+		const auto regionEnd = regionBegin + memory.RegionSize;
+		return begin >= regionBegin && begin <= regionEnd && a_size <= regionEnd - begin;
+	}
+
+	struct ENBFunctionRange
+	{
+		std::uintptr_t begin;
+		std::uintptr_t end;
+	};
+
+	std::optional<ENBFunctionRange> FindENBContainingFunction(
+		HMODULE a_module,
+		std::uintptr_t a_address)
+	{
+		if (!a_module) {
+			return std::nullopt;
+		}
+
+		const auto base = reinterpret_cast<std::uintptr_t>(a_module);
+		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			return std::nullopt;
+		}
+		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE ||
+			a_address < base || a_address >= base + nt->OptionalHeader.SizeOfImage) {
+			return std::nullopt;
+		}
+
+		const auto& directory =
+			nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+		if (!directory.VirtualAddress || directory.Size < sizeof(RUNTIME_FUNCTION)) {
+			return std::nullopt;
+		}
+
+		const auto* functions = reinterpret_cast<const RUNTIME_FUNCTION*>(
+			base + directory.VirtualAddress);
+		const auto count = directory.Size / sizeof(RUNTIME_FUNCTION);
+		const auto rva = static_cast<DWORD>(a_address - base);
+		for (DWORD i = 0; i < count; ++i) {
+			if (rva >= functions[i].BeginAddress && rva < functions[i].EndAddress) {
+				return ENBFunctionRange{
+					base + functions[i].BeginAddress,
+					base + functions[i].EndAddress
+				};
+			}
+		}
+		return std::nullopt;
+	}
+
+	bool TryResolveENBRIPRelativeLEA(
+		const std::uint8_t* a_instruction,
+		std::uintptr_t& a_target)
+	{
+		if (a_instruction[0] < 0x48 || a_instruction[0] > 0x4F ||
+			a_instruction[1] != 0x8D || (a_instruction[2] & 0xC7) != 0x05) {
+			return false;
+		}
+		a_target = ResolveENBRIPRelativeAddress(a_instruction, 3, 7);
+		return true;
+	}
+
+	bool IsENBModuleStringAt(
+		HMODULE a_module,
+		std::uintptr_t a_address,
+		std::string_view a_value)
+	{
+		if (!a_module || a_value.empty()) {
+			return false;
+		}
+
+		const auto base = reinterpret_cast<std::uintptr_t>(a_module);
+		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+			return false;
+		}
+		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		const auto imageEnd = base + nt->OptionalHeader.SizeOfImage;
+		if (a_address < base || a_address + a_value.size() >= imageEnd) {
+			return false;
+		}
+
+		const auto* value = reinterpret_cast<const char*>(a_address);
+		return std::equal(a_value.begin(), a_value.end(), value) &&
+			value[a_value.size()] == '\0';
+	}
+
+	bool ENBFunctionReferencesString(
+		HMODULE a_module,
+		const ENBFunctionRange& a_function,
+		std::string_view a_value)
+	{
+		for (auto address = a_function.begin; address + 7 <= a_function.end; ++address) {
+			std::uintptr_t target = 0;
+			if (TryResolveENBRIPRelativeLEA(
+					reinterpret_cast<const std::uint8_t*>(address), target) &&
+				IsENBModuleStringAt(a_module, target, a_value)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	std::optional<std::size_t> FindENBConstantBufferSlotOffset(
+		HMODULE a_module,
+		const ENBFunctionRange& a_function,
+		std::string_view a_constantBufferName)
+	{
+		for (auto address = a_function.begin; address + 7 <= a_function.end; ++address) {
+			std::uintptr_t target = 0;
+			if (!TryResolveENBRIPRelativeLEA(
+					reinterpret_cast<const std::uint8_t*>(address), target) ||
+				!IsENBModuleStringAt(a_module, target, a_constantBufferName)) {
+				continue;
+			}
+
+			const auto readSlotOffset = [](std::uintptr_t a_cursor) -> std::optional<std::size_t> {
+				const auto* load = reinterpret_cast<const std::uint8_t*>(a_cursor);
+				// mov r8,[nonvolatile+disp32], used as SetConstantBuffer's third argument.
+				if ((load[0] & 0xFC) != 0x4C || load[1] != 0x8B ||
+					(load[2] & 0xF8) != 0x80 || (load[2] & 7) == 4) {
+					return std::nullopt;
+				}
+
+				std::int32_t displacement = 0;
+				std::memcpy(&displacement, load + 3, sizeof(displacement));
+				if (displacement >= 0x100 && displacement <= 0x2000) {
+					return static_cast<std::size_t>(displacement);
+				}
+				return std::nullopt;
+			};
+
+			// MSVC normally materializes r8 immediately before the name's LEA.
+			// Select the nearest argument load so adjacent EConstantList1/List2
+			// bindings cannot be confused with one another.
+			const auto backwardLimit = std::min<std::uintptr_t>(24, address - a_function.begin);
+			for (std::uintptr_t distance = 1; distance <= backwardLimit; ++distance) {
+				if (const auto result = readSlotOffset(address - distance)) {
+					return result;
+				}
+			}
+			const auto forwardLimit = std::min(a_function.end, address + 7 + 24);
+			for (auto cursor = address + 7; cursor + 7 <= forwardLimit; ++cursor) {
+				if (const auto result = readSlotOffset(cursor)) {
+					return result;
+				}
+			}
+		}
+		return std::nullopt;
+	}
+
+	struct ENBTechniqueHandler
+	{
+		std::uintptr_t entry;
+		std::size_t constantBufferOffset;
+	};
+
+	std::optional<ENBTechniqueHandler> FindENBTechniqueHandler(
+		HMODULE a_module,
+		const ENBCodeRange& a_code,
+		std::string_view a_technique,
+		std::string_view a_constantBuffer,
+		std::string_view a_requiredSiblingTechnique = {})
+	{
+		for (std::size_t offset = 0; offset + 7 <= a_code.size; ++offset) {
+			const auto* instruction = a_code.begin + offset;
+			std::uintptr_t target = 0;
+			if (!TryResolveENBRIPRelativeLEA(instruction, target) ||
+				!IsENBModuleStringAt(a_module, target, a_technique)) {
+				continue;
+			}
+
+			const auto function = FindENBContainingFunction(
+				a_module, reinterpret_cast<std::uintptr_t>(instruction));
+			if (!function ||
+				(!a_requiredSiblingTechnique.empty() &&
+					!ENBFunctionReferencesString(a_module, *function, a_requiredSiblingTechnique))) {
+				continue;
+			}
+
+			const auto constantBufferOffset =
+				FindENBConstantBufferSlotOffset(a_module, *function, a_constantBuffer);
+			if (constantBufferOffset) {
+				return ENBTechniqueHandler{ function->begin, *constantBufferOffset };
+			}
+		}
+		return std::nullopt;
 	}
 
 	void ResolveENBRenderResolutionGlobals()
@@ -1968,6 +2558,415 @@ PSOut8 PSMainMRT8(VSOut input)
 			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
 	}
 
+	constexpr std::ptrdiff_t kENBDeviceContextOffset = 0x6C20;
+	constexpr std::ptrdiff_t kENBTexture0SRVOffset = 0xD20;
+	constexpr std::ptrdiff_t kENBTexture3SRVOffset = 0xD38;
+	constexpr std::uint32_t kENBReflectionBlurTechnique = 0xB1B77A4D;
+	constexpr std::uint32_t kENBReflectionSSRTechnique = 0x1355B81A;
+
+	std::optional<std::uint32_t> GetENBTechniqueHash(void* a_this)
+	{
+		if (!a_this) {
+			return std::nullopt;
+		}
+
+		auto** stateSlot = reinterpret_cast<std::byte**>(
+			reinterpret_cast<std::byte*>(a_this) + sizeof(void*));
+		if (!IsReadableProcessRange(stateSlot, sizeof(*stateSlot)) || !*stateSlot) {
+			return std::nullopt;
+		}
+
+		auto* hash = reinterpret_cast<const std::uint32_t*>(*stateSlot + sizeof(void*));
+		return IsReadableProcessRange(hash, sizeof(*hash)) ?
+			std::optional{ *hash } : std::nullopt;
+	}
+
+	ID3D11DeviceContext* GetENBDeviceContext(void* a_this)
+	{
+		if (!a_this) {
+			return nullptr;
+		}
+
+		auto** contextSlot = reinterpret_cast<ID3D11DeviceContext**>(
+			reinterpret_cast<std::byte*>(a_this) + kENBDeviceContextOffset);
+		return IsReadableProcessRange(contextSlot, sizeof(*contextSlot)) ? *contextSlot : nullptr;
+	}
+
+	bool GetENBRenderTargetDimensions(
+		ID3D11RenderTargetView* a_view,
+		UINT& a_width,
+		UINT& a_height)
+	{
+		if (!a_view) {
+			return false;
+		}
+
+		winrt::com_ptr<ID3D11Resource> resource;
+		a_view->GetResource(resource.put());
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		if (!resource || FAILED(resource->QueryInterface(IID_PPV_ARGS(texture.put())))) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC textureDesc{};
+		D3D11_RENDER_TARGET_VIEW_DESC viewDesc{};
+		texture->GetDesc(&textureDesc);
+		a_view->GetDesc(&viewDesc);
+		UINT mipSlice = 0;
+		switch (viewDesc.ViewDimension) {
+		case D3D11_RTV_DIMENSION_TEXTURE2D:
+			mipSlice = viewDesc.Texture2D.MipSlice;
+			break;
+		case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
+			mipSlice = viewDesc.Texture2DArray.MipSlice;
+			break;
+		default:
+			break;
+		}
+		mipSlice = std::min(mipSlice, 31u);
+
+		a_width = std::max(1u, textureDesc.Width >> mipSlice);
+		a_height = std::max(1u, textureDesc.Height >> mipSlice);
+		return true;
+	}
+
+	bool GetENBShaderResourceDimensions(
+		ID3D11ShaderResourceView* a_view,
+		UINT& a_width,
+		UINT& a_height)
+	{
+		if (!a_view) {
+			return false;
+		}
+
+		winrt::com_ptr<ID3D11Resource> resource;
+		a_view->GetResource(resource.put());
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		if (!resource || FAILED(resource->QueryInterface(IID_PPV_ARGS(texture.put())))) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC textureDesc{};
+		D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+		texture->GetDesc(&textureDesc);
+		a_view->GetDesc(&viewDesc);
+		UINT mipSlice = 0;
+		switch (viewDesc.ViewDimension) {
+		case D3D11_SRV_DIMENSION_TEXTURE2D:
+			mipSlice = viewDesc.Texture2D.MostDetailedMip;
+			break;
+		case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+			mipSlice = viewDesc.Texture2DArray.MostDetailedMip;
+			break;
+		default:
+			break;
+		}
+		mipSlice = std::min(mipSlice, 31u);
+
+		a_width = std::max(1u, textureDesc.Width >> mipSlice);
+		a_height = std::max(1u, textureDesc.Height >> mipSlice);
+		return true;
+	}
+
+	class ScopedENBRenderDomainViewport
+	{
+	public:
+		ScopedENBRenderDomainViewport(
+			void* a_this,
+			bool a_enable,
+			std::ptrdiff_t a_fallbackSRVOffset)
+		{
+			if (!a_enable || !(context_ = GetENBDeviceContext(a_this))) {
+				context_ = nullptr;
+				return;
+			}
+
+			winrt::com_ptr<ID3D11RenderTargetView> output;
+			context_->OMGetRenderTargets(1, output.put(), nullptr);
+			UINT width = 0;
+			UINT height = 0;
+			if (!GetENBRenderTargetDimensions(output.get(), width, height)) {
+				auto** fallbackSlot = reinterpret_cast<ID3D11ShaderResourceView**>(
+					reinterpret_cast<std::byte*>(a_this) + a_fallbackSRVOffset);
+				if (!IsReadableProcessRange(fallbackSlot, sizeof(*fallbackSlot)) ||
+					!GetENBShaderResourceDimensions(*fallbackSlot, width, height)) {
+					context_ = nullptr;
+					return;
+				}
+			}
+
+			viewportCount_ = static_cast<UINT>(viewports_.size());
+			context_->RSGetViewports(&viewportCount_, viewports_.data());
+			if (viewportCount_ == 0) {
+				context_ = nullptr;
+				return;
+			}
+
+			width_ = static_cast<float>(width);
+			height_ = static_cast<float>(height);
+			auto viewport = viewports_[0];
+			if (viewport.TopLeftX != 0.0f || viewport.TopLeftY != 0.0f ||
+				viewport.Width != width_ || viewport.Height != height_) {
+				viewport.TopLeftX = 0.0f;
+				viewport.TopLeftY = 0.0f;
+				viewport.Width = width_;
+				viewport.Height = height_;
+				context_->RSSetViewports(1, &viewport);
+				changed_ = true;
+			}
+			active_ = true;
+		}
+
+		~ScopedENBRenderDomainViewport()
+		{
+			if (changed_) {
+				context_->RSSetViewports(viewportCount_, viewports_.data());
+			}
+		}
+
+		ScopedENBRenderDomainViewport(const ScopedENBRenderDomainViewport&) = delete;
+		ScopedENBRenderDomainViewport& operator=(const ScopedENBRenderDomainViewport&) = delete;
+
+		bool IsActive() const { return active_; }
+		std::array<float, 2> Size() const { return { width_, height_ }; }
+
+	private:
+		ID3D11DeviceContext* context_{ nullptr };
+		std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_{};
+		UINT viewportCount_{ 0 };
+		float width_{ 0.0f };
+		float height_{ 0.0f };
+		bool active_{ false };
+		bool changed_{ false };
+	};
+
+	class ScopedENBReflectionColorInput
+	{
+	public:
+		ScopedENBReflectionColorInput(void* a_this, bool a_enable)
+		{
+			auto* upscaling = Upscaling::GetSingleton();
+			if (!a_enable || !a_this || !upscaling) {
+				return;
+			}
+
+			slot_ = reinterpret_cast<ID3D11ShaderResourceView**>(
+				reinterpret_cast<std::byte*>(a_this) + kENBTexture3SRVOffset);
+			auto* nativeColor = reinterpret_cast<ID3D11ShaderResourceView*>(
+				upscaling->originalRenderTargets[3].srView);
+			auto* renderColor = reinterpret_cast<ID3D11ShaderResourceView*>(
+				upscaling->proxyRenderTargets[3].srView);
+			if (!IsWritableProcessAddress(slot_) || !renderColor ||
+				(*slot_ != nativeColor && *slot_ != renderColor)) {
+				slot_ = nullptr;
+				return;
+			}
+
+			original_ = *slot_;
+			*slot_ = renderColor;
+
+			static bool loggedDimensions = false;
+			if (!loggedDimensions) {
+				UINT nativeWidth = 0;
+				UINT nativeHeight = 0;
+				UINT renderWidth = 0;
+				UINT renderHeight = 0;
+				if (GetENBShaderResourceDimensions(
+						nativeColor, nativeWidth, nativeHeight) &&
+					GetENBShaderResourceDimensions(
+						renderColor, renderWidth, renderHeight)) {
+					logger::info(
+						"[ENB SR] Reflection Texture3 color input {}x{} -> {}x{}",
+						nativeWidth, nativeHeight, renderWidth, renderHeight);
+					loggedDimensions = true;
+				}
+			}
+		}
+
+		~ScopedENBReflectionColorInput()
+		{
+			if (slot_) {
+				*slot_ = original_;
+			}
+		}
+
+		ScopedENBReflectionColorInput(const ScopedENBReflectionColorInput&) = delete;
+		ScopedENBReflectionColorInput& operator=(const ScopedENBReflectionColorInput&) = delete;
+
+		bool IsActive() const { return slot_ != nullptr; }
+
+	private:
+		ID3D11ShaderResourceView** slot_{ nullptr };
+		ID3D11ShaderResourceView* original_{ nullptr };
+	};
+
+	bool EnsureENBConstantBufferPatchResources(
+		ENBConstantBufferPatchResources& a_resources,
+		ID3D11Buffer* a_source)
+	{
+		if (!a_source) {
+			return false;
+		}
+
+		D3D11_BUFFER_DESC sourceDesc{};
+		a_source->GetDesc(&sourceDesc);
+		if ((sourceDesc.BindFlags & D3D11_BIND_CONSTANT_BUFFER) == 0 ||
+			sourceDesc.ByteWidth < 16 || (sourceDesc.ByteWidth & 15) != 0 ||
+			sourceDesc.ByteWidth > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16 ||
+			sourceDesc.MiscFlags != 0 || sourceDesc.StructureByteStride != 0) {
+			return false;
+		}
+
+		winrt::com_ptr<ID3D11Device> device;
+		a_source->GetDevice(device.put());
+		if (!device) {
+			return false;
+		}
+
+		const bool recreate =
+			!a_resources.device || a_resources.device.get() != device.get() ||
+			!a_resources.proxy || !a_resources.patch ||
+			a_resources.byteWidth != sourceDesc.ByteWidth;
+		if (!recreate) {
+			return true;
+		}
+
+		a_resources.patch = nullptr;
+		a_resources.proxy = nullptr;
+		a_resources.device = nullptr;
+		a_resources.byteWidth = 0;
+
+		auto proxyDesc = sourceDesc;
+		proxyDesc.Usage = D3D11_USAGE_DEFAULT;
+		proxyDesc.CPUAccessFlags = 0;
+
+		D3D11_BUFFER_DESC patchDesc{};
+		patchDesc.ByteWidth = 16;
+		patchDesc.Usage = D3D11_USAGE_DEFAULT;
+		if (FAILED(device->CreateBuffer(&proxyDesc, nullptr, a_resources.proxy.put())) ||
+			FAILED(device->CreateBuffer(&patchDesc, nullptr, a_resources.patch.put()))) {
+			a_resources.patch = nullptr;
+			a_resources.proxy = nullptr;
+			return false;
+		}
+
+		a_resources.device = std::move(device);
+		a_resources.byteWidth = sourceDesc.ByteWidth;
+		return true;
+	}
+
+	class ScopedENBConstantBufferDimensions
+	{
+	public:
+		ScopedENBConstantBufferDimensions(
+			void* a_this,
+			std::size_t a_bufferOffset,
+			const std::array<float, 2>& a_values,
+			ENBConstantBufferPatchResources& a_resources)
+		{
+			if (!a_this || !std::isfinite(a_values[0]) || !std::isfinite(a_values[1]) ||
+				a_values[0] <= 0.0f || a_values[1] <= 0.0f) {
+				return;
+			}
+
+			slot_ = reinterpret_cast<ID3D11Buffer**>(
+				reinterpret_cast<std::byte*>(a_this) + a_bufferOffset);
+			if (!IsWritableProcessAddress(slot_) || !*slot_ ||
+				!EnsureENBConstantBufferPatchResources(a_resources, *slot_) ||
+				*slot_ == a_resources.proxy.get()) {
+				slot_ = nullptr;
+				return;
+			}
+
+			winrt::com_ptr<ID3D11DeviceContext> context;
+			a_resources.device->GetImmediateContext(context.put());
+			if (!context) {
+				slot_ = nullptr;
+				return;
+			}
+
+			const std::array<float, 4> patchData{
+				a_values[0], a_values[1], 0.0f, 0.0f
+			};
+			context->UpdateSubresource(
+				a_resources.patch.get(), 0, nullptr, patchData.data(), 0, 0);
+			context->CopyResource(a_resources.proxy.get(), *slot_);
+			const D3D11_BOX sourceBox{ 0, 0, 0, sizeof(float) * 2, 1, 1 };
+			context->CopySubresourceRegion(
+				a_resources.proxy.get(), 0, 0, 0, 0,
+				a_resources.patch.get(), 0, &sourceBox);
+
+			original_ = *slot_;
+			*slot_ = a_resources.proxy.get();
+			active_ = true;
+		}
+
+		~ScopedENBConstantBufferDimensions()
+		{
+			if (active_) {
+				*slot_ = original_;
+			}
+		}
+
+		ScopedENBConstantBufferDimensions(const ScopedENBConstantBufferDimensions&) = delete;
+		ScopedENBConstantBufferDimensions& operator=(const ScopedENBConstantBufferDimensions&) = delete;
+
+		bool IsActive() const { return active_; }
+
+	private:
+		ID3D11Buffer** slot_{ nullptr };
+		ID3D11Buffer* original_{ nullptr };
+		bool active_{ false };
+	};
+
+	int ENBReflectionRenderThunk(
+		void* a_this,
+		std::uint32_t a2,
+		std::uint32_t a3,
+		std::uint32_t a4)
+	{
+		const auto technique = GetENBTechniqueHash(a_this);
+		const bool reflectionTechnique = technique == kENBReflectionBlurTechnique ||
+			technique == kENBReflectionSSRTechnique;
+		const bool shouldCorrect =
+			reflectionTechnique && ShouldUseENBProxyCompatibility() &&
+			TryGetENBBool(ENBBoolSetting::kReflections).value_or(true);
+		const ScopedENBReflectionColorInput colorInput(
+			a_this, shouldCorrect && technique == kENBReflectionSSRTechnique);
+		const ScopedENBRenderDomainViewport viewport(
+			a_this, shouldCorrect, kENBTexture0SRVOffset);
+		const bool shouldPatchConstants =
+			technique == kENBReflectionSSRTechnique && viewport.IsActive() &&
+			g_enbReflectionConstantBufferOffset.has_value();
+		const ScopedENBConstantBufferDimensions dimensions(
+			shouldPatchConstants ? a_this : nullptr,
+			g_enbReflectionConstantBufferOffset.value_or(0),
+			viewport.Size(),
+			g_enbReflectionConstantBufferPatch);
+		if (shouldPatchConstants && !dimensions.IsActive()) {
+			static bool loggedFailure = false;
+			if (!loggedFailure) {
+				logger::warn("[ENB SR] Reflection pixel-grid constant correction is unavailable");
+				loggedFailure = true;
+			}
+		}
+		if (shouldCorrect && !viewport.IsActive()) {
+			static bool loggedViewportFailure = false;
+			if (!loggedViewportFailure) {
+				logger::warn("[ENB SR] Reflection render-domain viewport correction is unavailable");
+				loggedViewportFailure = true;
+			}
+		}
+		if (shouldCorrect && technique == kENBReflectionSSRTechnique &&
+			!colorInput.IsActive()) {
+			static bool loggedColorInputFailure = false;
+			if (!loggedColorInputFailure) {
+				logger::warn("[ENB SR] Reflection color input substitution is unavailable");
+				loggedColorInputFailure = true;
+			}
+		}
+		return g_enbReflectionRender(a_this, a2, a3, a4);
+	}
 
 	class ScopedENBDeferMixNativeViewport
 	{
@@ -2064,7 +3063,8 @@ PSOut8 PSMainMRT8(VSOut input)
 		// this call site its own page anchored at the ENB instruction so CALL rel32
 		// can reach the generated stub without a far branch island.
 		if (g_enbDeferMixTrampoline.empty()) {
-			g_enbDeferMixTrampoline.create(4096, reinterpret_cast<void*>(a_drawCall));
+			g_enbDeferMixTrampoline.create(
+				kENBDeferMixTrampolineSize, reinterpret_cast<void*>(a_drawCall));
 		}
 		auto& trampoline = g_enbDeferMixTrampoline;
 		constexpr std::size_t kStubSize = 27;
@@ -2486,6 +3486,32 @@ PSOut8 PSMainMRT8(VSOut input)
 		const auto ssaoSetting = FindENBSettingStorage(module, *code, "EnableSSAO");
 		const auto detailedShadowSetting = FindENBSettingStorage(module, *code, "EnableDetailedShadow");
 		const auto depthOfFieldSetting = FindENBSettingStorage(module, *code, "EnableDepthOfField");
+
+		if (!g_enbReflectionRender) {
+			const auto handler = FindENBTechniqueHandler(
+				module,
+				*code,
+				"Shader_1355B81A",
+				"EConstantList0",
+				"Shader_B1B77A4D");
+			if (!handler) {
+				logger::warn("[ENB SR] Cannot resolve the reflection constant-buffer handler");
+			} else {
+				const auto trampoline = Detours::X64::DetourFunction(
+					handler->entry,
+					reinterpret_cast<std::uintptr_t>(&ENBReflectionRenderThunk));
+				if (trampoline) {
+					g_enbReflectionConstantBufferOffset = handler->constantBufferOffset;
+					g_enbReflectionRender = reinterpret_cast<ENBScreenEffectRender_t>(trampoline);
+					logger::info(
+						"[ENB SR] Reflection handler RVA 0x{:X}, constant-buffer slot +0x{:X}",
+						handler->entry - reinterpret_cast<std::uintptr_t>(module),
+						handler->constantBufferOffset);
+				} else {
+					logger::warn("[ENB SR] Failed to install the reflection constant-buffer hook");
+				}
+			}
+		}
 
 		if (!g_enbDeferMixInstalled && ssaoSetting) {
 			const auto ssaoEntry = FindENBSSAORenderEntry(*code, ssaoSetting);
@@ -3607,7 +4633,7 @@ struct DrawWorld_Render_PreUI_NVHBAO
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
-/** @brief Preserve ENB's native feature-composite path when required. */
+/** @brief Preserve ENB feature-composite passes in their established render domain. */
 struct DrawWorld_DeferredComposite_RenderPassImmediately
 {
 	static void thunk(RE::BSRenderPass* This, uint a2, bool a3)
@@ -3624,8 +4650,8 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately
 			func(This, a2, a3);
 			return;
 		}
-
-		if (requiresOverride && ShouldLeaveENBDeferredCompositeFeaturePassNative(This, upscaling->upscaleMethod)) {
+		if (requiresOverride &&
+			ShouldLeaveENBDeferredCompositeFeaturePassNative(This, upscaling->upscaleMethod)) {
 			func(This, a2, a3);
 			return;
 		}
@@ -3659,19 +4685,18 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately_First
 	{
 		auto upscaling = Upscaling::GetSingleton();
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
-		const bool renderDomain =
+		const bool enbCompatibilityActive =
 			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f) &&
 			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
 
-
-		if (renderDomain) {
-			++g_enbPrimaryCompositeScopeDepth;
+		if (!enbCompatibilityActive) {
 			func(This, a2, a3);
-			--g_enbPrimaryCompositeScopeDepth;
-			CopyENBInputToRenderProxy(3);
-		} else {
-			func(This, a2, a3);
+			return;
 		}
+
+		const ScopedENBPrimaryCompositeScope primaryCompositeScope;
+		func(This, a2, a3);
+		CopyENBInputToRenderProxy(3);
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
