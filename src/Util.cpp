@@ -5,6 +5,7 @@
 #include <d3dcompiler.h>
 #include <winrt/base.h>
 
+#include "RE/M/Main.h"
 #include "RE/P/PlayerCamera.h"
 
 namespace Util
@@ -53,27 +54,38 @@ namespace Util
 		return VerticalFOVFromHorizontalDegrees(horizontalFOV, a_aspectRatio);
 	}
 
+	const RE::BSGraphics::CameraStateData* GetWorldCameraStateData()
+	{
+		auto* state = State_GetSingleton();
+		const auto* worldCamera = RE::Main::WorldRootCamera();
+		if (!state || !worldCamera) {
+			return nullptr;
+		}
+
+		const RE::BSGraphics::CameraStateData* selected = nullptr;
+		for (const auto& candidate : state->cameraDataCache) {
+			if (candidate.referenceCamera == worldCamera &&
+				(!selected || (selected->useJitter && !candidate.useJitter))) {
+				selected = std::addressof(candidate);
+			}
+		}
+		return selected;
+	}
+
 	CameraProjection GetCameraProjection(float a_aspectRatio)
 	{
-		auto* gameViewport = State_GetSingleton();
-		auto& viewData = gameViewport->cameraState.camViewData;
-
-		const auto viewMatrix = ToXMMatrix(viewData.viewMat);
-		const auto viewProjUnjittered = ToXMMatrix(viewData.viewProjUnjittered);
-		const auto invViewMatrix = DirectX::XMMatrixInverse(nullptr, viewMatrix);
-		const auto cameraViewToClipA = DirectX::XMMatrixMultiply(invViewMatrix, viewProjUnjittered);
-		const auto cameraViewToClipB = DirectX::XMMatrixMultiply(viewProjUnjittered, invViewMatrix);
-
 		CameraProjection result{};
-		result.fovA = VerticalFOVFromProjection(cameraViewToClipA);
-		result.fovB = VerticalFOVFromProjection(cameraViewToClipB);
 		result.playerCameraFOV = PlayerCameraVerticalFOV(a_aspectRatio);
-		result.usedAlternateProjectionOrder = !IsPlausibleVerticalFOV(result.fovA) && IsPlausibleVerticalFOV(result.fovB);
-		result.cameraViewToClip = result.usedAlternateProjectionOrder ? cameraViewToClipB : cameraViewToClipA;
+		const auto* cameraState = GetWorldCameraStateData();
+		if (!cameraState) {
+			result.cameraFOV = result.playerCameraFOV;
+			return result;
+		}
 
-		const auto matrixFOV = result.usedAlternateProjectionOrder ? result.fovB : result.fovA;
-		result.usedMatrixFOV = IsPlausibleVerticalFOV(matrixFOV);
-		result.cameraFOV = result.usedMatrixFOV ? matrixFOV : result.playerCameraFOV;
+		result.cameraViewToClip = ToXMMatrix(cameraState->camViewData.projMat);
+		result.fovA = VerticalFOVFromProjection(result.cameraViewToClip);
+		result.usedMatrixFOV = IsPlausibleVerticalFOV(result.fovA);
+		result.cameraFOV = result.usedMatrixFOV ? result.fovA : result.playerCameraFOV;
 		return result;
 	}
 

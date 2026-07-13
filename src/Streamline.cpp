@@ -1186,40 +1186,26 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	return true;
 }
 
-void Streamline::UpdateConstants(float2 a_jitter)
+bool Streamline::UpdateConstants(float2 a_jitter, bool a_includeCameraData)
 {
 	static auto gameViewport = Util::State_GetSingleton();
 	const auto currentFrameIndex = gameViewport->frameCount;
-	if (constantsFrameIndex == currentFrameIndex && frameToken) {
-		return;
+	if (constantsFrameIndex == currentFrameIndex && frameToken &&
+		(!a_includeCameraData || constantsIncludeCameraData)) {
+		return true;
 	}
 
 	if (!EnsureFrameToken(currentFrameIndex)) {
-		return;
+		return false;
 	}
 
-	auto& cameraState = gameViewport->cameraState;
-	auto& viewData = cameraState.camViewData;
-
-	static auto cameraNear = reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
-	static auto cameraFar = reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
-
-	const auto aspectRatio = static_cast<float>(gameViewport->screenWidth) / static_cast<float>(gameViewport->screenHeight);
-	const auto cameraProjection = Util::GetCameraProjection(aspectRatio);
-
 	sl::Constants slConstants = {};
-
-	slConstants.cameraNear = *cameraNear;
-	slConstants.cameraFar = *cameraFar;
-	slConstants.cameraAspectRatio = aspectRatio;
-	slConstants.cameraFOV = cameraProjection.cameraFOV;
+	// The original D3D11 DLSS path used minimal camera constants successfully.
+	// Only frame generation needs the full world-camera payload below.
+	slConstants.cameraNear = 0.0f;
+	slConstants.cameraFar = 1.0f;
 	slConstants.cameraMotionIncluded = sl::Boolean::eTrue;
 	slConstants.cameraPinholeOffset = { 0.f, 0.f };
-	slConstants.cameraPos = { cameraState.currentPosAdjust.x, cameraState.currentPosAdjust.y, cameraState.currentPosAdjust.z };
-	slConstants.cameraFwd = { viewData.viewDir.m128_f32[0], viewData.viewDir.m128_f32[1], viewData.viewDir.m128_f32[2] };
-	slConstants.cameraUp = { viewData.viewUp.m128_f32[0], viewData.viewUp.m128_f32[1], viewData.viewUp.m128_f32[2] };
-	slConstants.cameraRight = { viewData.viewRight.m128_f32[0], viewData.viewRight.m128_f32[1], viewData.viewRight.m128_f32[2] };
-	slConstants.cameraViewToClip = ToSLMatrix(cameraProjection.cameraViewToClip);
 	slConstants.depthInverted = sl::Boolean::eFalse;
 	slConstants.jitterOffset = { -a_jitter.x, -a_jitter.y};
 	slConstants.mvecScale = { 1, 1 };
@@ -1230,36 +1216,78 @@ void Streamline::UpdateConstants(float2 a_jitter)
 	slConstants.motionVectorsDilated = sl::Boolean::eTrue;
 	slConstants.motionVectorsJittered = sl::Boolean::eFalse;
 
-	const auto currentViewProj = Util::ToXMMatrix(viewData.currentViewProjUnjittered);
-	const auto previousViewProj = Util::ToXMMatrix(viewData.previousViewProjUnjittered);
-	if (IsUsableMatrix(currentViewProj) && IsUsableMatrix(previousViewProj)) {
-		DirectX::XMVECTOR currentDeterminant{};
-		const auto clipToCurrentWorld = DirectX::XMMatrixInverse(&currentDeterminant, currentViewProj);
-		const auto determinant = DirectX::XMVectorGetX(currentDeterminant);
-		if (determinant != 0.0f && std::isfinite(determinant) && IsUsableMatrix(clipToCurrentWorld)) {
-			const auto clipToPrevClip = DirectX::XMMatrixMultiply(clipToCurrentWorld, previousViewProj);
-			DirectX::XMVECTOR previousDeterminant{};
-			const auto prevClipToClip = DirectX::XMMatrixInverse(&previousDeterminant, clipToPrevClip);
-			const auto previousDet = DirectX::XMVectorGetX(previousDeterminant);
-			if (previousDet != 0.0f && std::isfinite(previousDet) && IsUsableMatrix(prevClipToClip)) {
-				slConstants.clipToCameraView = ToSLMatrix(DirectX::XMMatrixInverse(nullptr, cameraProjection.cameraViewToClip));
-				slConstants.clipToPrevClip = ToSLMatrix(clipToPrevClip);
-				slConstants.prevClipToClip = ToSLMatrix(prevClipToClip);
+	const RE::BSGraphics::CameraStateData* cameraState = nullptr;
+	Util::CameraProjection cameraProjection{};
+	if (a_includeCameraData) {
+		cameraState = Util::GetWorldCameraStateData();
+		const auto aspectRatio = gameViewport->screenHeight > 0 ?
+			static_cast<float>(gameViewport->screenWidth) / static_cast<float>(gameViewport->screenHeight) :
+			1.0f;
+		cameraProjection = Util::GetCameraProjection(aspectRatio);
+		if (!cameraState || !cameraProjection.usedMatrixFOV) {
+			logger::error(
+				"[Streamline] Full common constants have no valid world camera frame={} camera={} fov={} matrixFov={}",
+				currentFrameIndex,
+				static_cast<const void*>(cameraState),
+				cameraProjection.cameraFOV,
+				cameraProjection.usedMatrixFOV);
+			return false;
+		}
+
+		static auto cameraNear = reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
+		static auto cameraFar = reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
+		const auto& viewData = cameraState->camViewData;
+		slConstants.cameraNear = *cameraNear;
+		slConstants.cameraFar = *cameraFar;
+		slConstants.cameraAspectRatio = aspectRatio;
+		slConstants.cameraFOV = cameraProjection.cameraFOV;
+		slConstants.cameraPos = { cameraState->currentPosAdjust.x, cameraState->currentPosAdjust.y, cameraState->currentPosAdjust.z };
+		slConstants.cameraFwd = { viewData.viewDir.m128_f32[0], viewData.viewDir.m128_f32[1], viewData.viewDir.m128_f32[2] };
+		slConstants.cameraUp = { viewData.viewUp.m128_f32[0], viewData.viewUp.m128_f32[1], viewData.viewUp.m128_f32[2] };
+		slConstants.cameraRight = { viewData.viewRight.m128_f32[0], viewData.viewRight.m128_f32[1], viewData.viewRight.m128_f32[2] };
+		slConstants.cameraViewToClip = ToSLMatrix(cameraProjection.cameraViewToClip);
+
+		const auto currentViewProj = Util::ToXMMatrix(viewData.currentViewProjUnjittered);
+		const auto previousViewProj = Util::ToXMMatrix(viewData.previousViewProjUnjittered);
+		if (IsUsableMatrix(currentViewProj) && IsUsableMatrix(previousViewProj)) {
+			DirectX::XMVECTOR currentDeterminant{};
+			const auto clipToCurrentWorld = DirectX::XMMatrixInverse(&currentDeterminant, currentViewProj);
+			const auto determinant = DirectX::XMVectorGetX(currentDeterminant);
+			if (determinant != 0.0f && std::isfinite(determinant) && IsUsableMatrix(clipToCurrentWorld)) {
+				const auto clipToPrevClip = DirectX::XMMatrixMultiply(clipToCurrentWorld, previousViewProj);
+				DirectX::XMVECTOR previousDeterminant{};
+				const auto prevClipToClip = DirectX::XMMatrixInverse(&previousDeterminant, clipToPrevClip);
+				const auto previousDet = DirectX::XMVectorGetX(previousDeterminant);
+				if (previousDet != 0.0f && std::isfinite(previousDet) && IsUsableMatrix(prevClipToClip)) {
+					slConstants.clipToCameraView = ToSLMatrix(DirectX::XMMatrixInverse(nullptr, cameraProjection.cameraViewToClip));
+					slConstants.clipToPrevClip = ToSLMatrix(clipToPrevClip);
+					slConstants.prevClipToClip = ToSLMatrix(prevClipToClip);
+				} else {
+					recalculateCameraMatrices(slConstants);
+				}
 			} else {
 				recalculateCameraMatrices(slConstants);
 			}
 		} else {
 			recalculateCameraMatrices(slConstants);
 		}
-	} else {
-		recalculateCameraMatrices(slConstants);
 	}
 
 	if (SL_FAILED(res, slSetConstants(slConstants, *frameToken, viewport))) {
-		logger::error("[Streamline] Could not set constants: {}", magic_enum::enum_name(res));
-	} else {
-		constantsFrameIndex = currentFrameIndex;
+		logger::error(
+			"[Streamline] Could not set constants: {} frame={} token={} fullCamera={} camera={} fov={}",
+			magic_enum::enum_name(res),
+			currentFrameIndex,
+			static_cast<std::uint32_t>(*frameToken),
+			a_includeCameraData,
+			static_cast<const void*>(cameraState),
+			cameraProjection.cameraFOV);
+		return false;
 	}
+
+	constantsFrameIndex = currentFrameIndex;
+	constantsIncludeCameraData = a_includeCameraData;
+	return true;
 }
 
 void Streamline::DisableDLSS()

@@ -519,21 +519,29 @@ bool FidelityFX::ConfigureFrameGeneration(
 	prepare.cameraNear = *reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
 	prepare.cameraFar = *reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
 	const auto aspectRatio = a_displaySize.y > 0.0f ? a_displaySize.x / a_displaySize.y : 0.0f;
-	prepare.cameraFovAngleVertical = Util::GetCameraProjection(aspectRatio).cameraFOV;
+	const auto cameraProjection = Util::GetCameraProjection(aspectRatio);
+	const auto* cameraState = Util::GetWorldCameraStateData();
+	if (!cameraState || !cameraProjection.usedMatrixFOV) {
+		logger::warn(
+			"[FidelityFX] Frame generation prepare has no valid world camera: camera={} fov={} matrixFov={}",
+			static_cast<const void*>(cameraState),
+			cameraProjection.cameraFOV,
+			cameraProjection.usedMatrixFOV);
+		return false;
+	}
+	prepare.cameraFovAngleVertical = cameraProjection.cameraFOV;
 	prepare.viewSpaceToMetersFactor = 0.01428222656f;
 	prepare.frameID = a_frameID;
 	prepare.reset = false;
 
-	static auto gameViewport = Util::State_GetSingleton();
-	auto& cameraState = gameViewport->cameraState;
-	auto& viewData = cameraState.camViewData;
+	auto& viewData = cameraState->camViewData;
 	float cameraRight[3]{};
 	float cameraUp[3]{};
 	float cameraForward[3]{};
 	FillCameraBasis(viewData, cameraRight, cameraUp, cameraForward);
-	prepare.cameraPosition[0] = cameraState.currentPosAdjust.x;
-	prepare.cameraPosition[1] = cameraState.currentPosAdjust.y;
-	prepare.cameraPosition[2] = cameraState.currentPosAdjust.z;
+	prepare.cameraPosition[0] = cameraState->currentPosAdjust.x;
+	prepare.cameraPosition[1] = cameraState->currentPosAdjust.y;
+	prepare.cameraPosition[2] = cameraState->currentPosAdjust.z;
 	prepare.cameraForward[0] = cameraForward[0];
 	prepare.cameraForward[1] = cameraForward[1];
 	prepare.cameraForward[2] = cameraForward[2];
@@ -659,8 +667,9 @@ bool FidelityFX::UpscaleD3D12(
 	dispatch.reset = false;
 	dispatch.cameraNear = *reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
 	dispatch.cameraFar = *reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
-	const auto aspectRatio = a_displaySize.y > 0.0f ? a_displaySize.x / a_displaySize.y : 0.0f;
-	dispatch.cameraFovAngleVertical = Util::GetCameraProjection(aspectRatio).cameraFOV;
+	// Match the original D3D11 FSR path: SR does not need the camera matrices
+	// required by frame generation and must not sample the late image-space camera.
+	dispatch.cameraFovAngleVertical = 1.0f;
 	dispatch.viewSpaceToMetersFactor = 0.01428222656f;
 	dispatch.flags = 0;
 

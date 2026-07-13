@@ -455,6 +455,8 @@ public:
 	struct FeatureRetryBlock
 	{
 		uint64_t retryGameFrame = 0;
+		uint64_t lastFailureGameFrame = std::numeric_limits<uint64_t>::max();
+		uint32_t consecutiveFailures = 0;
 		bool active = false;
 	};
 

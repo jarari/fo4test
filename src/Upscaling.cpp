@@ -73,6 +73,7 @@ namespace
 	constexpr const char* kSettingsPath = "Data\\MCM\\Settings\\Upscaling.ini";
 	constexpr uint32_t kDLSSGResumeStableFrames = 2;
 	constexpr uint64_t kFeatureRetryGameFrames = 5;
+	constexpr uint32_t kFeatureFailuresBeforeRetryBlock = 3;
 	constexpr uint64_t kTextureMemoryUpgradeReserveBytes = 512ull * 1024ull * 1024ull;
 	constexpr std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>
 		kNullD3D11ShaderResources{};
@@ -5181,24 +5182,53 @@ void Upscaling::ReportFeatureRequestFailure(FeatureRequest a_feature, std::strin
 		return;
 	}
 
-	auto& block = featureRetryBlocks[index];
-	block.active = true;
 	const auto currentGameFrame = CurrentGameFrame();
-	block.retryGameFrame = currentGameFrame + kFeatureRetryGameFrames;
-
-	if (a_feature == FeatureRequest::kDLSS || a_feature == FeatureRequest::kFSR) {
-		upscaleMethod = UpscaleMethod::kSpatialFallback;
-		upscaleMethodNoMenu = UpscaleMethod::kSpatialFallback;
+	auto& block = featureRetryBlocks[index];
+	if (block.lastFailureGameFrame != currentGameFrame) {
+		if (block.consecutiveFailures < std::numeric_limits<uint32_t>::max()) {
+			++block.consecutiveFailures;
+		}
+		block.lastFailureGameFrame = currentGameFrame;
+	}
+	if (block.consecutiveFailures >= kFeatureFailuresBeforeRetryBlock) {
+		block.active = true;
+		block.retryGameFrame = currentGameFrame + kFeatureRetryGameFrames;
 	}
 
 	ClearFrameFeatureRequests();
 
+	static auto gameViewport = Util::State_GetSingleton();
+	const auto aspectRatio = gameViewport && gameViewport->screenHeight > 0 ?
+		static_cast<float>(gameViewport->screenWidth) / static_cast<float>(gameViewport->screenHeight) :
+		1.0f;
+	const auto* cameraState = Util::GetWorldCameraStateData();
+	const auto cameraProjection = Util::GetCameraProjection(aspectRatio);
+	const auto* ui = RE::UI::GetSingleton();
+	const auto menuMode = ui ? ui->menuMode : 0;
+	const auto itemMenuMode = ui ? ui->itemMenuMode.load_unchecked() : 0;
+	const auto freezeFrameMenuBG = ui ? ui->freezeFrameMenuBG : 0;
+	const auto freezeFramePause = ui ? ui->freezeFramePause : 0;
+
 	logger::warn(
-		"[Upscaling] {} request failed in {}; suppressing retry until game frame {} (current {})",
+		"[Upscaling] {} request failed in {}; failures={}/{} blocked={} retryFrame={} currentFrame={} "
+		"ui(menu={} item={} freezeBG={} freezePause={}) "
+		"worldCamera(state={} reference={} jitter={} matrixFov={} fov={})",
 		FeatureRequestName(a_feature),
 		a_context,
+		block.consecutiveFailures,
+		kFeatureFailuresBeforeRetryBlock,
+		block.active,
 		block.retryGameFrame,
-		currentGameFrame);
+		currentGameFrame,
+		menuMode,
+		itemMenuMode,
+		freezeFrameMenuBG,
+		freezeFramePause,
+		static_cast<const void*>(cameraState),
+		cameraState ? static_cast<const void*>(cameraState->referenceCamera) : nullptr,
+		cameraState ? cameraState->useJitter : false,
+		cameraProjection.usedMatrixFOV,
+		cameraProjection.cameraFOV);
 }
 
 void Upscaling::CheckResources()
@@ -6443,16 +6473,34 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			dlssgUIColorAlphaD3D12[frameIndex] = nullptr;
 		}
 
-		if (useFrameGeneration || useD3D12DLSS) {
-			streamline->UpdateReflex(settings.reflexMode, useFrameGeneration);
-			streamline->UpdateConstants(jitter);
+		bool useDLSSGThisFrame = useFrameGeneration;
+		if (useDLSSGThisFrame) {
+			streamline->UpdateReflex(settings.reflexMode, true);
+			if (!streamline->UpdateConstants(jitter, true)) {
+				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "Streamline full common constants");
+				useDLSSGThisFrame = false;
+			}
 		}
-		const auto dlssgInputSize = float2(static_cast<float>(sharedMotionVectorDesc.Width), static_cast<float>(sharedMotionVectorDesc.Height));
-		if (useFrameGeneration) {
-			if (!streamline->UpdateDLSSG(true, settings.frameGenerationMode, settings.dlssgGeneratedFrames + 1, settings.dynamicMFGEnabled != 0, settings.dynamicMFGTargetFPS, dlssgInputSize, a_displaySize, frameBufferDesc.Format, sharedMotionVectorDesc.Format, sharedDepthDesc.Format, uiFormat)) {
-				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "DLSS-G options");
+		if (useD3D12DLSS && !useDLSSGThisFrame) {
+			streamline->UpdateReflex(settings.reflexMode, false);
+			if (!streamline->UpdateConstants(jitter, false)) {
+				ReportFeatureRequestFailure(FeatureRequest::kDLSS, "Streamline SR common constants");
 				frameBufferResource->Release();
 				return;
+			}
+		} else if (!useD3D12DLSS && useFrameGeneration && !useDLSSGThisFrame) {
+			frameBufferResource->Release();
+			return;
+		}
+		const auto dlssgInputSize = float2(static_cast<float>(sharedMotionVectorDesc.Width), static_cast<float>(sharedMotionVectorDesc.Height));
+		if (useDLSSGThisFrame) {
+			if (!streamline->UpdateDLSSG(true, settings.frameGenerationMode, settings.dlssgGeneratedFrames + 1, settings.dynamicMFGEnabled != 0, settings.dynamicMFGTargetFPS, dlssgInputSize, a_displaySize, frameBufferDesc.Format, sharedMotionVectorDesc.Format, sharedDepthDesc.Format, uiFormat)) {
+				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "DLSS-G options");
+				useDLSSGThisFrame = false;
+				if (!useD3D12DLSS) {
+					frameBufferResource->Release();
+					return;
+				}
 			}
 		}
 
@@ -6460,7 +6508,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		dlssgInputRenderSizes[frameIndex] = dlssgInputSize;
 		dlssgInputDisplaySizes[frameIndex] = a_displaySize;
 		dlssgInputFrameTokenIndices[frameIndex] = streamline->GetCurrentFrameTokenIndex();
-		dlssgInputsReady[frameIndex] = useFrameGeneration;
+		dlssgInputsReady[frameIndex] = useDLSSGThisFrame;
 		fsrFrameGenerationInputsReady[frameIndex] = useFSRFrameGeneration;
 		fsrFrameGenerationColorFormats[frameIndex] = frameBufferDesc.Format;
 		fsrFrameGenerationFrameIDs[frameIndex] = fsrFrameGenerationFrameID++;
@@ -6482,7 +6530,11 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 	context->CopyResource(dlssgHUDLessTexture->resource.get(), frameBufferResource);
 
 	streamline->UpdateReflex(settings.reflexMode, true);
-	streamline->UpdateConstants(jitter);
+	if (!streamline->UpdateConstants(jitter, true)) {
+		ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "Streamline common constants");
+		frameBufferResource->Release();
+		return;
+	}
 	if (!streamline->UpdateDLSSG(true, settings.frameGenerationMode, settings.dlssgGeneratedFrames + 1, settings.dynamicMFGEnabled != 0, settings.dynamicMFGTargetFPS, a_renderSize, a_displaySize, frameBufferDesc.Format, motionVectorDesc.Format, depthDesc.Format)) {
 		ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "DLSS-G options");
 		frameBufferResource->Release();

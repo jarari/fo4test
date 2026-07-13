@@ -137,11 +137,13 @@ public:
 	/**
 	 * @brief Update Streamline constants for current frame
 	 * @param a_jitter Camera jitter offset
+	 * @param a_includeCameraData Include the full camera data required by frame generation
+	 * @return True when a frame token and valid common constants were submitted
 	 *
 	 * Sets frame-specific constants like jitter offset, motion vector scale,
 	 * and camera parameters. Must be called before Upscale().
 	 */
-	void UpdateConstants(float2 a_jitter);
+	bool UpdateConstants(float2 a_jitter, bool a_includeCameraData);
 
 	/**
 	 * @brief Configure Reflex based on user settings and DLSS-G requirements.
@@ -276,6 +278,7 @@ private:
 	void SetPCLMarker(sl::PCLMarker a_marker, sl::FrameToken* a_frameToken = nullptr);
 	bool DisableDLSSGNow();
 	uint32_t constantsFrameIndex = std::numeric_limits<uint32_t>::max();
+	bool constantsIncludeCameraData = false;
 	uint32_t markerFrameIndex = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGStatus = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGPresentedFrames = std::numeric_limits<uint32_t>::max();

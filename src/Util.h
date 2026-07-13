@@ -107,6 +107,7 @@ namespace Util
 	bool IsPlausibleVerticalFOV(float a_fov);
 	float VerticalFOVFromHorizontalDegrees(float a_horizontalDegrees, float a_aspectRatio);
 	float PlayerCameraVerticalFOV(float a_aspectRatio);
+	const RE::BSGraphics::CameraStateData* GetWorldCameraStateData();
 	CameraProjection GetCameraProjection(float a_aspectRatio);
 
 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program = "main");
