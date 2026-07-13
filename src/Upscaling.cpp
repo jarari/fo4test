@@ -99,6 +99,7 @@ namespace
 	using ENBScreenEffectRender_t = int (*)(void*, std::uint32_t, std::uint32_t, std::uint32_t);
 	using D3D11Draw_t = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 	ENBScreenEffectRender_t g_enbDetailedShadowRender = nullptr;
+	bool g_enbDetailedShadowUsesFirstPersonModelPath = false;
 	ENBScreenEffectRender_t g_enbDepthOfFieldRender = nullptr;
 	REL::Trampoline g_enbDeferMixTrampoline{ "ENB DeferMix"sv };
 	bool g_enbDeferMixInstalled = false;
@@ -2114,54 +2115,37 @@ PSOut8 PSMainMRT8(VSOut input)
 				return;
 			}
 
-			// Fallout's cb1[0].xy contains 1/renderSize, but ENB's PS_DShadow only
-			// keeps that value for Y. Its "NEW GAME" path overwrites r1.x with
-			// v0.x / nativeWidth while r1.z remains 1 - v0.y / renderHeight.
-			// GPU cb1 reconstruction therefore needs an X-only correction. ENB also
-			// inverts the CPU mirror into Matrix03, whose output samples native Depth
-			// P2; that separate path needs both X and Y mapped into the native
-			// allocation subrect. Keep distinct GPU and CPU matrix variants.
+			// ENB copies this CPU projection into a temporary matrix and inverts it
+			// into Matrix03, whose output samples native Depth P2. Map that projection
+			// into the native allocation subrect on both axes. ENB 0.501 introduced
+			// DetailedShadowFirstPersonModels and a Parameters03-controlled shader path
+			// whose view reconstruction additionally needs the X-only GPU correction.
+			// The older shader (including 0.496) already expects its GPU cb1 unchanged.
 			auto* fields = reinterpret_cast<std::uintptr_t*>(a_this);
 			const auto bufferState = fields[19];
+			if (!bufferState) {
+				return;
+			}
 			auto** cpuDataSlot = reinterpret_cast<std::byte**>(bufferState + 48);
-			auto** gpuBufferSlot = reinterpret_cast<ID3D11Buffer**>(bufferState + 64);
-			auto** contextSlot = reinterpret_cast<ID3D11DeviceContext**>(
-				reinterpret_cast<std::byte*>(a_this) + 0x6C20);
-			if (!bufferState || !IsWritableProcessAddress(cpuDataSlot) || !*cpuDataSlot ||
-				!IsWritableProcessAddress(gpuBufferSlot) || !*gpuBufferSlot ||
-				!IsWritableProcessAddress(contextSlot) || !*contextSlot) {
+			if (!IsWritableProcessAddress(cpuDataSlot) || !*cpuDataSlot) {
 				return;
 			}
 
-			buffer_ = *gpuBufferSlot;
-			context_ = *contextSlot;
-			buffer_->GetDesc(&bufferDesc_);
-			if (bufferDesc_.ByteWidth < 448 || bufferDesc_.ByteWidth > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16 ||
-				!IsWritableProcessAddress(*cpuDataSlot + bufferDesc_.ByteWidth - 1)) {
-				buffer_ = nullptr;
-				context_ = nullptr;
-				return;
-			}
-
-			cpuData_ = *cpuDataSlot;
 			matrix_ = reinterpret_cast<float*>(*cpuDataSlot + 320);
 			if (!IsWritableProcessAddress(matrix_) ||
 				!IsWritableProcessAddress(matrix_ + matrixBackup_.size() - 1)) {
-				cpuData_ = nullptr;
 				matrix_ = nullptr;
-				buffer_ = nullptr;
-				context_ = nullptr;
 				return;
 			}
 
 			std::copy_n(matrix_, matrixBackup_.size(), matrixBackup_.begin());
-			gpuData_.resize(bufferDesc_.ByteWidth);
-			std::memcpy(gpuData_.data(), cpuData_, bufferDesc_.ByteWidth);
+			cpuData_ = *cpuDataSlot;
 			float nativeToRenderX = 1.0f / ratioX;
 			float nativeToRenderY = 1.0f / ratioY;
 			const auto frameBufferState = fields[9];
-			auto** frameCpuDataSlot = reinterpret_cast<std::byte**>(frameBufferState + 48);
-			if (frameBufferState && IsWritableProcessAddress(frameCpuDataSlot) && *frameCpuDataSlot &&
+			auto** frameCpuDataSlot = frameBufferState ?
+				reinterpret_cast<std::byte**>(frameBufferState + 48) : nullptr;
+			if (frameCpuDataSlot && IsWritableProcessAddress(frameCpuDataSlot) && *frameCpuDataSlot &&
 				IsWritableProcessAddress(*frameCpuDataSlot + sizeof(float)) &&
 				g_enbFullWidth && g_enbFullHeight && *g_enbFullWidth > 0 && *g_enbFullHeight > 0) {
 				const auto* reciprocalRenderSize = reinterpret_cast<const float*>(*frameCpuDataSlot);
@@ -2177,22 +2161,48 @@ PSOut8 PSMainMRT8(VSOut input)
 				}
 			}
 
-			// The GPU buffer supplies cb1[20..27] to view reconstruction. Patch X
-			// in both the normal and near-depth inverse projections, but preserve Y.
-			ComposeNativeToRender(
-				reinterpret_cast<float*>(gpuData_.data() + 320), nativeToRenderX, 1.0f);
-			ComposeNativeToRender(
-				reinterpret_cast<float*>(gpuData_.data() + 384), nativeToRenderX, 1.0f);
+			const void* gpuUploadData = nullptr;
+			if (g_enbDetailedShadowUsesFirstPersonModelPath) {
+				auto** gpuBufferSlot = reinterpret_cast<ID3D11Buffer**>(bufferState + 64);
+				auto** contextSlot = reinterpret_cast<ID3D11DeviceContext**>(
+					reinterpret_cast<std::byte*>(a_this) + 0x6C20);
+				if (!IsWritableProcessAddress(gpuBufferSlot) || !*gpuBufferSlot ||
+					!IsWritableProcessAddress(contextSlot) || !*contextSlot) {
+					matrix_ = nullptr;
+					cpuData_ = nullptr;
+					return;
+				}
 
-			// ENB copies only cb1[20..23] from the CPU mirror and inverts it into
-			// Matrix03. Its projected UV samples a native allocation, so this copy
-			// needs the full render-NDC -> native-subrect conversion on both axes.
+				buffer_ = *gpuBufferSlot;
+				context_ = *contextSlot;
+				buffer_->GetDesc(&bufferDesc_);
+				if (bufferDesc_.ByteWidth < 448 ||
+					bufferDesc_.ByteWidth > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16 ||
+					!IsWritableProcessAddress(cpuData_ + bufferDesc_.ByteWidth - 1)) {
+					matrix_ = nullptr;
+					cpuData_ = nullptr;
+					buffer_ = nullptr;
+					context_ = nullptr;
+					return;
+				}
+
+				// DetailedShadow may enter repeatedly in one frame. Reuse storage per
+				// render thread instead of allocating a temporary buffer for every pass.
+				static thread_local std::vector<std::byte> gpuData;
+				gpuData.resize(bufferDesc_.ByteWidth);
+				std::memcpy(gpuData.data(), cpuData_, bufferDesc_.ByteWidth);
+				ComposeNativeToRender(
+					reinterpret_cast<float*>(gpuData.data() + 320), nativeToRenderX, 1.0f);
+				ComposeNativeToRender(
+					reinterpret_cast<float*>(gpuData.data() + 384), nativeToRenderX, 1.0f);
+				gpuUploadData = gpuData.data();
+			}
+
 			ComposeNativeToRender(matrix_, nativeToRenderX, nativeToRenderY);
-			if (!Upload(gpuData_.data())) {
+			if (buffer_ && !Upload(gpuUploadData)) {
 				std::copy(matrixBackup_.begin(), matrixBackup_.end(), matrix_);
-				gpuData_.clear();
-				cpuData_ = nullptr;
 				matrix_ = nullptr;
+				cpuData_ = nullptr;
 				buffer_ = nullptr;
 				context_ = nullptr;
 				return;
@@ -2204,7 +2214,9 @@ PSOut8 PSMainMRT8(VSOut input)
 		{
 			if (active_) {
 				std::copy(matrixBackup_.begin(), matrixBackup_.end(), matrix_);
-				Upload(cpuData_);
+				if (buffer_) {
+					Upload(cpuData_);
+				}
 			}
 		}
 
@@ -2254,7 +2266,6 @@ PSOut8 PSMainMRT8(VSOut input)
 		D3D11_BUFFER_DESC bufferDesc_{};
 		float* matrix_ = nullptr;
 		std::array<float, 16> matrixBackup_{};
-		std::vector<std::byte> gpuData_{};
 		bool active_ = false;
 	};
 
@@ -2347,6 +2358,11 @@ PSOut8 PSMainMRT8(VSOut input)
 					detailedShadowEntry,
 					reinterpret_cast<std::uintptr_t>(&ENBDetailedShadowRenderThunk));
 				if (trampoline) {
+					// 0.501 introduced this setting together with the Parameters03 DShadow
+					// branch whose GPU inverse projection has the asymmetric X coordinate.
+					// Use the feature marker instead of assuming a contiguous version range.
+					g_enbDetailedShadowUsesFirstPersonModelPath = ENBModuleContainsString(
+						module, "DetailedShadowFirstPersonModels");
 					g_enbDetailedShadowRender = reinterpret_cast<ENBScreenEffectRender_t>(trampoline);
 				} else {
 					logger::warn("[ENB SR] Failed to install DetailedShadow projection hook");
