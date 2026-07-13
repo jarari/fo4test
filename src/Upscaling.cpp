@@ -74,18 +74,21 @@ namespace
 	constexpr uint32_t kDLSSGResumeStableFrames = 2;
 	constexpr uint64_t kFeatureRetryGameFrames = 200;
 	constexpr uint64_t kTextureMemoryUpgradeReserveBytes = 512ull * 1024ull * 1024ull;
+	constexpr std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>
+		kNullD3D11ShaderResources{};
 	FILETIME g_lastSettingsWriteTime{};
 	bool g_hasLastSettingsWriteTime = false;
 	bool g_lastSettingsFileExists = false;
 	bool g_textureMemoryReserveApplied = false;
 	winrt::com_ptr<ID3D11VertexShader> g_enbScaleCopyVS;
 	winrt::com_ptr<ID3D11PixelShader> g_enbScaleCopyPS;
+	std::array<winrt::com_ptr<ID3D11PixelShader>, 3> g_enbScaleCopyMRTPS;
 	winrt::com_ptr<ID3D11SamplerState> g_enbScaleCopySampler;
 	winrt::com_ptr<ID3D11BlendState> g_enbScaleCopyBlendState;
 	winrt::com_ptr<ID3D11DepthStencilState> g_enbScaleCopyDepthStencilState;
 	winrt::com_ptr<ID3D11RasterizerState> g_enbScaleCopyRasterizerState;
-	winrt::com_ptr<ID3D11Texture2D> g_enbSRInputRenderRect;
-	winrt::com_ptr<ID3D11RenderTargetView> g_enbSRInputRenderRectRTV;
+	winrt::com_ptr<ID3D11Device> g_enbNativeDevice;
+	winrt::com_ptr<ID3D11DeviceContext> g_enbNativeContext;
 	winrt::com_ptr<ID3D11Texture2D> g_enbNativeDepth;
 	winrt::com_ptr<ID3D11ShaderResourceView> g_enbNativeDepthSRV;
 	winrt::com_ptr<ID3D11RenderTargetView> g_enbNativeDepthRTV;
@@ -462,7 +465,15 @@ namespace
 		return cached;
 	}
 
-	std::optional<bool> TryGetENBBool(const char* a_category, const char* a_key)
+	enum class ENBBoolSetting : std::uint8_t
+	{
+		kUseEffect,
+		kSubSurfaceScattering,
+		kPrepass,
+		kTotal
+	};
+
+	std::optional<bool> QueryENBBool(const char* a_category, const char* a_key)
 	{
 		if (!enbLoaded) {
 			return std::nullopt;
@@ -473,7 +484,11 @@ namespace
 			return std::nullopt;
 		}
 
-		const auto getParameter = reinterpret_cast<ENB_SDK::_ENBGetParameterA>(GetProcAddress(enbModule, "ENBGetParameter"));
+		static ENB_SDK::_ENBGetParameterA getParameter = nullptr;
+		if (!getParameter) {
+			getParameter = reinterpret_cast<ENB_SDK::_ENBGetParameterA>(
+				GetProcAddress(enbModule, "ENBGetParameter"));
+		}
 		if (!getParameter) {
 			return std::nullopt;
 		}
@@ -489,6 +504,42 @@ namespace
 		return *reinterpret_cast<BOOL*>(param.Data) != FALSE;
 	}
 
+	std::optional<bool> TryGetENBBool(ENBBoolSetting a_setting)
+	{
+		struct CacheEntry
+		{
+			std::uint64_t frame{ std::numeric_limits<std::uint64_t>::max() };
+			std::optional<bool> value;
+		};
+
+		static thread_local std::array<CacheEntry, static_cast<std::size_t>(ENBBoolSetting::kTotal)> cache{};
+		static auto* gameViewport = Util::State_GetSingleton();
+		const auto frame = gameViewport ?
+			static_cast<std::uint64_t>(gameViewport->frameCount) :
+			std::numeric_limits<std::uint64_t>::max() - 1;
+		auto& entry = cache[static_cast<std::size_t>(a_setting)];
+		if (entry.frame == frame) {
+			return entry.value;
+		}
+
+		entry.frame = frame;
+		switch (a_setting) {
+		case ENBBoolSetting::kUseEffect:
+			entry.value = QueryENBBool("GLOBAL", "UseEffect");
+			break;
+		case ENBBoolSetting::kSubSurfaceScattering:
+			entry.value = QueryENBBool("EFFECT", "EnableSubSurfaceScattering");
+			break;
+		case ENBBoolSetting::kPrepass:
+			entry.value = QueryENBBool("EFFECT", "EnablePrepass");
+			break;
+		default:
+			entry.value = std::nullopt;
+			break;
+		}
+		return entry.value;
+	}
+
 	bool IsTemporalSuperResolutionMethod(Upscaling::UpscaleMethod a_upscaleMethod)
 	{
 		return a_upscaleMethod == Upscaling::UpscaleMethod::kDLSS ||
@@ -497,29 +548,29 @@ namespace
 
 	bool IsENBUseEffectActive()
 	{
-		return enbLoaded && TryGetENBBool("GLOBAL", "UseEffect").value_or(false);
+		return enbLoaded && TryGetENBBool(ENBBoolSetting::kUseEffect).value_or(false);
 	}
 
 	bool ShouldBypassDynamicResolutionHooksForInactiveENB()
 	{
-		const auto useEffect = TryGetENBBool("GLOBAL", "UseEffect");
+		const auto useEffect = TryGetENBBool(ENBBoolSetting::kUseEffect);
 		return enbLoaded && useEffect.has_value() && !*useEffect;
 	}
 
 	bool IsENBSRCompatibilityActive(Upscaling::UpscaleMethod a_upscaleMethod)
 	{
-		return IsENBUseEffectActive() &&
-			IsTemporalSuperResolutionMethod(a_upscaleMethod);
+		return IsTemporalSuperResolutionMethod(a_upscaleMethod) &&
+			IsENBUseEffectActive();
 	}
 
 	bool ShouldLeaveENBDeferredCompositeFeaturePassNative(RE::BSRenderPass* a_renderPass, Upscaling::UpscaleMethod a_upscaleMethod)
 	{
-		if (!IsENBUseEffectActive() ||
-			!IsTemporalSuperResolutionMethod(a_upscaleMethod)) {
+		if (!IsTemporalSuperResolutionMethod(a_upscaleMethod) ||
+			!IsENBUseEffectActive()) {
 			return false;
 		}
 
-		if (TryGetENBBool("EFFECT", "EnableSubSurfaceScattering").value_or(false)) {
+		if (TryGetENBBool(ENBBoolSetting::kSubSurfaceScattering).value_or(false)) {
 			return true;
 		}
 
@@ -635,6 +686,48 @@ namespace
 		reinterpret_cast<ID3D11DeviceContext*>(rendererData->context)->RSSetViewports(1, &viewport);
 	}
 
+	bool EnsureENBNativeD3D11Context(ID3D11Resource* a_resource)
+	{
+		if (g_enbNativeDevice && g_enbNativeContext) {
+			return true;
+		}
+		if (!a_resource) {
+			return false;
+		}
+
+		g_enbNativeContext = nullptr;
+		g_enbNativeDevice = nullptr;
+		a_resource->GetDevice(g_enbNativeDevice.put());
+		if (!g_enbNativeDevice) {
+			return false;
+		}
+		g_enbNativeDevice->GetImmediateContext(g_enbNativeContext.put());
+		if (!g_enbNativeContext) {
+			g_enbNativeDevice = nullptr;
+			return false;
+		}
+		return true;
+	}
+
+	bool CanBypassENBD3D11Context(ID3D11DeviceContext* a_wrappedContext)
+	{
+		if (!g_enbNativeContext || g_enbNativeContext.get() == a_wrappedContext) {
+			return false;
+		}
+
+		auto*** const object = reinterpret_cast<void***>(g_enbNativeContext.get());
+		if (!object || !*object || !**object) {
+			return false;
+		}
+
+		MEMORY_BASIC_INFORMATION memory{};
+		if (VirtualQuery(**object, &memory, sizeof(memory)) != sizeof(memory)) {
+			return false;
+		}
+		const auto enbModule = FindENBModule();
+		return enbModule && memory.AllocationBase != enbModule;
+	}
+
 	bool EnsureENBScaleCopyResources(ID3D11Device* a_device)
 	{
 		if (!a_device) {
@@ -646,7 +739,7 @@ namespace
 		}
 
 		constexpr const char* shaderSource = R"(
-Texture2D sourceTexture : register(t0);
+Texture2D sourceTextures[8] : register(t0);
 SamplerState sourceSampler : register(s0);
 
 struct VSOut
@@ -676,12 +769,71 @@ VSOut VSMain(uint vertexID : SV_VertexID)
 
 float4 PSMain(VSOut input) : SV_Target
 {
-	return sourceTexture.SampleLevel(sourceSampler, input.uv, 0.0);
+	return sourceTextures[0].SampleLevel(sourceSampler, input.uv, 0.0);
+}
+
+struct PSOut2
+{
+	float4 color0 : SV_Target0;
+	float4 color1 : SV_Target1;
+};
+
+PSOut2 PSMainMRT2(VSOut input)
+{
+	PSOut2 output;
+	output.color0 = sourceTextures[0].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color1 = sourceTextures[1].SampleLevel(sourceSampler, input.uv, 0.0);
+	return output;
+}
+
+struct PSOut4
+{
+	float4 color0 : SV_Target0;
+	float4 color1 : SV_Target1;
+	float4 color2 : SV_Target2;
+	float4 color3 : SV_Target3;
+};
+
+PSOut4 PSMainMRT4(VSOut input)
+{
+	PSOut4 output;
+	output.color0 = sourceTextures[0].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color1 = sourceTextures[1].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color2 = sourceTextures[2].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color3 = sourceTextures[3].SampleLevel(sourceSampler, input.uv, 0.0);
+	return output;
+}
+
+struct PSOut8
+{
+	float4 color0 : SV_Target0;
+	float4 color1 : SV_Target1;
+	float4 color2 : SV_Target2;
+	float4 color3 : SV_Target3;
+	float4 color4 : SV_Target4;
+	float4 color5 : SV_Target5;
+	float4 color6 : SV_Target6;
+	float4 color7 : SV_Target7;
+};
+
+PSOut8 PSMainMRT8(VSOut input)
+{
+	PSOut8 output;
+	output.color0 = sourceTextures[0].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color1 = sourceTextures[1].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color2 = sourceTextures[2].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color3 = sourceTextures[3].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color4 = sourceTextures[4].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color5 = sourceTextures[5].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color6 = sourceTextures[6].SampleLevel(sourceSampler, input.uv, 0.0);
+	output.color7 = sourceTextures[7].SampleLevel(sourceSampler, input.uv, 0.0);
+	return output;
 }
 )";
 
 		winrt::com_ptr<ID3DBlob> vertexShaderBlob;
 		winrt::com_ptr<ID3DBlob> pixelShaderBlob;
+		std::array<winrt::com_ptr<ID3DBlob>, 3> mrtPixelShaderBlobs;
 		winrt::com_ptr<ID3DBlob> errors;
 		const auto compileFlags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
 		auto hr = D3DCompile(
@@ -719,10 +871,53 @@ float4 PSMain(VSOut input) : SV_Target
 			return false;
 		}
 
-		if (FAILED(a_device->CreateVertexShader(vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize(), nullptr, g_enbScaleCopyVS.put())) ||
-			FAILED(a_device->CreatePixelShader(pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize(), nullptr, g_enbScaleCopyPS.put()))) {
+		constexpr std::array<const char*, 3> mrtEntryPoints{
+			"PSMainMRT2", "PSMainMRT4", "PSMainMRT8"
+		};
+		for (std::size_t i = 0; i < mrtEntryPoints.size(); ++i) {
+			errors = nullptr;
+			hr = D3DCompile(
+				shaderSource,
+				std::strlen(shaderSource),
+				"ENBScaleCopy",
+				nullptr,
+				nullptr,
+				mrtEntryPoints[i],
+				"ps_5_0",
+				compileFlags,
+				0,
+				mrtPixelShaderBlobs[i].put(),
+				errors.put());
+			if (FAILED(hr)) {
+				logger::warn(
+					"[Upscaling] Failed to compile ENB scale-copy {}: {}",
+					mrtEntryPoints[i],
+					errors ? static_cast<char*>(errors->GetBufferPointer()) : "unknown error");
+				mrtPixelShaderBlobs[i] = nullptr;
+			}
+		}
+
+		winrt::com_ptr<ID3D11VertexShader> scaleCopyVS;
+		winrt::com_ptr<ID3D11PixelShader> scaleCopyPS;
+		std::array<winrt::com_ptr<ID3D11PixelShader>, 3> scaleCopyMRTPS;
+		winrt::com_ptr<ID3D11SamplerState> scaleCopySampler;
+		winrt::com_ptr<ID3D11BlendState> scaleCopyBlendState;
+		winrt::com_ptr<ID3D11DepthStencilState> scaleCopyDepthStencilState;
+		winrt::com_ptr<ID3D11RasterizerState> scaleCopyRasterizerState;
+
+		if (FAILED(a_device->CreateVertexShader(vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize(), nullptr, scaleCopyVS.put())) ||
+			FAILED(a_device->CreatePixelShader(pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize(), nullptr, scaleCopyPS.put()))) {
 			logger::warn("[Upscaling] Failed to create ENB scale-copy shaders");
 			return false;
+		}
+		for (std::size_t i = 0; i < mrtPixelShaderBlobs.size(); ++i) {
+			if (mrtPixelShaderBlobs[i] && FAILED(a_device->CreatePixelShader(
+					mrtPixelShaderBlobs[i]->GetBufferPointer(),
+					mrtPixelShaderBlobs[i]->GetBufferSize(),
+					nullptr,
+					scaleCopyMRTPS[i].put()))) {
+				logger::warn("[Upscaling] Failed to create ENB MRT scale-copy shader");
+			}
 		}
 
 		D3D11_SAMPLER_DESC samplerDesc{};
@@ -731,14 +926,16 @@ float4 PSMain(VSOut input) : SV_Target
 		samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
 		samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
 		samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
-		if (FAILED(a_device->CreateSamplerState(&samplerDesc, g_enbScaleCopySampler.put()))) {
+		if (FAILED(a_device->CreateSamplerState(&samplerDesc, scaleCopySampler.put()))) {
 			logger::warn("[Upscaling] Failed to create ENB scale-copy sampler");
 			return false;
 		}
 
 		D3D11_BLEND_DESC blendDesc{};
-		blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-		if (FAILED(a_device->CreateBlendState(&blendDesc, g_enbScaleCopyBlendState.put()))) {
+		for (auto& target : blendDesc.RenderTarget) {
+			target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+		}
+		if (FAILED(a_device->CreateBlendState(&blendDesc, scaleCopyBlendState.put()))) {
 			logger::warn("[Upscaling] Failed to create ENB scale-copy blend state");
 			return false;
 		}
@@ -746,7 +943,7 @@ float4 PSMain(VSOut input) : SV_Target
 		D3D11_DEPTH_STENCIL_DESC depthDesc{};
 		depthDesc.DepthEnable = FALSE;
 		depthDesc.StencilEnable = FALSE;
-		if (FAILED(a_device->CreateDepthStencilState(&depthDesc, g_enbScaleCopyDepthStencilState.put()))) {
+		if (FAILED(a_device->CreateDepthStencilState(&depthDesc, scaleCopyDepthStencilState.put()))) {
 			logger::warn("[Upscaling] Failed to create ENB scale-copy depth state");
 			return false;
 		}
@@ -755,135 +952,343 @@ float4 PSMain(VSOut input) : SV_Target
 		rasterizerDesc.FillMode = D3D11_FILL_SOLID;
 		rasterizerDesc.CullMode = D3D11_CULL_NONE;
 		rasterizerDesc.DepthClipEnable = TRUE;
-		if (FAILED(a_device->CreateRasterizerState(&rasterizerDesc, g_enbScaleCopyRasterizerState.put()))) {
+		if (FAILED(a_device->CreateRasterizerState(&rasterizerDesc, scaleCopyRasterizerState.put()))) {
 			logger::warn("[Upscaling] Failed to create ENB scale-copy rasterizer state");
 			return false;
 		}
 
+		g_enbScaleCopyVS = std::move(scaleCopyVS);
+		g_enbScaleCopyPS = std::move(scaleCopyPS);
+		g_enbScaleCopyMRTPS = std::move(scaleCopyMRTPS);
+		g_enbScaleCopySampler = std::move(scaleCopySampler);
+		g_enbScaleCopyBlendState = std::move(scaleCopyBlendState);
+		g_enbScaleCopyDepthStencilState = std::move(scaleCopyDepthStencilState);
+		g_enbScaleCopyRasterizerState = std::move(scaleCopyRasterizerState);
 		return true;
 	}
+
+	struct ENBScaleCopyJob
+	{
+		ID3D11Texture2D* sourceTexture{ nullptr };
+		ID3D11ShaderResourceView* sourceSRV{ nullptr };
+		ID3D11RenderTargetView* destinationRTV{ nullptr };
+		ID3D11Texture2D* destinationTexture{ nullptr };
+		D3D11_TEXTURE2D_DESC destinationDesc{};
+		DXGI_FORMAT sourceViewFormat{ DXGI_FORMAT_UNKNOWN };
+		DXGI_FORMAT destinationViewFormat{ DXGI_FORMAT_UNKNOWN };
+	};
+
+	class ScopedENBProxyPromotionBoundary
+	{
+	public:
+		explicit ScopedENBProxyPromotionBoundary(ID3D11DeviceContext* a_context) :
+			context_(a_context)
+		{
+			if (!context_) {
+				return;
+			}
+
+			context_->OMGetRenderTargets(
+				D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+				savedRTVs_.data(),
+				&savedDSV_);
+			context_->PSGetShaderResources(
+				0,
+				D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+				savedPSResources_.data());
+
+			context_->PSSetShaderResources(
+				0,
+				D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+				kNullD3D11ShaderResources.data());
+			context_->OMSetRenderTargets(0, nullptr, nullptr);
+			active_ = true;
+		}
+
+		~ScopedENBProxyPromotionBoundary()
+		{
+			if (!active_) {
+				return;
+			}
+
+			// Preserve the original ENB-visible boundary ordering. In current ENB the
+			// OMSetRenderTargets wrapper uses the 6 -> non-6 transition to hand off
+			// its deferred composite, then rebuilds admission state from this final
+			// bind. Internal promotion draws run on the native context between them.
+			context_->PSSetShaderResources(
+				0,
+				D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+				savedPSResources_.data());
+			context_->OMSetRenderTargets(
+				D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+				savedRTVs_.data(),
+				savedDSV_);
+
+			for (auto* srv : savedPSResources_) {
+				if (srv) {
+					srv->Release();
+				}
+			}
+			for (auto* rtv : savedRTVs_) {
+				if (rtv) {
+					rtv->Release();
+				}
+			}
+			if (savedDSV_) {
+				savedDSV_->Release();
+			}
+		}
+
+		ScopedENBProxyPromotionBoundary(const ScopedENBProxyPromotionBoundary&) = delete;
+		ScopedENBProxyPromotionBoundary& operator=(const ScopedENBProxyPromotionBoundary&) = delete;
+
+		bool IsActive() const { return active_; }
+
+	private:
+		ID3D11DeviceContext* context_{ nullptr };
+		bool active_{ false };
+		std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> savedPSResources_{};
+		std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> savedRTVs_{};
+		ID3D11DepthStencilView* savedDSV_{ nullptr };
+	};
+
+	class ScopedENBScaleCopyState
+	{
+	public:
+		ScopedENBScaleCopyState(
+			ID3D11Device* a_device,
+			ID3D11DeviceContext* a_context,
+			UINT a_savedPSResourceCount = 1)
+		{
+			if (!a_context || !EnsureENBScaleCopyResources(a_device)) {
+				return;
+			}
+
+			context_ = a_context;
+			savedPSResourceCount_ = std::clamp<UINT>(
+				a_savedPSResourceCount,
+				1,
+				D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
+			context_->VSGetShader(savedVS_.put(), nullptr, nullptr);
+			context_->PSGetShader(savedPS_.put(), nullptr, nullptr);
+			context_->GSGetShader(savedGS_.put(), nullptr, nullptr);
+			context_->HSGetShader(savedHS_.put(), nullptr, nullptr);
+			context_->DSGetShader(savedDS_.put(), nullptr, nullptr);
+			context_->IAGetInputLayout(savedInputLayout_.put());
+			context_->IAGetPrimitiveTopology(&savedTopology_);
+			context_->PSGetSamplers(0, 1, savedSampler_.put());
+			context_->PSGetShaderResources(0, savedPSResourceCount_, savedPSResources_.data());
+			context_->OMGetRenderTargets(
+				D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+				savedRTVs_.data(),
+				&savedDSV_);
+			context_->OMGetBlendState(savedBlendState_.put(), savedBlendFactor_, &savedSampleMask_);
+			context_->OMGetDepthStencilState(savedDepthStencilState_.put(), &savedStencilRef_);
+			context_->RSGetState(savedRasterizerState_.put());
+			savedViewportCount_ = static_cast<UINT>(savedViewports_.size());
+			context_->RSGetViewports(&savedViewportCount_, savedViewports_.data());
+
+			context_->PSSetShaderResources(0, savedPSResourceCount_, kNullD3D11ShaderResources.data());
+			const float blendFactor[4]{};
+			context_->OMSetBlendState(g_enbScaleCopyBlendState.get(), blendFactor, 0xffffffff);
+			context_->OMSetDepthStencilState(g_enbScaleCopyDepthStencilState.get(), 0);
+			context_->RSSetState(g_enbScaleCopyRasterizerState.get());
+			context_->IASetInputLayout(nullptr);
+			context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			context_->VSSetShader(g_enbScaleCopyVS.get(), nullptr, 0);
+			context_->PSSetShader(g_enbScaleCopyPS.get(), nullptr, 0);
+			context_->GSSetShader(nullptr, nullptr, 0);
+			context_->HSSetShader(nullptr, nullptr, 0);
+			context_->DSSetShader(nullptr, nullptr, 0);
+			ID3D11SamplerState* sampler = g_enbScaleCopySampler.get();
+			context_->PSSetSamplers(0, 1, &sampler);
+			active_ = true;
+		}
+
+		~ScopedENBScaleCopyState()
+		{
+			if (!active_) {
+				return;
+			}
+
+			context_->PSSetShaderResources(0, savedPSResourceCount_, kNullD3D11ShaderResources.data());
+			context_->VSSetShader(savedVS_.get(), nullptr, 0);
+			context_->PSSetShader(savedPS_.get(), nullptr, 0);
+			context_->GSSetShader(savedGS_.get(), nullptr, 0);
+			context_->HSSetShader(savedHS_.get(), nullptr, 0);
+			context_->DSSetShader(savedDS_.get(), nullptr, 0);
+			context_->IASetInputLayout(savedInputLayout_.get());
+			context_->IASetPrimitiveTopology(savedTopology_);
+			ID3D11SamplerState* sampler = savedSampler_.get();
+			context_->PSSetSamplers(0, 1, &sampler);
+			context_->OMSetBlendState(savedBlendState_.get(), savedBlendFactor_, savedSampleMask_);
+			context_->OMSetDepthStencilState(savedDepthStencilState_.get(), savedStencilRef_);
+			context_->RSSetState(savedRasterizerState_.get());
+			if (savedViewportCount_ > 0) {
+				context_->RSSetViewports(savedViewportCount_, savedViewports_.data());
+			}
+			context_->OMSetRenderTargets(
+				D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+				savedRTVs_.data(),
+				savedDSV_);
+			context_->PSSetShaderResources(0, savedPSResourceCount_, savedPSResources_.data());
+
+			for (UINT i = 0; i < savedPSResourceCount_; ++i) {
+				if (savedPSResources_[i]) {
+					savedPSResources_[i]->Release();
+				}
+			}
+			for (auto* rtv : savedRTVs_) {
+				if (rtv) {
+					rtv->Release();
+				}
+			}
+			if (savedDSV_) {
+				savedDSV_->Release();
+			}
+		}
+
+		ScopedENBScaleCopyState(const ScopedENBScaleCopyState&) = delete;
+		ScopedENBScaleCopyState& operator=(const ScopedENBScaleCopyState&) = delete;
+
+		bool IsActive() const { return active_; }
+
+		bool Draw(
+			ID3D11ShaderResourceView* a_sourceSRV,
+			ID3D11RenderTargetView* a_destinationRTV,
+			ID3D11Texture2D* a_destinationTexture,
+			UINT a_outputWidth = 0,
+			UINT a_outputHeight = 0)
+		{
+			if (!active_ || !a_sourceSRV || !a_destinationRTV || !a_destinationTexture) {
+				return false;
+			}
+
+			D3D11_TEXTURE2D_DESC desc{};
+			a_destinationTexture->GetDesc(&desc);
+			const auto width = a_outputWidth ? a_outputWidth : desc.Width;
+			const auto height = a_outputHeight ? a_outputHeight : desc.Height;
+			if (width == 0 || height == 0 || width > desc.Width || height > desc.Height) {
+				return false;
+			}
+
+			context_->OMSetRenderTargets(1, &a_destinationRTV, nullptr);
+			SetViewport(width, height);
+			context_->PSSetShaderResources(0, 1, &a_sourceSRV);
+			context_->Draw(3, 0);
+			context_->PSSetShaderResources(0, 1, kNullD3D11ShaderResources.data());
+			return true;
+		}
+
+		bool DrawMRT(const ENBScaleCopyJob* const* a_jobs, std::size_t a_count)
+		{
+			if (!active_ || !a_jobs ||
+				a_count < 2 || a_count > D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT) {
+				return false;
+			}
+
+			const auto& first = *a_jobs[0];
+			if (!first.sourceSRV || !first.destinationRTV ||
+				first.destinationDesc.Width == 0 || first.destinationDesc.Height == 0) {
+				return false;
+			}
+
+			std::array<ID3D11ShaderResourceView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> sources{};
+			std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> destinations{};
+			for (std::size_t i = 0; i < a_count; ++i) {
+				const auto& job = *a_jobs[i];
+				if (!job.sourceSRV || !job.destinationRTV ||
+					job.destinationDesc.Width != first.destinationDesc.Width ||
+					job.destinationDesc.Height != first.destinationDesc.Height ||
+					job.destinationDesc.SampleDesc.Count != first.destinationDesc.SampleDesc.Count ||
+					job.destinationDesc.SampleDesc.Quality != first.destinationDesc.SampleDesc.Quality ||
+					job.sourceViewFormat != first.sourceViewFormat ||
+					job.destinationViewFormat != first.destinationViewFormat) {
+					return false;
+				}
+				sources[i] = job.sourceSRV;
+				destinations[i] = job.destinationRTV;
+			}
+
+			const auto shaderIndex = a_count <= 2 ? 0u : (a_count <= 4 ? 1u : 2u);
+			if (!g_enbScaleCopyMRTPS[shaderIndex]) {
+				return false;
+			}
+			context_->PSSetShader(g_enbScaleCopyMRTPS[shaderIndex].get(), nullptr, 0);
+			context_->OMSetRenderTargets(static_cast<UINT>(a_count), destinations.data(), nullptr);
+			SetViewport(first.destinationDesc.Width, first.destinationDesc.Height);
+			context_->PSSetShaderResources(0, static_cast<UINT>(a_count), sources.data());
+			context_->Draw(3, 0);
+			context_->PSSetShaderResources(
+				0,
+				static_cast<UINT>(a_count),
+				kNullD3D11ShaderResources.data());
+			context_->PSSetShader(g_enbScaleCopyPS.get(), nullptr, 0);
+			return true;
+		}
+
+	private:
+		void SetViewport(UINT a_width, UINT a_height)
+		{
+			const D3D11_VIEWPORT viewport{
+				0.0f,
+				0.0f,
+				static_cast<float>(a_width),
+				static_cast<float>(a_height),
+				0.0f,
+				1.0f
+			};
+			context_->RSSetViewports(1, &viewport);
+		}
+
+		ID3D11DeviceContext* context_{ nullptr };
+		bool active_{ false };
+		UINT savedPSResourceCount_{ 1 };
+		winrt::com_ptr<ID3D11VertexShader> savedVS_;
+		winrt::com_ptr<ID3D11PixelShader> savedPS_;
+		winrt::com_ptr<ID3D11GeometryShader> savedGS_;
+		winrt::com_ptr<ID3D11HullShader> savedHS_;
+		winrt::com_ptr<ID3D11DomainShader> savedDS_;
+		winrt::com_ptr<ID3D11InputLayout> savedInputLayout_;
+		D3D11_PRIMITIVE_TOPOLOGY savedTopology_{};
+		winrt::com_ptr<ID3D11SamplerState> savedSampler_;
+		std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> savedPSResources_{};
+		std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> savedRTVs_{};
+		ID3D11DepthStencilView* savedDSV_{ nullptr };
+		winrt::com_ptr<ID3D11BlendState> savedBlendState_;
+		float savedBlendFactor_[4]{};
+		UINT savedSampleMask_{ 0 };
+		winrt::com_ptr<ID3D11DepthStencilState> savedDepthStencilState_;
+		UINT savedStencilRef_{ 0 };
+		winrt::com_ptr<ID3D11RasterizerState> savedRasterizerState_;
+		std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> savedViewports_{};
+		UINT savedViewportCount_{ 0 };
+	};
 
 	bool ScaleCopyRenderTarget(
 		ID3D11Device* a_device,
 		ID3D11DeviceContext* a_context,
 		ID3D11ShaderResourceView* a_sourceSRV,
 		ID3D11RenderTargetView* a_destinationRTV,
-		ID3D11Texture2D* a_destinationTexture)
+		ID3D11Texture2D* a_destinationTexture,
+		UINT a_outputWidth = 0,
+		UINT a_outputHeight = 0)
 	{
-		if (!EnsureENBScaleCopyResources(a_device)) {
-			return false;
+		auto* resourceDevice = a_device;
+		if (EnsureENBNativeD3D11Context(a_destinationTexture) &&
+			CanBypassENBD3D11Context(a_context)) {
+			// Create helper shaders/states on the same real device used by the
+			// native fast path. ENB's context wrapper can forward those native
+			// objects, while the inverse is not guaranteed for wrapper-created ones.
+			resourceDevice = g_enbNativeDevice.get();
 		}
-
-		if (!a_context || !a_sourceSRV || !a_destinationRTV || !a_destinationTexture) {
-			return false;
-		}
-
-		D3D11_TEXTURE2D_DESC destinationDesc{};
-		a_destinationTexture->GetDesc(&destinationDesc);
-		if (destinationDesc.Width == 0 || destinationDesc.Height == 0) {
-			return false;
-		}
-
-		winrt::com_ptr<ID3D11VertexShader> savedVS;
-		winrt::com_ptr<ID3D11PixelShader> savedPS;
-		winrt::com_ptr<ID3D11GeometryShader> savedGS;
-		winrt::com_ptr<ID3D11HullShader> savedHS;
-		winrt::com_ptr<ID3D11DomainShader> savedDS;
-		a_context->VSGetShader(savedVS.put(), nullptr, nullptr);
-		a_context->PSGetShader(savedPS.put(), nullptr, nullptr);
-		a_context->GSGetShader(savedGS.put(), nullptr, nullptr);
-		a_context->HSGetShader(savedHS.put(), nullptr, nullptr);
-		a_context->DSGetShader(savedDS.put(), nullptr, nullptr);
-
-		winrt::com_ptr<ID3D11InputLayout> savedInputLayout;
-		D3D11_PRIMITIVE_TOPOLOGY savedTopology{};
-		a_context->IAGetInputLayout(savedInputLayout.put());
-		a_context->IAGetPrimitiveTopology(&savedTopology);
-
-		winrt::com_ptr<ID3D11SamplerState> savedSampler;
-		winrt::com_ptr<ID3D11ShaderResourceView> savedSRV;
-		a_context->PSGetSamplers(0, 1, savedSampler.put());
-		a_context->PSGetShaderResources(0, 1, savedSRV.put());
-
-		ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-		ID3D11DepthStencilView* savedDSV = nullptr;
-		a_context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
-
-		winrt::com_ptr<ID3D11BlendState> savedBlendState;
-		float savedBlendFactor[4]{};
-		UINT savedSampleMask = 0;
-		a_context->OMGetBlendState(savedBlendState.put(), savedBlendFactor, &savedSampleMask);
-
-		winrt::com_ptr<ID3D11DepthStencilState> savedDepthStencilState;
-		UINT savedStencilRef = 0;
-		a_context->OMGetDepthStencilState(savedDepthStencilState.put(), &savedStencilRef);
-
-		winrt::com_ptr<ID3D11RasterizerState> savedRasterizerState;
-		a_context->RSGetState(savedRasterizerState.put());
-
-		UINT savedViewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-		D3D11_VIEWPORT savedViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{};
-		a_context->RSGetViewports(&savedViewportCount, savedViewports);
-
-		ID3D11ShaderResourceView* nullSRV = nullptr;
-		a_context->PSSetShaderResources(0, 1, &nullSRV);
-		a_context->OMSetRenderTargets(1, &a_destinationRTV, nullptr);
-
-		D3D11_VIEWPORT viewport{};
-		viewport.TopLeftX = 0.0f;
-		viewport.TopLeftY = 0.0f;
-		viewport.Width = static_cast<float>(destinationDesc.Width);
-		viewport.Height = static_cast<float>(destinationDesc.Height);
-		viewport.MinDepth = 0.0f;
-		viewport.MaxDepth = 1.0f;
-		a_context->RSSetViewports(1, &viewport);
-
-		const float blendFactor[4]{};
-		a_context->OMSetBlendState(g_enbScaleCopyBlendState.get(), blendFactor, 0xffffffff);
-		a_context->OMSetDepthStencilState(g_enbScaleCopyDepthStencilState.get(), 0);
-		a_context->RSSetState(g_enbScaleCopyRasterizerState.get());
-		a_context->IASetInputLayout(nullptr);
-		a_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		a_context->VSSetShader(g_enbScaleCopyVS.get(), nullptr, 0);
-		a_context->PSSetShader(g_enbScaleCopyPS.get(), nullptr, 0);
-		a_context->GSSetShader(nullptr, nullptr, 0);
-		a_context->HSSetShader(nullptr, nullptr, 0);
-		a_context->DSSetShader(nullptr, nullptr, 0);
-		ID3D11SamplerState* scaleCopySampler = g_enbScaleCopySampler.get();
-		a_context->PSSetSamplers(0, 1, &scaleCopySampler);
-		a_context->PSSetShaderResources(0, 1, &a_sourceSRV);
-		a_context->Draw(3, 0);
-
-		a_context->PSSetShaderResources(0, 1, &nullSRV);
-		a_context->VSSetShader(savedVS.get(), nullptr, 0);
-		a_context->PSSetShader(savedPS.get(), nullptr, 0);
-		a_context->GSSetShader(savedGS.get(), nullptr, 0);
-		a_context->HSSetShader(savedHS.get(), nullptr, 0);
-		a_context->DSSetShader(savedDS.get(), nullptr, 0);
-		a_context->IASetInputLayout(savedInputLayout.get());
-		a_context->IASetPrimitiveTopology(savedTopology);
-		ID3D11SamplerState* restoreSampler = savedSampler.get();
-		ID3D11ShaderResourceView* restoreSRV = savedSRV.get();
-		a_context->PSSetSamplers(0, 1, &restoreSampler);
-		a_context->PSSetShaderResources(0, 1, &restoreSRV);
-		a_context->OMSetBlendState(savedBlendState.get(), savedBlendFactor, savedSampleMask);
-		a_context->OMSetDepthStencilState(savedDepthStencilState.get(), savedStencilRef);
-		a_context->RSSetState(savedRasterizerState.get());
-		if (savedViewportCount > 0) {
-			a_context->RSSetViewports(savedViewportCount, savedViewports);
-		}
-		a_context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
-
-		for (auto* rtv : savedRTVs) {
-			if (rtv) {
-				rtv->Release();
-			}
-		}
-		if (savedDSV) {
-			savedDSV->Release();
-		}
-
-		return true;
+		ScopedENBScaleCopyState state(resourceDevice, a_context);
+		return state.Draw(
+			a_sourceSRV,
+			a_destinationRTV,
+			a_destinationTexture,
+			a_outputWidth,
+			a_outputHeight);
 	}
 
 	std::uintptr_t FindLiveENBPrepass(HMODULE a_module)
@@ -1546,20 +1951,20 @@ float4 PSMain(VSOut input) : SV_Target
 		return true;
 	}
 
-	bool CopyENBInputToRenderProxy(int a_target)
+	bool CopyENBInputToRenderProxy(
+		Upscaling* a_upscaling,
+		ID3D11DeviceContext* a_context,
+		int a_target)
 	{
-		auto* upscaling = Upscaling::GetSingleton();
-		auto* rendererData = RE::BSGraphics::GetRendererData();
-		if (!upscaling || !rendererData || a_target < 0 ||
-			a_target >= static_cast<int>(std::size(upscaling->proxyRenderTargets))) {
+		if (!a_upscaling || !a_context || a_target < 0 ||
+			a_target >= static_cast<int>(std::size(a_upscaling->proxyRenderTargets))) {
 			return false;
 		}
 
-		auto* source = reinterpret_cast<ID3D11Texture2D*>(upscaling->originalRenderTargets[a_target].texture);
-		auto* destination = reinterpret_cast<ID3D11Texture2D*>(upscaling->proxyRenderTargets[a_target].texture);
-		auto* destinationSRV = reinterpret_cast<ID3D11ShaderResourceView*>(upscaling->proxyRenderTargets[a_target].srView);
-		auto* context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
-		if (!source || !destination || !destinationSRV || !context) {
+		auto* source = reinterpret_cast<ID3D11Texture2D*>(a_upscaling->originalRenderTargets[a_target].texture);
+		auto* destination = reinterpret_cast<ID3D11Texture2D*>(a_upscaling->proxyRenderTargets[a_target].texture);
+		auto* destinationSRV = reinterpret_cast<ID3D11ShaderResourceView*>(a_upscaling->proxyRenderTargets[a_target].srView);
+		if (!source || !destination || !destinationSRV) {
 			return false;
 		}
 
@@ -1584,8 +1989,114 @@ float4 PSMain(VSOut input) : SV_Target
 			destinationDesc.Height,
 			1
 		};
-		context->CopySubresourceRegion(destination, 0, 0, 0, 0, source, 0, &sourceBox);
+		a_context->CopySubresourceRegion(destination, 0, 0, 0, 0, source, 0, &sourceBox);
 		return true;
+	}
+
+	bool CopyENBInputToRenderProxy(int a_target)
+	{
+		auto* rendererData = RE::BSGraphics::GetRendererData();
+		return rendererData && CopyENBInputToRenderProxy(
+			Upscaling::GetSingleton(),
+			reinterpret_cast<ID3D11DeviceContext*>(rendererData->context),
+			a_target);
+	}
+
+	void CopyENBInputsToRenderProxies(std::initializer_list<int> a_targets)
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		auto* rendererData = RE::BSGraphics::GetRendererData();
+		auto* context = rendererData ?
+			reinterpret_cast<ID3D11DeviceContext*>(rendererData->context) : nullptr;
+		if (!upscaling || !context) {
+			return;
+		}
+
+		ID3D11DeviceContext* copyContext = context;
+		for (const auto target : a_targets) {
+			if (target < 0 || target >= static_cast<int>(std::size(upscaling->originalRenderTargets))) {
+				continue;
+			}
+			auto* const source = reinterpret_cast<ID3D11Texture2D*>(
+				upscaling->originalRenderTargets[target].texture);
+			if (!source) {
+				continue;
+			}
+			if (EnsureENBNativeD3D11Context(source) && CanBypassENBD3D11Context(context)) {
+				copyContext = g_enbNativeContext.get();
+			}
+			break;
+		}
+
+		for (const auto target : a_targets) {
+			CopyENBInputToRenderProxy(upscaling, copyContext, target);
+		}
+		// Match the observable end state of the removed ResetRenderTargets call.
+		for (const auto target : renderTargetsPatch) {
+			// OverrideRenderTarget/ResetRenderTarget both leave late-created or
+			// unavailable targets untouched when either side of the proxy pair is
+			// missing. Do not overwrite those live engine entries with an old null
+			// snapshot.
+			if (!upscaling->originalRenderTargets[target].texture ||
+				!upscaling->proxyRenderTargets[target].texture) {
+				continue;
+			}
+			rendererData->renderTargets[target] = upscaling->originalRenderTargets[target];
+		}
+
+		ID3D11ShaderResourceView* boundSRVs[16]{};
+		context->PSGetShaderResources(0, static_cast<UINT>(std::size(boundSRVs)), boundSRVs);
+		for (UINT slot = 0; slot < std::size(boundSRVs); ++slot) {
+			auto* const bound = boundSRVs[slot];
+			if (!bound) {
+				continue;
+			}
+			for (const auto target : renderTargetsPatch) {
+				auto* const proxy = reinterpret_cast<ID3D11ShaderResourceView*>(
+					upscaling->proxyRenderTargets[target].srView);
+				auto* const original = reinterpret_cast<ID3D11ShaderResourceView*>(
+					upscaling->originalRenderTargets[target].srView);
+				if (bound == proxy && original) {
+					context->PSSetShaderResources(slot, 1, &original);
+					break;
+				}
+			}
+			bound->Release();
+		}
+
+		ID3D11RenderTargetView* boundRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+		ID3D11DepthStencilView* boundDSV = nullptr;
+		context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, boundRTVs, &boundDSV);
+		ID3D11RenderTargetView* restoredRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+		bool restoreOM = false;
+		for (UINT slot = 0; slot < std::size(boundRTVs); ++slot) {
+			restoredRTVs[slot] = boundRTVs[slot];
+			if (!boundRTVs[slot]) {
+				continue;
+			}
+			for (const auto target : renderTargetsPatch) {
+				auto* const proxy = reinterpret_cast<ID3D11RenderTargetView*>(
+					upscaling->proxyRenderTargets[target].rtView);
+				auto* const original = reinterpret_cast<ID3D11RenderTargetView*>(
+					upscaling->originalRenderTargets[target].rtView);
+				if (boundRTVs[slot] == proxy && original) {
+					restoredRTVs[slot] = original;
+					restoreOM = true;
+					break;
+				}
+			}
+		}
+		if (restoreOM) {
+			context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, restoredRTVs, boundDSV);
+		}
+		for (auto* rtv : boundRTVs) {
+			if (rtv) {
+				rtv->Release();
+			}
+		}
+		if (boundDSV) {
+			boundDSV->Release();
+		}
 	}
 
 
@@ -2025,34 +2536,19 @@ float4 PSMain(VSOut input) : SV_Target
 
 		auto* textureOriginal = GetENBPrepassTexture(0x00);
 		auto* textureOriginalRTV = GetENBPrepassRTV(0x00);
-		auto* textureColorA = GetENBPrepassTexture(0x18);
-		auto* textureColorARTV = GetENBPrepassRTV(0x18);
-		auto* textureColorB = GetENBPrepassTexture(0x30);
-		auto* textureColorBRTV = GetENBPrepassRTV(0x30);
-		if (!textureOriginal || !textureOriginalRTV ||
-			!textureColorA || !textureColorARTV ||
-			!textureColorB || !textureColorBRTV) {
+		if (!textureOriginal || !textureOriginalRTV) {
 			return false;
 		}
 
+		// ENB 0.496 and 0.502 bind TextureOriginal for the first prepass technique,
+		// writes the result to one TextureColor surface, then ping-pongs A/B.
+		// Neither color surface is read before ENB overwrites it.
 		return ScaleCopyRenderTarget(
-				a_device,
-				a_context,
-				a_nativeScene,
-				textureOriginalRTV,
-				textureOriginal) &&
-			ScaleCopyRenderTarget(
-				a_device,
-				a_context,
-				a_nativeScene,
-				textureColorARTV,
-				textureColorA) &&
-			ScaleCopyRenderTarget(
-				a_device,
-				a_context,
-				a_nativeScene,
-				textureColorBRTV,
-				textureColorB);
+			a_device,
+			a_context,
+			a_nativeScene,
+			textureOriginalRTV,
+			textureOriginal);
 	}
 
 	bool PrepareENBSuperResolutionInput(
@@ -2064,7 +2560,7 @@ float4 PSMain(VSOut input) : SV_Target
 		uint32_t a_renderHeight)
 	{
 		if (!a_device || !a_context || !a_nativeSource || !a_upscalingInput ||
-			!a_upscalingInput->resource || !a_upscalingInput->uav ||
+			!a_upscalingInput->resource || !a_upscalingInput->uav || !a_upscalingInput->rtv ||
 			a_renderWidth == 0 || a_renderHeight == 0) {
 			return false;
 		}
@@ -2075,60 +2571,26 @@ float4 PSMain(VSOut input) : SV_Target
 			return false;
 		}
 
-		D3D11_TEXTURE2D_DESC renderRectDesc{};
-		renderRectDesc.Width = a_renderWidth;
-		renderRectDesc.Height = a_renderHeight;
-		renderRectDesc.MipLevels = 1;
-		renderRectDesc.ArraySize = 1;
-		renderRectDesc.Format = inputDesc.Format;
-		renderRectDesc.SampleDesc.Count = 1;
-		renderRectDesc.Usage = D3D11_USAGE_DEFAULT;
-		renderRectDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-
-		bool recreateRenderRect = !g_enbSRInputRenderRect || !g_enbSRInputRenderRectRTV;
-		if (!recreateRenderRect) {
-			D3D11_TEXTURE2D_DESC currentDesc{};
-			g_enbSRInputRenderRect->GetDesc(&currentDesc);
-			recreateRenderRect =
-				currentDesc.Width != renderRectDesc.Width ||
-				currentDesc.Height != renderRectDesc.Height ||
-				currentDesc.Format != renderRectDesc.Format ||
-				currentDesc.SampleDesc.Count != renderRectDesc.SampleDesc.Count;
-		}
-
-		if (recreateRenderRect) {
-			g_enbSRInputRenderRectRTV = nullptr;
-			g_enbSRInputRenderRect = nullptr;
-			if (FAILED(a_device->CreateTexture2D(&renderRectDesc, nullptr, g_enbSRInputRenderRect.put())) ||
-				FAILED(a_device->CreateRenderTargetView(g_enbSRInputRenderRect.get(), nullptr, g_enbSRInputRenderRectRTV.put()))) {
-				g_enbSRInputRenderRectRTV = nullptr;
-				g_enbSRInputRenderRect = nullptr;
-				return false;
-			}
-		}
-
-		if (!ScaleCopyRenderTarget(
-				a_device,
-				a_context,
-				a_nativeSource,
-				g_enbSRInputRenderRectRTV.get(),
-				g_enbSRInputRenderRect.get())) {
-			return false;
+		auto* workDevice = a_device;
+		auto* workContext = a_context;
+		// Upscale() has already unbound OM outputs. Keep this helper draw invisible
+		// to ENB and restore the real context before the engine resumes.
+		if (EnsureENBNativeD3D11Context(a_upscalingInput->resource.get()) &&
+			CanBypassENBD3D11Context(a_context)) {
+			workDevice = g_enbNativeDevice.get();
+			workContext = g_enbNativeContext.get();
 		}
 
 		const float clearColor[4]{};
-		a_context->ClearUnorderedAccessViewFloat(a_upscalingInput->uav.get(), clearColor);
-		const D3D11_BOX sourceBox{ 0, 0, 0, a_renderWidth, a_renderHeight, 1 };
-		a_context->CopySubresourceRegion(
+		workContext->ClearUnorderedAccessViewFloat(a_upscalingInput->uav.get(), clearColor);
+		return ScaleCopyRenderTarget(
+			workDevice,
+			workContext,
+			a_nativeSource,
+			a_upscalingInput->rtv.get(),
 			a_upscalingInput->resource.get(),
-			0,
-			0,
-			0,
-			0,
-			g_enbSRInputRenderRect.get(),
-			0,
-			&sourceBox);
-		return true;
+			a_renderWidth,
+			a_renderHeight);
 	}
 
 	bool PrepareENBNativeDepth(
@@ -2183,62 +2645,165 @@ float4 PSMain(VSOut input) : SV_Target
 			g_enbNativeDepth.get());
 	}
 
-	bool ScaleCopyProxyRenderTargetToOriginal(ID3D11Device* a_device, ID3D11DeviceContext* a_context, int a_sourceTarget, int a_destinationTarget)
-	{
-		auto upscaling = Upscaling::GetSingleton();
-		if (a_sourceTarget < 0 || a_destinationTarget < 0 ||
-			a_sourceTarget >= static_cast<int>(std::size(upscaling->proxyRenderTargets)) ||
-			a_destinationTarget >= static_cast<int>(std::size(upscaling->originalRenderTargets))) {
-			return false;
-		}
-
-		return ScaleCopyRenderTarget(
-			a_device,
-			a_context,
-			reinterpret_cast<ID3D11ShaderResourceView*>(upscaling->proxyRenderTargets[a_sourceTarget].srView),
-			reinterpret_cast<ID3D11RenderTargetView*>(upscaling->originalRenderTargets[a_destinationTarget].rtView),
-			reinterpret_cast<ID3D11Texture2D*>(upscaling->originalRenderTargets[a_destinationTarget].texture));
-	}
-
 	void ScaleProxyTargetsToOriginalNative(std::initializer_list<int> a_targets)
 	{
 		static auto rendererData = RE::BSGraphics::GetRendererData();
 		auto* context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
-		if (!context) {
+		auto* upscaling = Upscaling::GetSingleton();
+		if (!context || !upscaling) {
 			return;
 		}
 
-		auto* device = reinterpret_cast<ID3D11Device*>(rendererData->device);
-		ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-		ID3D11DepthStencilView* savedDSV = nullptr;
-		context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, &savedDSV);
-
-		ID3D11ShaderResourceView* savedSRVs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
-		context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, savedSRVs);
-
-		ID3D11ShaderResourceView* nullSRVs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
-		context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, nullSRVs);
-		context->OMSetRenderTargets(0, nullptr, nullptr);
-
+		auto* wrappedDevice = reinterpret_cast<ID3D11Device*>(rendererData->device);
+		std::array<ENBScaleCopyJob, std::size(renderTargetsPatch)> jobs{};
+		std::size_t jobCount = 0;
 		for (const auto targetIndex : a_targets) {
-			ScaleCopyProxyRenderTargetToOriginal(device, context, targetIndex, targetIndex);
+			if (jobCount >= jobs.size()) {
+				break;
+			}
+			if (targetIndex < 0 ||
+				targetIndex >= static_cast<int>(std::size(upscaling->proxyRenderTargets))) {
+				continue;
+			}
+
+			auto* sourceTexture = reinterpret_cast<ID3D11Texture2D*>(
+				upscaling->proxyRenderTargets[targetIndex].texture);
+			auto* sourceSRV = reinterpret_cast<ID3D11ShaderResourceView*>(
+				upscaling->proxyRenderTargets[targetIndex].srView);
+			auto* destinationTexture = reinterpret_cast<ID3D11Texture2D*>(
+				upscaling->originalRenderTargets[targetIndex].texture);
+			auto* destinationRTV = reinterpret_cast<ID3D11RenderTargetView*>(
+				upscaling->originalRenderTargets[targetIndex].rtView);
+			if (!sourceTexture || !sourceSRV || !destinationTexture || !destinationRTV) {
+				continue;
+			}
+
+			ENBScaleCopyJob job{
+				sourceTexture,
+				sourceSRV,
+				destinationRTV,
+				destinationTexture
+			};
+			destinationTexture->GetDesc(&job.destinationDesc);
+			D3D11_SHADER_RESOURCE_VIEW_DESC sourceViewDesc{};
+			D3D11_RENDER_TARGET_VIEW_DESC destinationViewDesc{};
+			sourceSRV->GetDesc(&sourceViewDesc);
+			destinationRTV->GetDesc(&destinationViewDesc);
+			job.sourceViewFormat = sourceViewDesc.Format;
+			job.destinationViewFormat = destinationViewDesc.Format;
+			jobs[jobCount++] = job;
 		}
 
-		context->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, savedSRVs);
-		context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, savedRTVs, savedDSV);
+		const bool hasNativeContext = jobCount > 0 &&
+			EnsureENBNativeD3D11Context(jobs[0].destinationTexture);
+		const auto drawWrappedIndividually = [&]() {
+			for (std::size_t i = 0; i < jobCount; ++i) {
+				ScaleCopyRenderTarget(
+					wrappedDevice,
+					context,
+					jobs[i].sourceSRV,
+					jobs[i].destinationRTV,
+					jobs[i].destinationTexture);
+			}
+		};
 
-		for (auto* srv : savedSRVs) {
-			if (srv) {
-				srv->Release();
+		// Keep the two outer calls visible to ENB: its context wrapper uses
+		// the initial OM unbind as the deferred-composite handoff and reconstructs
+		// its tracked state from the final restore. Native resources return the real
+		// device/context, so the independent helper draws can be batched without ENB
+		// mistaking their MRTs for engine passes. If that unwrap is unavailable, use
+		// the original one-target helper sequence through the wrapper.
+		ScopedENBProxyPromotionBoundary promotionBoundary(context);
+		if (!promotionBoundary.IsActive()) {
+			return;
+		}
+		if (!hasNativeContext || !CanBypassENBD3D11Context(context)) {
+			drawWrappedIndividually();
+			return;
+		}
+
+		ScopedENBScaleCopyState state(g_enbNativeDevice.get(), g_enbNativeContext.get());
+		if (!state.IsActive()) {
+			drawWrappedIndividually();
+			return;
+		}
+
+		std::array<ID3D11UnorderedAccessView*, D3D11_PS_CS_UAV_REGISTER_COUNT> boundOMUAVs{};
+		g_enbNativeContext->OMGetRenderTargetsAndUnorderedAccessViews(
+			0,
+			nullptr,
+			nullptr,
+			0,
+			static_cast<UINT>(boundOMUAVs.size()),
+			boundOMUAVs.data());
+		const bool hasBoundOMUAV = std::ranges::any_of(boundOMUAVs, [](const auto* a_view) {
+			return a_view != nullptr;
+		});
+		for (auto* view : boundOMUAVs) {
+			if (view) {
+				view->Release();
 			}
 		}
-		for (auto* rtv : savedRTVs) {
-			if (rtv) {
-				rtv->Release();
+
+		// All proxy sources and native destinations are distinct in the normal
+		// renderer allocation. Verify both read/write aliasing and unique outputs
+		// before reordering independent promotions into equal-size MRT batches.
+		bool independent = !hasBoundOMUAV;
+		for (std::size_t i = 0; independent && i < jobCount; ++i) {
+			for (std::size_t j = 0; j < jobCount; ++j) {
+				if (jobs[i].sourceTexture == jobs[j].destinationTexture ||
+					(i != j && jobs[i].destinationTexture == jobs[j].destinationTexture)) {
+					independent = false;
+					break;
+				}
 			}
 		}
-		if (savedDSV) {
-			savedDSV->Release();
+		if (!independent) {
+			for (std::size_t i = 0; i < jobCount; ++i) {
+				state.Draw(jobs[i].sourceSRV, jobs[i].destinationRTV, jobs[i].destinationTexture);
+			}
+			return;
+		}
+
+		std::array<bool, std::size(renderTargetsPatch)> promoted{};
+		for (std::size_t i = 0; i < jobCount; ++i) {
+			if (promoted[i]) {
+				continue;
+			}
+
+			std::array<const ENBScaleCopyJob*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> batch{};
+			std::array<std::size_t, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> batchIndices{};
+			std::size_t batchSize = 0;
+			for (std::size_t j = i;
+				j < jobCount && batchSize < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
+				++j) {
+				if (promoted[j] ||
+					jobs[j].destinationDesc.Width != jobs[i].destinationDesc.Width ||
+					jobs[j].destinationDesc.Height != jobs[i].destinationDesc.Height ||
+					jobs[j].destinationDesc.SampleDesc.Count != jobs[i].destinationDesc.SampleDesc.Count ||
+					jobs[j].destinationDesc.SampleDesc.Quality != jobs[i].destinationDesc.SampleDesc.Quality ||
+					jobs[j].sourceViewFormat != jobs[i].sourceViewFormat ||
+					jobs[j].destinationViewFormat != jobs[i].destinationViewFormat) {
+					continue;
+				}
+				batch[batchSize] = &jobs[j];
+				batchIndices[batchSize] = j;
+				++batchSize;
+			}
+
+			bool completed = false;
+			if (batchSize > 1) {
+				completed = state.DrawMRT(batch.data(), batchSize);
+			}
+			if (!completed) {
+				for (std::size_t j = 0; j < batchSize; ++j) {
+					const auto& job = *batch[j];
+					state.Draw(job.sourceSRV, job.destinationRTV, job.destinationTexture);
+				}
+			}
+			for (std::size_t j = 0; j < batchSize; ++j) {
+				promoted[batchIndices[j]] = true;
+			}
 		}
 	}
 
@@ -2379,7 +2944,8 @@ float4 PSMain(VSOut input) : SV_Target
 		D3D11_TEXTURE2D_DESC a_desc,
 		std::unique_ptr<Texture2D>& a_texture,
 		bool a_createSRV,
-		bool a_createUAV)
+		bool a_createUAV,
+		bool a_createRTV = false)
 	{
 		a_desc.Usage = D3D11_USAGE_DEFAULT;
 		a_desc.CPUAccessFlags = 0;
@@ -2402,6 +2968,14 @@ float4 PSMain(VSOut input) : SV_Target
 			uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
 			uavDesc.Texture2D.MipSlice = 0;
 			a_texture->CreateUAV(uavDesc);
+		}
+
+		if (a_createRTV && !a_texture->rtv) {
+			D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+			rtvDesc.Format = a_desc.Format;
+			rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+			rtvDesc.Texture2D.MipSlice = 0;
+			a_texture->CreateRTV(rtvDesc);
 		}
 	}
 
@@ -2480,6 +3054,8 @@ float4 PSMain(VSOut input) : SV_Target
 	}
 }
 
+void RestoreDynamicResolutionViewportDefaultFlag(RE::BSGraphics::RenderTargetManager* a_renderTargetManager);
+
 /** @brief Hook to fix outline thickness in VATs shader*/
 struct ImageSpaceEffectVatsTarget_UpdateParams_SetPixelConstant
 {
@@ -2543,14 +3119,12 @@ struct DrawWorld_Imagespace_RenderEffectRange
 					static_cast<uint32_t>(gameViewport->screenWidth),
 					static_cast<uint32_t>(gameViewport->screenHeight));
 
-				// Promote only after the deferred/ENB composites are complete. The
-				// render-sized proxies provide the valid source rectangle; P29 remains
-				// render-sized because motion-vector dilation consumes it directly.
-				// P4's feature pass writes the original native allocation, so refresh
-				// its stale proxy with an exact 1:1 render-rectangle copy first.
-				CopyENBInputToRenderProxy(4);
-				upscaling->OverrideRenderTargets(kENBSpatialBridgeTargets);
-				upscaling->ResetRenderTargets({}, false);
+				// Promote only after the deferred/ENB composites are complete. Copy the
+				// current render rectangles directly: the former override/reset pair did
+				// no rendering between its swaps, so every other state change cancelled.
+				// P29 remains render-sized because motion-vector dilation consumes it.
+				CopyENBInputsToRenderProxies(kENBSpatialBridgeTargets);
+				RestoreDynamicResolutionViewportDefaultFlag(renderTargetManager);
 				ScaleProxyTargetsToOriginalNative(kENBSpatialBridgeTargets);
 				if (nativeDepthReady) {
 					rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth =
@@ -2561,7 +3135,8 @@ struct DrawWorld_Imagespace_RenderEffectRange
 				ApplyFullFrameViewport();
 
 				const bool shouldPrimeENBPrepass =
-					TryGetENBBool("EFFECT", "EnablePrepass").value_or(false);
+					g_enbTextureOriginalSRVAddress != 0 &&
+					TryGetENBBool(ENBBoolSetting::kPrepass).value_or(false);
 				if (shouldPrimeENBPrepass) {
 					auto* nativeScene = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->renderTargets[4].srView);
 					PrimeENBPrepassNativeColor(device, context, nativeScene);
@@ -2717,6 +3292,14 @@ struct DrawWorld_Imagespace_SetUseDynamicResolutionViewportAsDefaultViewport
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
+
+void RestoreDynamicResolutionViewportDefaultFlag(RE::BSGraphics::RenderTargetManager* a_renderTargetManager)
+{
+	// The removed override/reset pair ended by restoring this single engine byte.
+	DrawWorld_Imagespace_SetUseDynamicResolutionViewportAsDefaultViewport::func(
+		a_renderTargetManager,
+		true);
+}
 
 struct BSImagespaceShader_Render_ENBFinalComposite
 {
@@ -3430,10 +4013,10 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 
 	frameBufferResource->Release();
 
-	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;
 
 	// Intermediate upscaling texture (stores DLSS/FSR output)
-	EnsureTexture2D(texDesc, upscalingTexture, true, true);
+	EnsureTexture2D(texDesc, upscalingTexture, true, true, true);
 
 	// Do not need to replace render targets at native resolution
 	if (a_currentWidthRatio == 1.0f && a_currentHeightRatio == 1.0f)
