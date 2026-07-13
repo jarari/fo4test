@@ -100,6 +100,12 @@ namespace
 	using D3D11Draw_t = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 	ENBScreenEffectRender_t g_enbDetailedShadowRender = nullptr;
 	bool g_enbDetailedShadowUsesFirstPersonModelPath = false;
+	struct ENBDetailedShadowBufferLayout
+	{
+		std::size_t cpuDataOffset;
+		std::size_t gpuBufferOffset;
+	};
+	std::optional<ENBDetailedShadowBufferLayout> g_enbDetailedShadowBufferLayout;
 	ENBScreenEffectRender_t g_enbDepthOfFieldRender = nullptr;
 	REL::Trampoline g_enbDeferMixTrampoline{ "ENB DeferMix"sv };
 	bool g_enbDeferMixInstalled = false;
@@ -1749,6 +1755,60 @@ PSOut8 PSMainMRT8(VSOut input)
 		return 0;
 	}
 
+	std::optional<ENBDetailedShadowBufferLayout> FindENBDetailedShadowBufferLayout(
+		const ENBCodeRange& a_code,
+		std::uintptr_t a_detailedShadowEntry)
+	{
+		const auto codeBegin = reinterpret_cast<std::uintptr_t>(a_code.begin);
+		const auto codeEnd = codeBegin + a_code.size;
+		if (a_detailedShadowEntry < codeBegin || a_detailedShadowEntry >= codeEnd) {
+			return std::nullopt;
+		}
+
+		// DetailedShadow builds Matrix03 from the projection constant list at
+		// a_this+0x98. The list's CPU mirror moved from +0x28 in 0.420 to +0x30
+		// in 0.496. Match the stable two-load chain instead of a version number:
+		//   mov reg,[nonvolatile+98h]; test reg,reg; jz ...; mov reg,[reg+28h/30h]
+		const auto* scanBegin = reinterpret_cast<const std::uint8_t*>(a_detailedShadowEntry);
+		const auto* scanEnd = reinterpret_cast<const std::uint8_t*>(
+			std::min(codeEnd, a_detailedShadowEntry + 0x1000));
+		for (auto cursor = scanBegin; cursor + 16 <= scanEnd; ++cursor) {
+			if ((cursor[0] & 0xF8) != 0x48 || cursor[1] != 0x8B ||
+				(cursor[2] & 0xC0) != 0x80 || (cursor[2] & 7) == 4) {
+				continue;
+			}
+
+			std::uint32_t displacement = 0;
+			std::memcpy(&displacement, cursor + 3, sizeof(displacement));
+			if (displacement != 0x98) {
+				continue;
+			}
+
+			const auto loadedRegister = static_cast<std::uint8_t>(
+				((cursor[0] & 0x04) ? 8 : 0) | ((cursor[2] >> 3) & 7));
+			const auto* chainEnd = std::min(scanEnd, cursor + 24);
+			for (auto load = cursor + 7; load + 4 <= chainEnd; ++load) {
+				if ((load[0] & 0xF8) != 0x48 || load[1] != 0x8B ||
+					(load[2] & 0xC0) != 0x40 || (load[2] & 7) == 4) {
+					continue;
+				}
+
+				const auto destination = static_cast<std::uint8_t>(
+					((load[0] & 0x04) ? 8 : 0) | ((load[2] >> 3) & 7));
+				const auto source = static_cast<std::uint8_t>(
+					((load[0] & 0x01) ? 8 : 0) | (load[2] & 7));
+				const auto cpuDataOffset = static_cast<std::size_t>(load[3]);
+				if (destination == loadedRegister && source == loadedRegister &&
+					(cpuDataOffset == 0x28 || cpuDataOffset == 0x30)) {
+					return ENBDetailedShadowBufferLayout{
+						cpuDataOffset, cpuDataOffset + 0x10
+					};
+				}
+			}
+		}
+		return std::nullopt;
+	}
+
 	std::uintptr_t FindENBDepthOfFieldRenderEntry(
 		const ENBCodeRange& a_code,
 		std::uintptr_t a_depthOfFieldSetting)
@@ -2108,7 +2168,7 @@ PSOut8 PSMainMRT8(VSOut input)
 		{
 			const float ratioX = originalDynamicWidthRatio;
 			const float ratioY = originalDynamicHeightRatio;
-			if (!a_this || !ShouldUseENBProxyCompatibility() ||
+			if (!a_this || !g_enbDetailedShadowBufferLayout || !ShouldUseENBProxyCompatibility() ||
 				!std::isfinite(ratioX) || !std::isfinite(ratioY) ||
 				ratioX <= 0.0f || ratioY <= 0.0f ||
 				(ratioX == 1.0f && ratioY == 1.0f)) {
@@ -2126,7 +2186,9 @@ PSOut8 PSMainMRT8(VSOut input)
 			if (!bufferState) {
 				return;
 			}
-			auto** cpuDataSlot = reinterpret_cast<std::byte**>(bufferState + 48);
+			const auto layout = *g_enbDetailedShadowBufferLayout;
+			auto** cpuDataSlot = reinterpret_cast<std::byte**>(
+				bufferState + layout.cpuDataOffset);
 			if (!IsWritableProcessAddress(cpuDataSlot) || !*cpuDataSlot) {
 				return;
 			}
@@ -2144,7 +2206,7 @@ PSOut8 PSMainMRT8(VSOut input)
 			float nativeToRenderY = 1.0f / ratioY;
 			const auto frameBufferState = fields[9];
 			auto** frameCpuDataSlot = frameBufferState ?
-				reinterpret_cast<std::byte**>(frameBufferState + 48) : nullptr;
+				reinterpret_cast<std::byte**>(frameBufferState + layout.cpuDataOffset) : nullptr;
 			if (frameCpuDataSlot && IsWritableProcessAddress(frameCpuDataSlot) && *frameCpuDataSlot &&
 				IsWritableProcessAddress(*frameCpuDataSlot + sizeof(float)) &&
 				g_enbFullWidth && g_enbFullHeight && *g_enbFullWidth > 0 && *g_enbFullHeight > 0) {
@@ -2163,7 +2225,8 @@ PSOut8 PSMainMRT8(VSOut input)
 
 			const void* gpuUploadData = nullptr;
 			if (g_enbDetailedShadowUsesFirstPersonModelPath) {
-				auto** gpuBufferSlot = reinterpret_cast<ID3D11Buffer**>(bufferState + 64);
+				auto** gpuBufferSlot = reinterpret_cast<ID3D11Buffer**>(
+					bufferState + layout.gpuBufferOffset);
 				auto** contextSlot = reinterpret_cast<ID3D11DeviceContext**>(
 					reinterpret_cast<std::byte*>(a_this) + 0x6C20);
 				if (!IsWritableProcessAddress(gpuBufferSlot) || !*gpuBufferSlot ||
@@ -2354,18 +2417,29 @@ PSOut8 PSMainMRT8(VSOut input)
 			if (!detailedShadowEntry) {
 				logger::warn("[ENB SR] Cannot resolve the DetailedShadow renderer");
 			} else {
-				const auto trampoline = Detours::X64::DetourFunction(
-					detailedShadowEntry,
-					reinterpret_cast<std::uintptr_t>(&ENBDetailedShadowRenderThunk));
-				if (trampoline) {
-					// 0.501 introduced this setting together with the Parameters03 DShadow
-					// branch whose GPU inverse projection has the asymmetric X coordinate.
-					// Use the feature marker instead of assuming a contiguous version range.
-					g_enbDetailedShadowUsesFirstPersonModelPath = ENBModuleContainsString(
-						module, "DetailedShadowFirstPersonModels");
-					g_enbDetailedShadowRender = reinterpret_cast<ENBScreenEffectRender_t>(trampoline);
+				const auto bufferLayout =
+					FindENBDetailedShadowBufferLayout(*code, detailedShadowEntry);
+				if (!bufferLayout) {
+					logger::warn("[ENB SR] Cannot resolve the DetailedShadow constant-list layout");
 				} else {
-					logger::warn("[ENB SR] Failed to install DetailedShadow projection hook");
+					const auto trampoline = Detours::X64::DetourFunction(
+						detailedShadowEntry,
+						reinterpret_cast<std::uintptr_t>(&ENBDetailedShadowRenderThunk));
+					if (trampoline) {
+						g_enbDetailedShadowBufferLayout = bufferLayout;
+						logger::info(
+							"[ENB SR] DetailedShadow constant-list layout: CPU +0x{:X}, GPU +0x{:X}",
+							bufferLayout->cpuDataOffset,
+							bufferLayout->gpuBufferOffset);
+						// 0.501 introduced this setting together with the Parameters03 DShadow
+						// branch whose GPU inverse projection has the asymmetric X coordinate.
+						// Use the feature marker instead of assuming a contiguous version range.
+						g_enbDetailedShadowUsesFirstPersonModelPath = ENBModuleContainsString(
+							module, "DetailedShadowFirstPersonModels");
+						g_enbDetailedShadowRender = reinterpret_cast<ENBScreenEffectRender_t>(trampoline);
+					} else {
+						logger::warn("[ENB SR] Failed to install DetailedShadow projection hook");
+					}
 				}
 			}
 		}
