@@ -22,14 +22,6 @@
 			"type": "text"
 		},
 		{
-			"text": "When ENBSeries is active, only DLAA is available.",
-			"type": "text"
-		},
-		{
-			"text": "",
-			"type": "text"
-		},
-		{
 			"text": "SETTINGS",
 			"type": "section"
 		},
@@ -158,6 +150,15 @@
 			"text": "Tagged textures",
 			"type": "switcher",
 			"help": "Shows the current DX12 upscaler inputs as a 2x2 debug view: original color, depth, motion vectors, and final image. (Default: Disabled)",
+			"valueOptions": {
+				"sourceType": "ModSettingInt"
+			}
+		},
+		{
+			"id": "bImageSpaceEffectLog:Settings",
+			"text": "Image-space effect log",
+			"type": "switcher",
+			"help": "Logs each unique active image-space effect dispatched inside the ENB native-resolution scope. Intended for compatibility diagnostics. (Default: Disabled)",
 			"valueOptions": {
 				"sourceType": "ModSettingInt"
 			}

@@ -72,7 +72,7 @@ namespace
 {
 	constexpr const char* kSettingsPath = "Data\\MCM\\Settings\\Upscaling.ini";
 	constexpr uint32_t kDLSSGResumeStableFrames = 2;
-	constexpr uint64_t kFeatureRetryGameFrames = 200;
+	constexpr uint64_t kFeatureRetryGameFrames = 5;
 	constexpr uint64_t kTextureMemoryUpgradeReserveBytes = 512ull * 1024ull * 1024ull;
 	constexpr std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>
 		kNullD3D11ShaderResources{};
@@ -119,6 +119,7 @@ namespace
 	thread_local void* g_enbRefractionCompositeEffect = nullptr;
 	thread_local std::array<void*, 0x20> g_enbNativeImageSpaceShaders{};
 	thread_local std::size_t g_enbNativeImageSpaceShaderCount = 0;
+	std::array<std::atomic_bool, 0x48> g_loggedENBNativeImageSpaceEffects{};
 
 	constexpr std::ptrdiff_t kImageSpaceEffectUseDynamicResolutionOffset = 0xA8;
 	constexpr std::ptrdiff_t kImageSpaceEffectListOffset = 0x18;
@@ -127,6 +128,17 @@ namespace
 	constexpr std::ptrdiff_t kServingThreadStateOffset = 0x68;
 	constexpr std::ptrdiff_t kHFPFDisableLoadingAnimationPatchOffset = 0x19D;
 	constexpr std::array<std::uint8_t, 4> kHFPFDisableLoadingAnimationPatch{ 0x0F, 0x1F, 0x40, 0x00 };
+	constexpr std::array kENBNativeImageSpaceEffectIndices{
+		2, 6, 7, 8, 9, 10, 11, 12, 13, 15, 20
+	};
+
+	bool IsENBNativeImageSpaceEffectIndex(int32_t a_effectIndex)
+	{
+		return std::binary_search(
+			kENBNativeImageSpaceEffectIndices.begin(),
+			kENBNativeImageSpaceEffectIndices.end(),
+			a_effectIndex);
+	}
 
 	class ScopedENBNativeImageSpaceParams
 	{
@@ -173,7 +185,7 @@ namespace
 	bool ShouldForceENBNativeImageSpaceParams(int32_t a_effectIndex)
 	{
 		return g_enbNativeImageSpaceParamScopeDepth > 0 &&
-			(a_effectIndex == 8 || a_effectIndex == 9 || a_effectIndex == 11 || a_effectIndex == 12 || a_effectIndex == 13 || a_effectIndex == 15);
+			IsENBNativeImageSpaceEffectIndex(a_effectIndex);
 	}
 
 	struct JobListManager_ServingThread_DisplayLoadingScreen
@@ -299,8 +311,7 @@ namespace
 			previousCount_(g_enbNativeImageSpaceShaderCount)
 		{
 			if (!a_effect || g_enbNativeImageSpaceParamScopeDepth <= 0 ||
-				(a_effectIndex != 8 && a_effectIndex != 9 && a_effectIndex != 11 && 
-					a_effectIndex != 12 && a_effectIndex != 13 && a_effectIndex != 15)) {
+				!IsENBNativeImageSpaceEffectIndex(a_effectIndex)) {
 				return;
 			}
 
@@ -356,6 +367,84 @@ namespace
 			g_enbNativeImageSpaceShaders.begin(),
 			g_enbNativeImageSpaceShaders.begin() + g_enbNativeImageSpaceShaderCount,
 			a_shader) != g_enbNativeImageSpaceShaders.begin() + g_enbNativeImageSpaceShaderCount;
+	}
+
+	std::string_view ImageSpaceEffectName(int32_t a_effectIndex)
+	{
+		switch (a_effectIndex) {
+		case 0: return "WorldCamera"sv;
+		case 1: return "TemporalAAPreHDR"sv;
+		case 2: return "Sunbeams"sv;
+		case 3: return "HDR"sv;
+		case 4: return "HDRCS"sv;
+		case 5: return "Refraction"sv;
+		case 6: return "DepthOfField"sv;
+		case 7: return "DepthOfFieldSplitScreen"sv;
+		case 8: return "RadialBlur"sv;
+		case 9: return "FullScreenBlur"sv;
+		case 10: return "MotionBlur"sv;
+		case 11: return "GetHit"sv;
+		case 12: return "VatsTarget"sv;
+		case 13: return "FullScreenColor"sv;
+		case 14: return "GammaCorrect"sv;
+		case 15: return "GammaCorrectLUT"sv;
+		case 16: return "GammaCorrectResize"sv;
+		case 17: return "FXAA"sv;
+		case 18: return "TemporalAA"sv;
+		case 19: return "TemporalOldAA"sv;
+		case 20: return "BokehDepthOfField"sv;
+		case 21: return "UpsampleDynamicResolution"sv;
+		default: return "Unknown"sv;
+		}
+	}
+
+	void ResetENBNativeImageSpaceEffectLog()
+	{
+		for (auto& logged : g_loggedENBNativeImageSpaceEffects) {
+			logged.store(false, std::memory_order_relaxed);
+		}
+	}
+
+	void LogENBNativeImageSpaceEffect(
+		void* a_effect,
+		int32_t a_effectIndex,
+		int a_targetA,
+		int a_targetB)
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		if (!a_effect || !upscaling || upscaling->settings.imageSpaceEffectLog == 0 ||
+			g_enbNativeImageSpaceParamScopeDepth <= 0 || a_effectIndex < 0 ||
+			a_effectIndex >= static_cast<int32_t>(g_loggedENBNativeImageSpaceEffects.size()) ||
+			g_loggedENBNativeImageSpaceEffects[a_effectIndex].exchange(true, std::memory_order_relaxed)) {
+			return;
+		}
+
+		const auto* bytes = reinterpret_cast<const std::byte*>(a_effect);
+		const auto vtable = *reinterpret_cast<const std::uintptr_t*>(a_effect);
+		const auto moduleBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+		const auto vtableRVA = vtable >= moduleBase ? vtable - moduleBase : 0;
+		const auto childCount = *reinterpret_cast<const std::uint16_t*>(
+			bytes + kImageSpaceEffectCountOffset);
+		const auto rawActive = *reinterpret_cast<const std::uint8_t*>(bytes + 0x08) != 0;
+		const auto isComputeShader = *reinterpret_cast<const std::uint8_t*>(bytes + 0xA0) != 0;
+		const auto outputCount = *reinterpret_cast<const std::uint32_t*>(bytes + 0xA4);
+		const auto useDynamicResolution = *reinterpret_cast<const std::uint8_t*>(
+			bytes + kImageSpaceEffectUseDynamicResolutionOffset) != 0;
+		logger::info(
+			"[ENB IS Log] index={} name={} range={} dispatchActive=true rawActive={} useDR={} compute={} outputs={} children={} targetA={} targetB={} effect={} vtable={} Fallout4RVA=0x{:X}",
+			a_effectIndex,
+			ImageSpaceEffectName(a_effectIndex),
+			a_effectIndex <= 13 ? "early" : "late",
+			rawActive,
+			useDynamicResolution,
+			isComputeShader,
+			outputCount,
+			childCount,
+			a_targetA,
+			a_targetB,
+			a_effect,
+			reinterpret_cast<const void*>(vtable),
+			vtableRVA);
 	}
 
 	class ScopedENBRefractionCompositeEffect
@@ -3591,6 +3680,7 @@ struct ImageSpaceManager_RenderEffect
 	static void thunk(void* This, void* a_effect, int a_targetA, int a_targetB, void* a_params)
 	{
 		const auto effectIndex = FindEffectIndex(This, a_effect);
+		LogENBNativeImageSpaceEffect(a_effect, effectIndex, a_targetA, a_targetB);
 		const ScopedImageSpaceEffectNativeParams forceNativeParams(a_effect, effectIndex);
 		const ScopedENBHDRFinalCompositeEffects hdrFinalCompositeEffects(a_effect, effectIndex);
 		const ScopedENBRefractionCompositeEffect refractionCompositeEffect(a_effect, effectIndex);
@@ -3807,6 +3897,7 @@ struct SamplerStates
 void Upscaling::LoadSettings()
 {
 	const auto previousUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
+	const bool previousImageSpaceEffectLog = settings.imageSpaceEffectLog != 0;
 
 	CSimpleIniA ini;
 	ini.SetUnicode();
@@ -3823,6 +3914,11 @@ void Upscaling::LoadSettings()
 	settings.dlssModelPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iDLSSModelPreset", 0), 0, 4));
 	settings.osdMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iOnScreenDisplay", 0), 0, 2));
 	settings.taggedTextureDebug = static_cast<uint>(ini.GetLongValue("Settings", "bTaggedTextureDebug", 0) == 1);
+	settings.imageSpaceEffectLog = static_cast<uint>(ini.GetLongValue("Settings", "bImageSpaceEffectLog", 0) == 1);
+	if (!previousImageSpaceEffectLog && settings.imageSpaceEffectLog != 0) {
+		ResetENBNativeImageSpaceEffectLog();
+		logger::info("[ENB IS Log] Enabled; waiting for active effects in the ENB native scope");
+	}
 	const auto legacySharpness = ini.GetDoubleValue("Settings", "fRCASSharpness", 0.2);
 	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", legacySharpness)), 0.0f, 1.0f);
 

@@ -90,6 +90,7 @@ public:
 		uint dlssModelPreset = 0;                                   ///< DLSS model preset: 0=Recommended, 1=Default, 2=K, 3=M, 4=L
 		uint osdMode = 0;                                           ///< Debug OSD: 0=Off, 1=Compact, 2=Detailed
 		uint taggedTextureDebug = 0;                                ///< Debug tagged texture view: 0=Off, 1=On
+		uint imageSpaceEffectLog = 0;                               ///< Log unique active image-space effects in the ENB native scope
 		float sharpness = 0.2f;                                       ///< Upscaler sharpness: 0.0=off, 1.0=max
 	};
 
