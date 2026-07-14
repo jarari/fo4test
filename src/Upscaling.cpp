@@ -4760,13 +4760,30 @@ struct BSImagespaceShaderLensFlare_RenderLensFlare
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
+/** @brief Hook the SSLR projection producer. */
+struct BSImagespaceShaderSSLRPrepass_SetupTechnique_BeginTechnique
+{
+	static bool thunk(RE::BSShader* This, uint a2, uint a3, uint a4, uint a5)
+	{
+		const bool result = func(This, a2, a3, a4, a5);
+		if (result) {
+			Upscaling::GetSingleton()->PatchSSRPrepassShader();
+		}
+		return result;
+	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
+
 /** @brief Hook for BSImagespaceShaderSSLRRaytracing with replaced shader */
 struct BSImagespaceShaderSSLRRaytracing_SetupTechnique_BeginTechnique
 {
-	static void thunk(RE::BSShader* This, uint a2, uint a3, uint a4, uint a5)
+	static bool thunk(RE::BSShader* This, uint a2, uint a3, uint a4, uint a5)
 	{
-		func(This, a2, a3, a4, a5);
-		Upscaling::GetSingleton()->PatchSSRShader();
+		const bool result = func(This, a2, a3, a4, a5);
+		if (result) {
+			Upscaling::GetSingleton()->PatchSSRShader();
+		}
+		return result;
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
@@ -4864,6 +4881,8 @@ void Upscaling::InstallHooks()
 	stl::detour_thunk<BSImagespaceShaderLensFlare_RenderLensFlare>(REL::ID{ 676108, 2317547 });
 
 	// Fix dynamic resolution for Screenspace Reflections
+	stl::write_thunk_call<BSImagespaceShaderSSLRPrepass_SetupTechnique_BeginTechnique>(
+		REL::ID{ 395020, 2317301 }.address() + 0x1C);
 	stl::write_thunk_call<BSImagespaceShaderSSLRRaytracing_SetupTechnique_BeginTechnique>(
 		REL::ID{ 779077, 2317302 }.address() + 0x1C);
 
@@ -6421,6 +6440,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 	return spatialFallbackUpscaleCS.get();
 }
 
+ID3D11PixelShader* Upscaling::GetBSImagespaceShaderSSLRPrepass()
+{
+	if (!BSImagespaceShaderSSLRPrepass) {
+		logger::debug("Compiling BSImagespaceShaderSSLRPrepass.hlsl");
+		BSImagespaceShaderSSLRPrepass.attach((ID3D11PixelShader*)Util::CompileShader(L"Data/F4SE/Plugins/Upscaling/BSImagespaceShaderSSLRPrepass.hlsl", {}, "ps_5_0"));
+	}
+	return BSImagespaceShaderSSLRPrepass.get();
+}
+
 ID3D11PixelShader* Upscaling::GetBSImagespaceShaderSSLRRaytracing()
 {
 	if (!BSImagespaceShaderSSLRRaytracing) {
@@ -7973,10 +8001,49 @@ void Upscaling::DestroyUpscalingResources()
 	}
 }
 
+void Upscaling::PatchSSRPrepassShader()
+{
+	static auto rendererData = RE::BSGraphics::GetRendererData();
+	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+	const float widthScale = renderTargetManager->dynamicWidthRatio;
+	const float heightScale = renderTargetManager->dynamicHeightRatio;
+	if (widthScale == 1.0f && heightScale == 1.0f) {
+		return;
+	}
+
+	struct alignas(16) SSLRProjectionCB
+	{
+		float2 uvScale;
+		float2 inverseUVScale;
+	};
+	static_assert(sizeof(SSLRProjectionCB) == 16);
+
+	static std::unique_ptr<ConstantBuffer> projectionCB;
+	if (!projectionCB) {
+		projectionCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<SSLRProjectionCB>(true));
+	}
+
+	const SSLRProjectionCB data{
+		{ widthScale, heightScale },
+		{ 1.0f / std::max(widthScale, std::numeric_limits<float>::epsilon()),
+			1.0f / std::max(heightScale, std::numeric_limits<float>::epsilon()) }
+	};
+	projectionCB->Update(data);
+
+	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+	auto buffer = projectionCB->CB();
+	context->PSSetConstantBuffers(13, 1, &buffer);
+	context->PSSetShader(GetBSImagespaceShaderSSLRPrepass(), nullptr, 0);
+}
+
 void Upscaling::PatchSSRShader()
 {
 	static auto rendererData = RE::BSGraphics::GetRendererData();
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+
+	// Restore the otherwise-unused slot after the immediately preceding prepass.
+	ID3D11Buffer* nullBuffer = nullptr;
+	context->PSSetConstantBuffers(13, 1, &nullBuffer);
 
 	// Replace the game's SSR pixel shader with our custom one that fixes scaled render targets
 	context->PSSetShader(GetBSImagespaceShaderSSLRRaytracing(), nullptr, 0);
