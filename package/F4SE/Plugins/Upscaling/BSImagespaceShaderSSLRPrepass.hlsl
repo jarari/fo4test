@@ -113,8 +113,9 @@ void main(
   r2.xyz = r2.yyy ? float3(1,1,1) : r2.xzw;
   r2.xyz = r2.xyz * float3(0.5,-0.5,1) + float3(0.5,0.5,0);
 
-  // Re-enter allocation UV space before generating the ray equation consumed
-  // by the raytracing pass.
+  // Projection matrices use logical UV, but the hierarchical ray marcher and
+  // its depth-mip cell coordinates operate in allocation UV. Convert the
+  // projected endpoint back before generating the shared ray equation.
   r2.xy = r2.xy * cb13[0].xy;
   r2.xyz = r2.xyz + -float3(v1.xy, r0.z);
   r0.xy = r2.xy / r2.zz;

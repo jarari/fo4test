@@ -8,9 +8,14 @@
 #include <cstdint>
 #include <cstring>
 #include <d3dcompiler.h>
+#include <filesystem>
+#include <fstream>
+#include <intrin.h>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <SimpleIni.h>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -100,6 +105,10 @@ namespace
 	std::uint32_t* g_enbFullHeight = nullptr;
 	using ENBScreenEffectRender_t = int (*)(void*, std::uint32_t, std::uint32_t, std::uint32_t);
 	using D3D11Draw_t = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
+	using D3D11DrawIndexed_t = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
+	using D3D11DrawIndexedInstanced_t = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+	using D3D11PSSetShaderResources_t = void (STDMETHODCALLTYPE*)(
+		ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
 	ENBScreenEffectRender_t g_enbDetailedShadowRender = nullptr;
 	bool g_enbDetailedShadowUsesFirstPersonModelPath = false;
 	struct ENBDetailedShadowBufferLayout
@@ -110,7 +119,10 @@ namespace
 	std::optional<ENBDetailedShadowBufferLayout> g_enbDetailedShadowBufferLayout;
 	ENBScreenEffectRender_t g_enbDepthOfFieldRender = nullptr;
 	ENBScreenEffectRender_t g_enbReflectionRender = nullptr;
+	ENBScreenEffectRender_t g_enbPuddleWaterRender = nullptr;
 	std::optional<std::size_t> g_enbReflectionConstantBufferOffset;
+	std::optional<std::size_t> g_enbPuddleWaterConstantBufferOffset;
+	std::optional<std::size_t> g_enbPuddleWaterTexture11Offset;
 	struct ENBConstantBufferPatchResources
 	{
 		winrt::com_ptr<ID3D11Device> device;
@@ -119,15 +131,61 @@ namespace
 		UINT byteWidth{ 0 };
 	};
 	ENBConstantBufferPatchResources g_enbReflectionConstantBufferPatch;
+	ENBConstantBufferPatchResources g_enbPuddleWaterConstantBufferPatch;
 	constexpr std::size_t kENBDeferMixTrampolineSize = 64;
 	REL::Trampoline g_enbDeferMixTrampoline{ "ENB DeferMix"sv };
 	bool g_enbDeferMixInstalled = false;
+	constexpr std::uint32_t kReflectionCaptureVanillaSSLR = 1u << 0;
+	constexpr std::uint32_t kReflectionCaptureENBPuddle = 1u << 1;
+	constexpr std::uint32_t kReflectionCaptureENBReflection = 1u << 2;
+	// Armed after Shader_418BF7EB writes its material MRTs.  This must remain a
+	// separate bit from the material capture: the final puddle reflection is
+	// produced by a later pass, not by Shader_418BF7EB itself.
+	constexpr std::uint32_t kReflectionCaptureENBPuddleConsumer = 1u << 3;
+	std::atomic_uint32_t g_reflectionCapturePending{ 0 };
+	std::atomic_uint32_t g_reflectionCaptureSerial{ 0 };
+	std::atomic_uint32_t g_activeReflectionCaptureSerial{ 0 };
+	constexpr std::size_t kD3D11PSSetShaderResourcesVTableIndex = 8;
+	constexpr std::size_t kD3D11DrawIndexedVTableIndex = 12;
+	constexpr std::size_t kD3D11DrawVTableIndex = 13;
+	constexpr std::size_t kD3D11DrawIndexedInstancedVTableIndex = 20;
+	// The D3D12 proxy queries this same object as ID3D11DeviceContext4 and calls
+	// Signal/Wait (slots 147/148).  A 115-entry base ID3D11DeviceContext clone
+	// leaves those calls beyond the cloned allocation and corrupts synchronization.
+	constexpr std::size_t kD3D11DeviceContext4SignalVTableIndex = 147;
+	constexpr std::size_t kD3D11DeviceContext4WaitVTableIndex = kD3D11DeviceContext4SignalVTableIndex + 1;
+	constexpr std::size_t kD3D11ContextVTableSize = kD3D11DeviceContext4WaitVTableIndex + 1;
+	std::unique_ptr<std::array<void*, kD3D11ContextVTableSize>> g_reflectionCaptureVTable;
+	void** g_reflectionCaptureOriginalVTable = nullptr;
+	ID3D11DeviceContext* g_reflectionCaptureContext = nullptr;
+	D3D11Draw_t g_reflectionCaptureOriginalDraw = nullptr;
+	D3D11DrawIndexed_t g_reflectionCaptureOriginalDrawIndexed = nullptr;
+	D3D11DrawIndexedInstanced_t g_reflectionCaptureOriginalDrawIndexedInstanced = nullptr;
+	D3D11PSSetShaderResources_t g_reflectionCaptureOriginalPSSetShaderResources = nullptr;
+	std::uintptr_t g_enbPuddleWaterDrawReturnAddress = 0;
+	struct ENBPuddleMaterialConsumerTrace
+	{
+		ID3D11DeviceContext* context{ nullptr };
+		std::array<winrt::com_ptr<ID3D11Resource>, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> outputs{};
+		std::uint32_t outputCount{ 0 };
+		std::uint16_t boundSlots{ 0 };
+		std::unordered_set<std::uint64_t> consumerKeys;
+		std::uint32_t drawsRemaining{ 0 };
+	};
+	ENBPuddleMaterialConsumerTrace g_enbPuddleMaterialConsumerTrace;
+	constexpr std::size_t kENBPuddleCaptureTrampolineSize = 64;
+	REL::Trampoline g_enbPuddleCaptureTrampoline{ "ENB Puddle Capture"sv };
+	bool g_enbPuddleCaptureInstalled = false;
 	ID3D11ShaderResourceView** g_enbDepthTextureSRVSlot = nullptr;
 	thread_local int g_enbPrimaryCompositeScopeDepth = 0;
 	thread_local int g_enbNativeImageSpaceParamScopeDepth = 0;
+	thread_local int g_enbReflectionCaptureScopeDepth = 0;
+	thread_local std::uint32_t g_enbReflectionCaptureTechnique = 0;
 	thread_local int g_enbPrepassDepthBridgeScopeDepth = 0;
 	float* GetGlobalDynamicWidthRatio();
 	float* GetGlobalDynamicHeightRatio();
+	void InstallENBScreenEffectRenderHooks();
+	bool InstallReflectionDrawCaptureHook(ID3D11DeviceContext* a_context);
 	thread_local std::array<void*, 2> g_enbHDRFinalCompositeEffects{};
 	thread_local void* g_enbRefractionCompositeEffect = nullptr;
 	thread_local std::array<void*, 0x20> g_enbNativeImageSpaceShaders{};
@@ -597,6 +655,7 @@ namespace
 		kSubSurfaceScattering,
 		kPrepass,
 		kReflections,
+		kPuddleReflections,
 		kTotal
 	};
 
@@ -662,6 +721,9 @@ namespace
 			break;
 		case ENBBoolSetting::kReflections:
 			entry.value = QueryENBBool("EFFECT", "EnableReflections");
+			break;
+		case ENBBoolSetting::kPuddleReflections:
+			entry.value = QueryENBBool("EFFECT", "EnablePuddleReflections");
 			break;
 		default:
 			entry.value = std::nullopt;
@@ -1320,8 +1382,8 @@ PSOut8 PSMainMRT8(VSOut input)
 			ID3D11ShaderResourceView* a_sourceSRV,
 			ID3D11RenderTargetView* a_destinationRTV,
 			ID3D11Texture2D* a_destinationTexture,
-			UINT a_outputWidth = 0,
-			UINT a_outputHeight = 0)
+			float a_outputWidth = 0.0f,
+			float a_outputHeight = 0.0f)
 		{
 			if (!active_ || !a_sourceSRV || !a_destinationRTV || !a_destinationTexture) {
 				return false;
@@ -1329,9 +1391,11 @@ PSOut8 PSMainMRT8(VSOut input)
 
 			D3D11_TEXTURE2D_DESC desc{};
 			a_destinationTexture->GetDesc(&desc);
-			const auto width = a_outputWidth ? a_outputWidth : desc.Width;
-			const auto height = a_outputHeight ? a_outputHeight : desc.Height;
-			if (width == 0 || height == 0 || width > desc.Width || height > desc.Height) {
+			const auto width = a_outputWidth > 0.0f ? a_outputWidth : static_cast<float>(desc.Width);
+			const auto height = a_outputHeight > 0.0f ? a_outputHeight : static_cast<float>(desc.Height);
+			if (!std::isfinite(width) || !std::isfinite(height) ||
+				width <= 0.0f || height <= 0.0f ||
+				width > static_cast<float>(desc.Width) || height > static_cast<float>(desc.Height)) {
 				return false;
 			}
 
@@ -1347,8 +1411,8 @@ PSOut8 PSMainMRT8(VSOut input)
 			ID3D11ShaderResourceView* a_sourceSRV,
 			ID3D11RenderTargetView* a_destinationRTV,
 			ID3D11Texture2D* a_destinationTexture,
-			UINT a_outputWidth = 0,
-			UINT a_outputHeight = 0)
+			float a_outputWidth = 0.0f,
+			float a_outputHeight = 0.0f)
 		{
 			if (!active_ || !g_enbCropCopyPS) {
 				return false;
@@ -1401,7 +1465,9 @@ PSOut8 PSMainMRT8(VSOut input)
 			}
 			context_->PSSetShader(g_enbScaleCopyMRTPS[shaderIndex].get(), nullptr, 0);
 			context_->OMSetRenderTargets(static_cast<UINT>(a_count), destinations.data(), nullptr);
-			SetViewport(first.destinationDesc.Width, first.destinationDesc.Height);
+			SetViewport(
+				static_cast<float>(first.destinationDesc.Width),
+				static_cast<float>(first.destinationDesc.Height));
 			context_->PSSetShaderResources(0, static_cast<UINT>(a_count), sources.data());
 			context_->Draw(3, 0);
 			context_->PSSetShaderResources(
@@ -1413,13 +1479,13 @@ PSOut8 PSMainMRT8(VSOut input)
 		}
 
 	private:
-		void SetViewport(UINT a_width, UINT a_height)
+		void SetViewport(float a_width, float a_height)
 		{
 			const D3D11_VIEWPORT viewport{
 				0.0f,
 				0.0f,
-				static_cast<float>(a_width),
-				static_cast<float>(a_height),
+				a_width,
+				a_height,
 				0.0f,
 				1.0f
 			};
@@ -1472,8 +1538,8 @@ PSOut8 PSMainMRT8(VSOut input)
 			a_sourceSRV,
 			a_destinationRTV,
 			a_destinationTexture,
-			a_outputWidth,
-			a_outputHeight);
+			static_cast<float>(a_outputWidth),
+			static_cast<float>(a_outputHeight));
 	}
 
 	void SelectENBCopyDeviceContext(
@@ -1750,8 +1816,8 @@ PSOut8 PSMainMRT8(VSOut input)
 			sourceSRV,
 			destinationRTV,
 			destinationTexture,
-			sourceDesc.Width,
-			sourceDesc.Height);
+			static_cast<float>(sourceDesc.Width),
+			static_cast<float>(sourceDesc.Height));
 	}
 
 	void FinishENBCompositeTargets(
@@ -2144,6 +2210,13 @@ PSOut8 PSMainMRT8(VSOut input)
 		std::size_t constantBufferOffset;
 	};
 
+	struct ENBPuddleWaterHandler
+	{
+		std::uintptr_t entry;
+		std::size_t constantBufferOffset;
+		std::size_t texture11Offset;
+	};
+
 	std::optional<ENBTechniqueHandler> FindENBTechniqueHandler(
 		HMODULE a_module,
 		const ENBCodeRange& a_code,
@@ -2174,6 +2247,112 @@ PSOut8 PSMainMRT8(VSOut input)
 			}
 		}
 		return std::nullopt;
+	}
+
+	std::optional<ENBPuddleWaterHandler> FindENBPuddleWaterHandler(
+		HMODULE a_module,
+		const ENBCodeRange& a_code)
+	{
+		const auto technique = FindENBTechniqueHandler(
+			a_module,
+			a_code,
+			"Shader_AEFCDE5E",
+			"EConstantList0",
+			"Shader_332B4FCF");
+		if (!technique) {
+			return std::nullopt;
+		}
+		const auto function = FindENBContainingFunction(a_module, technique->entry);
+		if (!function) {
+			return std::nullopt;
+		}
+		const auto texture11Offset =
+			FindENBConstantBufferSlotOffset(a_module, *function, "Texture11");
+		if (!texture11Offset) {
+			return std::nullopt;
+		}
+		return ENBPuddleWaterHandler{
+			technique->entry,
+			technique->constantBufferOffset,
+			*texture11Offset
+		};
+	}
+
+	std::uintptr_t FindENBPuddleWaterDrawCallAddress(
+		HMODULE a_module,
+		const ENBCodeRange& a_code)
+	{
+		const auto handler = FindENBPuddleWaterHandler(a_module, a_code);
+		if (!handler) {
+			return 0;
+		}
+		const auto function = FindENBContainingFunction(a_module, handler->entry);
+		if (!function) {
+			return 0;
+		}
+
+		// The primary technique draw is inside an effect-pass loop and is followed
+		// by `inc r32`. The later fallback DrawIndexed in the same handler is not.
+		for (auto cursor = function->begin; cursor + 5 <= function->end; ++cursor) {
+			const auto* instruction = reinterpret_cast<const std::uint8_t*>(cursor);
+			if (instruction[0] == 0xFF && instruction[1] == 0x50 && instruction[2] == 0x60 &&
+				instruction[3] == 0xFF && (instruction[4] & 0xF8) == 0xC0) {
+				return cursor;
+			}
+		}
+		return 0;
+	}
+
+	bool IsENBPuddleWaterDrawReturnAddress(
+		HMODULE a_module,
+		const ENBCodeRange& a_code,
+		std::uintptr_t a_returnAddress)
+	{
+		if (!a_module || !a_returnAddress ||
+			a_returnAddress < reinterpret_cast<std::uintptr_t>(a_code.begin) + 3 ||
+			a_returnAddress + 2 > reinterpret_cast<std::uintptr_t>(a_code.begin) + a_code.size) {
+			return false;
+		}
+		if (a_returnAddress == g_enbPuddleWaterDrawReturnAddress) {
+			return true;
+		}
+
+		// ID3D11DeviceContext::DrawIndexed is vtable slot 12 (offset 0x60).
+		// In ENB's primary puddle/water technique loop the call is immediately
+		// followed by `inc r32`. Validate the observed return address itself so a
+		// startup scan cannot silently classify a different, similarly shaped call.
+		const auto* call = reinterpret_cast<const std::uint8_t*>(a_returnAddress - 3);
+		const auto* continuation = reinterpret_cast<const std::uint8_t*>(a_returnAddress);
+		if (call[0] != 0xFF || call[1] != 0x50 || call[2] != 0x60 ||
+			continuation[0] != 0xFF || (continuation[1] & 0xF8) != 0xC0) {
+			return false;
+		}
+
+		const auto function = FindENBContainingFunction(a_module, a_returnAddress - 3);
+		if (!function) {
+			return false;
+		}
+		const auto containsImmediate = [&](std::uint32_t a_value) {
+			std::array<std::uint8_t, sizeof(a_value)> bytes{};
+			std::memcpy(bytes.data(), &a_value, sizeof(a_value));
+			return std::search(
+				reinterpret_cast<const std::uint8_t*>(function->begin),
+				reinterpret_cast<const std::uint8_t*>(function->end),
+				bytes.begin(), bytes.end()) != reinterpret_cast<const std::uint8_t*>(function->end);
+		};
+		// This handler selects its water techniques by hash at runtime. Requiring
+		// direct xrefs to their diagnostic names rejected the verified 0.501 draw.
+		if (!containsImmediate(0xAEFCDE5Eu) || !containsImmediate(0x332B4FCFu)) {
+			return false;
+		}
+
+		const auto previous = g_enbPuddleWaterDrawReturnAddress;
+		g_enbPuddleWaterDrawReturnAddress = a_returnAddress;
+		logger::info(
+			"[Reflection Capture] Validated ENB primary puddle/water draw at RVA 0x{:X}{}",
+			a_returnAddress - 3 - reinterpret_cast<std::uintptr_t>(a_module),
+			previous && previous != a_returnAddress ? " (corrected startup candidate)" : "");
+		return true;
 	}
 
 	void ResolveENBRenderResolutionGlobals()
@@ -2560,7 +2739,6 @@ PSOut8 PSMainMRT8(VSOut input)
 
 	constexpr std::ptrdiff_t kENBDeviceContextOffset = 0x6C20;
 	constexpr std::ptrdiff_t kENBTexture0SRVOffset = 0xD20;
-	constexpr std::ptrdiff_t kENBTexture3SRVOffset = 0xD38;
 	constexpr std::uint32_t kENBReflectionBlurTechnique = 0xB1B77A4D;
 	constexpr std::uint32_t kENBReflectionSSRTechnique = 0x1355B81A;
 
@@ -2740,66 +2918,6 @@ PSOut8 PSMainMRT8(VSOut input)
 		bool changed_{ false };
 	};
 
-	class ScopedENBReflectionColorInput
-	{
-	public:
-		ScopedENBReflectionColorInput(void* a_this, bool a_enable)
-		{
-			auto* upscaling = Upscaling::GetSingleton();
-			if (!a_enable || !a_this || !upscaling) {
-				return;
-			}
-
-			slot_ = reinterpret_cast<ID3D11ShaderResourceView**>(
-				reinterpret_cast<std::byte*>(a_this) + kENBTexture3SRVOffset);
-			auto* nativeColor = reinterpret_cast<ID3D11ShaderResourceView*>(
-				upscaling->originalRenderTargets[3].srView);
-			auto* renderColor = reinterpret_cast<ID3D11ShaderResourceView*>(
-				upscaling->proxyRenderTargets[3].srView);
-			if (!IsWritableProcessAddress(slot_) || !renderColor ||
-				(*slot_ != nativeColor && *slot_ != renderColor)) {
-				slot_ = nullptr;
-				return;
-			}
-
-			original_ = *slot_;
-			*slot_ = renderColor;
-
-			static bool loggedDimensions = false;
-			if (!loggedDimensions) {
-				UINT nativeWidth = 0;
-				UINT nativeHeight = 0;
-				UINT renderWidth = 0;
-				UINT renderHeight = 0;
-				if (GetENBShaderResourceDimensions(
-						nativeColor, nativeWidth, nativeHeight) &&
-					GetENBShaderResourceDimensions(
-						renderColor, renderWidth, renderHeight)) {
-					logger::info(
-						"[ENB SR] Reflection Texture3 color input {}x{} -> {}x{}",
-						nativeWidth, nativeHeight, renderWidth, renderHeight);
-					loggedDimensions = true;
-				}
-			}
-		}
-
-		~ScopedENBReflectionColorInput()
-		{
-			if (slot_) {
-				*slot_ = original_;
-			}
-		}
-
-		ScopedENBReflectionColorInput(const ScopedENBReflectionColorInput&) = delete;
-		ScopedENBReflectionColorInput& operator=(const ScopedENBReflectionColorInput&) = delete;
-
-		bool IsActive() const { return slot_ != nullptr; }
-
-	private:
-		ID3D11ShaderResourceView** slot_{ nullptr };
-		ID3D11ShaderResourceView* original_{ nullptr };
-	};
-
 	bool EnsureENBConstantBufferPatchResources(
 		ENBConstantBufferPatchResources& a_resources,
 		ID3D11Buffer* a_source)
@@ -2852,6 +2970,678 @@ PSOut8 PSMainMRT8(VSOut input)
 
 		a_resources.device = std::move(device);
 		a_resources.byteWidth = sourceDesc.ByteWidth;
+		return true;
+	}
+
+	#pragma pack(push, 1)
+	struct DDS_PIXELFORMAT
+	{
+		std::uint32_t size = 32;
+		std::uint32_t flags = 0x4;  // DDPF_FOURCC
+		std::uint32_t fourCC = 0x30315844;  // DX10
+		std::uint32_t rgbBitCount = 0;
+		std::uint32_t rBitMask = 0;
+		std::uint32_t gBitMask = 0;
+		std::uint32_t bBitMask = 0;
+		std::uint32_t aBitMask = 0;
+	};
+
+	struct DDS_HEADER
+	{
+		std::uint32_t size = 124;
+		std::uint32_t flags = 0x0002100F;  // CAPS | HEIGHT | WIDTH | PITCH | PIXELFORMAT
+		std::uint32_t height = 0;
+		std::uint32_t width = 0;
+		std::uint32_t pitchOrLinearSize = 0;
+		std::uint32_t depth = 0;
+		std::uint32_t mipMapCount = 1;
+		std::array<std::uint32_t, 11> reserved1{};
+		DDS_PIXELFORMAT pixelFormat{};
+		std::uint32_t caps = 0x1000;  // DDSCAPS_TEXTURE
+		std::uint32_t caps2 = 0;
+		std::uint32_t caps3 = 0;
+		std::uint32_t caps4 = 0;
+		std::uint32_t reserved2 = 0;
+	};
+
+	struct DDS_HEADER_DXT10
+	{
+		std::uint32_t format = DXGI_FORMAT_UNKNOWN;
+		std::uint32_t resourceDimension = 3;  // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+		std::uint32_t miscFlag = 0;
+		std::uint32_t arraySize = 1;
+		std::uint32_t miscFlags2 = 0;
+	};
+	#pragma pack(pop)
+	static_assert(sizeof(DDS_HEADER) == 124);
+	static_assert(sizeof(DDS_HEADER_DXT10) == 20);
+
+	std::optional<std::uint32_t> GetCaptureBytesPerPixel(DXGI_FORMAT a_format)
+	{
+		switch (a_format) {
+		case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+		case DXGI_FORMAT_R32G32B32A32_FLOAT:
+		case DXGI_FORMAT_R32G32B32A32_UINT:
+		case DXGI_FORMAT_R32G32B32A32_SINT:
+			return 16;
+		case DXGI_FORMAT_R32G32B32_TYPELESS:
+		case DXGI_FORMAT_R32G32B32_FLOAT:
+		case DXGI_FORMAT_R32G32B32_UINT:
+		case DXGI_FORMAT_R32G32B32_SINT:
+			return 12;
+		case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+		case DXGI_FORMAT_R16G16B16A16_FLOAT:
+		case DXGI_FORMAT_R16G16B16A16_UNORM:
+		case DXGI_FORMAT_R16G16B16A16_UINT:
+		case DXGI_FORMAT_R16G16B16A16_SNORM:
+		case DXGI_FORMAT_R16G16B16A16_SINT:
+		case DXGI_FORMAT_R32G32_TYPELESS:
+		case DXGI_FORMAT_R32G32_FLOAT:
+		case DXGI_FORMAT_R32G32_UINT:
+		case DXGI_FORMAT_R32G32_SINT:
+			return 8;
+		case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+		case DXGI_FORMAT_R10G10B10A2_UNORM:
+		case DXGI_FORMAT_R10G10B10A2_UINT:
+		case DXGI_FORMAT_R11G11B10_FLOAT:
+		case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+		case DXGI_FORMAT_R8G8B8A8_UNORM:
+		case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+		case DXGI_FORMAT_R8G8B8A8_UINT:
+		case DXGI_FORMAT_R8G8B8A8_SNORM:
+		case DXGI_FORMAT_R8G8B8A8_SINT:
+		case DXGI_FORMAT_B8G8R8A8_UNORM:
+		case DXGI_FORMAT_B8G8R8X8_UNORM:
+		case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+		case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+		case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+		case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+		case DXGI_FORMAT_R16G16_TYPELESS:
+		case DXGI_FORMAT_R16G16_FLOAT:
+		case DXGI_FORMAT_R16G16_UNORM:
+		case DXGI_FORMAT_R16G16_UINT:
+		case DXGI_FORMAT_R16G16_SNORM:
+		case DXGI_FORMAT_R16G16_SINT:
+		case DXGI_FORMAT_R32_TYPELESS:
+		case DXGI_FORMAT_D32_FLOAT:
+		case DXGI_FORMAT_R32_FLOAT:
+		case DXGI_FORMAT_R32_UINT:
+		case DXGI_FORMAT_R32_SINT:
+			return 4;
+		case DXGI_FORMAT_R8G8_TYPELESS:
+		case DXGI_FORMAT_R8G8_UNORM:
+		case DXGI_FORMAT_R8G8_UINT:
+		case DXGI_FORMAT_R8G8_SNORM:
+		case DXGI_FORMAT_R8G8_SINT:
+		case DXGI_FORMAT_R16_TYPELESS:
+		case DXGI_FORMAT_R16_FLOAT:
+		case DXGI_FORMAT_D16_UNORM:
+		case DXGI_FORMAT_R16_UNORM:
+		case DXGI_FORMAT_R16_UINT:
+		case DXGI_FORMAT_R16_SNORM:
+		case DXGI_FORMAT_R16_SINT:
+		case DXGI_FORMAT_B5G6R5_UNORM:
+		case DXGI_FORMAT_B5G5R5A1_UNORM:
+		case DXGI_FORMAT_B4G4R4A4_UNORM:
+			return 2;
+		case DXGI_FORMAT_R8_TYPELESS:
+		case DXGI_FORMAT_R8_UNORM:
+		case DXGI_FORMAT_R8_UINT:
+		case DXGI_FORMAT_R8_SNORM:
+		case DXGI_FORMAT_R8_SINT:
+		case DXGI_FORMAT_A8_UNORM:
+			return 1;
+		default:
+			return std::nullopt;
+		}
+	}
+
+	std::filesystem::path GetReflectionCaptureDirectory()
+	{
+		return std::filesystem::path("Data\\F4SE\\Plugins\\ShaderEngineDumps\\UpscalingReflection") /
+			std::format("capture_{:04}", g_activeReflectionCaptureSerial.load());
+	}
+
+	bool SaveReflectionCaptureTexture(
+		ID3D11DeviceContext* a_context,
+		ID3D11Resource* a_resource,
+		DXGI_FORMAT a_viewFormat,
+		UINT a_mipSlice,
+		const std::filesystem::path& a_path)
+	{
+		if (!a_context || !a_resource) {
+			return false;
+		}
+
+		winrt::com_ptr<ID3D11Texture2D> source;
+		if (FAILED(a_resource->QueryInterface(IID_PPV_ARGS(source.put())))) {
+			logger::warn("[Reflection Capture] {} is not a Texture2D", a_path.string());
+			return false;
+		}
+		D3D11_TEXTURE2D_DESC sourceDesc{};
+		source->GetDesc(&sourceDesc);
+		if (sourceDesc.SampleDesc.Count != 1 || sourceDesc.ArraySize != 1 || a_mipSlice >= sourceDesc.MipLevels) {
+			logger::warn("[Reflection Capture] {} has unsupported samples/array ({}/{})", a_path.string(), sourceDesc.SampleDesc.Count, sourceDesc.ArraySize);
+			return false;
+		}
+		const auto format = a_viewFormat == DXGI_FORMAT_UNKNOWN ? sourceDesc.Format : a_viewFormat;
+		const auto bytesPerPixel = GetCaptureBytesPerPixel(format);
+		if (!bytesPerPixel || sourceDesc.Format == DXGI_FORMAT_UNKNOWN) {
+			logger::warn("[Reflection Capture] {} has unsupported format {}", a_path.string(), static_cast<int>(format));
+			return false;
+		}
+
+		const UINT width = std::max(1u, sourceDesc.Width >> a_mipSlice);
+		const UINT height = std::max(1u, sourceDesc.Height >> a_mipSlice);
+		D3D11_TEXTURE2D_DESC stagingDesc = sourceDesc;
+		stagingDesc.Width = width;
+		stagingDesc.Height = height;
+		stagingDesc.MipLevels = 1;
+		stagingDesc.BindFlags = 0;
+		stagingDesc.Usage = D3D11_USAGE_STAGING;
+		stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		stagingDesc.MiscFlags = 0;
+		winrt::com_ptr<ID3D11Device> device;
+		source->GetDevice(device.put());
+		winrt::com_ptr<ID3D11Texture2D> staging;
+		if (!device || FAILED(device->CreateTexture2D(&stagingDesc, nullptr, staging.put()))) {
+			logger::warn("[Reflection Capture] Cannot create staging texture for {}", a_path.string());
+			return false;
+		}
+
+		a_context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source.get(), a_mipSlice, nullptr);
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (FAILED(a_context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+			logger::warn("[Reflection Capture] Cannot map {}", a_path.string());
+			return false;
+		}
+
+		const auto rowBytes = static_cast<std::uint64_t>(width) * *bytesPerPixel;
+		const bool validPitch = rowBytes <= mapped.RowPitch && rowBytes <= std::numeric_limits<std::uint32_t>::max();
+		std::error_code error;
+		std::filesystem::create_directories(a_path.parent_path(), error);
+		std::ofstream stream(a_path, std::ios::binary | std::ios::trunc);
+		if (!validPitch || !stream) {
+			a_context->Unmap(staging.get(), 0);
+			logger::warn("[Reflection Capture] Cannot write {}", a_path.string());
+			return false;
+		}
+
+		const std::uint32_t magic = 0x20534444;  // DDS
+		DDS_HEADER header{};
+		header.height = height;
+		header.width = width;
+		header.pitchOrLinearSize = static_cast<std::uint32_t>(rowBytes);
+		DDS_HEADER_DXT10 header10{};
+		header10.format = static_cast<std::uint32_t>(format);
+		stream.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+		stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
+		stream.write(reinterpret_cast<const char*>(&header10), sizeof(header10));
+		for (UINT row = 0; row < height; ++row) {
+			stream.write(
+				reinterpret_cast<const char*>(mapped.pData) + static_cast<std::size_t>(row) * mapped.RowPitch,
+				static_cast<std::streamsize>(rowBytes));
+		}
+		a_context->Unmap(staging.get(), 0);
+		return stream.good();
+	}
+
+	bool SaveReflectionCaptureSRV(
+		ID3D11DeviceContext* a_context,
+		ID3D11ShaderResourceView* a_view,
+		const std::filesystem::path& a_path)
+	{
+		if (!a_view) {
+			return false;
+		}
+		D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+		a_view->GetDesc(&desc);
+		UINT mipSlice = 0;
+		if (desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
+			mipSlice = desc.Texture2D.MostDetailedMip;
+		}
+		winrt::com_ptr<ID3D11Resource> resource;
+		a_view->GetResource(resource.put());
+		return SaveReflectionCaptureTexture(a_context, resource.get(), desc.Format, mipSlice, a_path);
+	}
+
+	bool SaveReflectionCaptureRTV(
+		ID3D11DeviceContext* a_context,
+		ID3D11RenderTargetView* a_view,
+		const std::filesystem::path& a_path)
+	{
+		if (!a_view) {
+			return false;
+		}
+		D3D11_RENDER_TARGET_VIEW_DESC desc{};
+		a_view->GetDesc(&desc);
+		UINT mipSlice = 0;
+		if (desc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D) {
+			mipSlice = desc.Texture2D.MipSlice;
+		}
+		winrt::com_ptr<ID3D11Resource> resource;
+		a_view->GetResource(resource.put());
+		return SaveReflectionCaptureTexture(a_context, resource.get(), desc.Format, mipSlice, a_path);
+	}
+
+	void CaptureReflectionDrawState(ID3D11DeviceContext* a_context, std::string_view a_pass)
+	{
+		if (!a_context) {
+			return;
+		}
+		const auto directory = GetReflectionCaptureDirectory();
+		std::array<ID3D11ShaderResourceView*, 16> inputs{};
+		std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> outputs{};
+		a_context->PSGetShaderResources(0, static_cast<UINT>(inputs.size()), inputs.data());
+		a_context->OMGetRenderTargets(static_cast<UINT>(outputs.size()), outputs.data(), nullptr);
+		std::uint32_t savedInputs = 0;
+		std::uint32_t savedOutputs = 0;
+		for (std::size_t slot = 0; slot < inputs.size(); ++slot) {
+			if (inputs[slot]) {
+				savedInputs += SaveReflectionCaptureSRV(
+					a_context, inputs[slot], directory / std::format("{}_srv{:02}.dds", a_pass, slot)) ? 1u : 0u;
+				inputs[slot]->Release();
+			}
+		}
+		for (std::size_t slot = 0; slot < outputs.size(); ++slot) {
+			if (outputs[slot]) {
+				savedOutputs += SaveReflectionCaptureRTV(
+					a_context, outputs[slot], directory / std::format("{}_rt{:02}.dds", a_pass, slot)) ? 1u : 0u;
+				outputs[slot]->Release();
+			}
+		}
+		D3D11_VIEWPORT viewport{};
+		UINT viewportCount = 1;
+		a_context->RSGetViewports(&viewportCount, &viewport);
+		logger::info(
+			"[Reflection Capture] {} wrote {} SRVs and {} RTVs to {} (viewport {:.3f}x{:.3f})",
+			a_pass, savedInputs, savedOutputs, directory.string(), viewport.Width, viewport.Height);
+	}
+
+	void ResetReflectionCaptureTrace()
+	{
+		if (g_reflectionCaptureContext && g_reflectionCaptureOriginalVTable) {
+			REL::WriteSafeData(
+				reinterpret_cast<std::uintptr_t>(g_reflectionCaptureContext),
+				g_reflectionCaptureOriginalVTable);
+		}
+		g_reflectionCaptureContext = nullptr;
+		g_reflectionCaptureOriginalVTable = nullptr;
+		g_reflectionCaptureOriginalDraw = nullptr;
+		g_reflectionCaptureOriginalDrawIndexed = nullptr;
+		g_reflectionCaptureOriginalDrawIndexedInstanced = nullptr;
+		g_reflectionCaptureOriginalPSSetShaderResources = nullptr;
+		g_reflectionCaptureVTable.reset();
+		g_enbPuddleMaterialConsumerTrace = {};
+	}
+
+	void CompleteReflectionCapture(std::uint32_t a_pass)
+	{
+		const auto remaining = g_reflectionCapturePending.fetch_and(~a_pass) & ~a_pass;
+		if (remaining == 0) {
+			ResetReflectionCaptureTrace();
+			logger::info("[Reflection Capture] Complete. Toggle Reflection capture off and on to arm another one-shot capture.");
+		}
+	}
+
+	bool IsVanillaSSLRShader(ID3D11DeviceContext* a_context)
+	{
+		if ((g_reflectionCapturePending.load() & kReflectionCaptureVanillaSSLR) == 0 || !a_context) {
+			return false;
+		}
+		winrt::com_ptr<ID3D11PixelShader> shader;
+		a_context->PSGetShader(shader.put(), nullptr, nullptr);
+		return shader && shader.get() == Upscaling::GetSingleton()->GetBSImagespaceShaderSSLRRaytracing();
+	}
+
+	bool IsENBReflectionCaptureDraw()
+	{
+		return (g_reflectionCapturePending.load() & kReflectionCaptureENBReflection) != 0 &&
+			g_enbReflectionCaptureScopeDepth > 0 &&
+			g_enbReflectionCaptureTechnique == kENBReflectionSSRTechnique;
+	}
+
+	bool IsENBPuddleMaterialResource(ID3D11Resource* a_resource)
+	{
+		if (!a_resource) {
+			return false;
+		}
+		return std::any_of(
+			g_enbPuddleMaterialConsumerTrace.outputs.begin(),
+			g_enbPuddleMaterialConsumerTrace.outputs.end(),
+			[&](const auto& a_output) { return a_output.get() == a_resource; });
+	}
+
+	void ArmENBPuddleMaterialConsumerTrace(ID3D11DeviceContext* a_context)
+	{
+		if ((g_reflectionCapturePending.load() & kReflectionCaptureENBPuddleConsumer) == 0 || !a_context) {
+			return;
+		}
+		// Latch one material output set for the one-shot interval. Replacing it on
+		// every material draw can race past downstream readers and prevents a
+		// bounded enumeration of the consumers of one concrete output set.
+		if (g_enbPuddleMaterialConsumerTrace.context != nullptr ||
+			g_enbPuddleMaterialConsumerTrace.outputCount != 0) {
+			return;
+		}
+
+		g_enbPuddleMaterialConsumerTrace = {};
+		g_enbPuddleMaterialConsumerTrace.context = a_context;
+		g_enbPuddleMaterialConsumerTrace.drawsRemaining = 4096;
+		std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> outputs{};
+		a_context->OMGetRenderTargets(static_cast<UINT>(outputs.size()), outputs.data(), nullptr);
+		for (auto* output : outputs) {
+			if (!output) {
+				continue;
+			}
+			winrt::com_ptr<ID3D11Resource> resource;
+			output->GetResource(resource.put());
+			output->Release();
+			if (!resource) {
+				continue;
+			}
+			const bool duplicate = std::any_of(
+				g_enbPuddleMaterialConsumerTrace.outputs.begin(),
+				g_enbPuddleMaterialConsumerTrace.outputs.end(),
+				[&](const auto& a_existing) { return a_existing.get() == resource.get(); });
+			if (!duplicate && g_enbPuddleMaterialConsumerTrace.outputCount <
+				g_enbPuddleMaterialConsumerTrace.outputs.size()) {
+				g_enbPuddleMaterialConsumerTrace.outputs[g_enbPuddleMaterialConsumerTrace.outputCount++] =
+					std::move(resource);
+			}
+		}
+
+		D3D11_VIEWPORT viewport{};
+		UINT viewportCount = 1;
+		a_context->RSGetViewports(&viewportCount, &viewport);
+		logger::info(
+			"[Reflection Capture] Armed ENB puddle consumer trace for {} material resources (viewport {:.3f}x{:.3f})",
+			g_enbPuddleMaterialConsumerTrace.outputCount,
+			viewport.Width,
+			viewport.Height);
+	}
+
+	void STDMETHODCALLTYPE ReflectionPSSetShaderResourcesCaptureThunk(
+		ID3D11DeviceContext* a_context,
+		UINT a_startSlot,
+		UINT a_numViews,
+		ID3D11ShaderResourceView* const* a_views)
+	{
+		const auto setShaderResources = g_reflectionCaptureOriginalPSSetShaderResources;
+		if (!setShaderResources) {
+			return;
+		}
+		setShaderResources(a_context, a_startSlot, a_numViews, a_views);
+
+		auto& trace = g_enbPuddleMaterialConsumerTrace;
+		if ((g_reflectionCapturePending.load(std::memory_order_relaxed) &
+			kReflectionCaptureENBPuddleConsumer) == 0 ||
+			a_context != trace.context || trace.outputCount == 0 || a_startSlot >= 16) {
+			return;
+		}
+
+		const auto endSlot = std::min<UINT>(16, a_startSlot + std::min<UINT>(a_numViews, 16));
+		for (UINT slot = a_startSlot; slot < endSlot; ++slot) {
+			const auto bit = static_cast<std::uint16_t>(1u << slot);
+			trace.boundSlots &= static_cast<std::uint16_t>(~bit);
+			const auto viewIndex = slot - a_startSlot;
+			if (!a_views || !a_views[viewIndex]) {
+				continue;
+			}
+			winrt::com_ptr<ID3D11Resource> resource;
+			a_views[viewIndex]->GetResource(resource.put());
+			if (IsENBPuddleMaterialResource(resource.get())) {
+				trace.boundSlots |= bit;
+			}
+		}
+	}
+
+	void CaptureENBPuddleMaterialConsumer(
+		ID3D11DeviceContext* a_context,
+		std::uintptr_t a_drawCaller)
+	{
+		auto& trace = g_enbPuddleMaterialConsumerTrace;
+		if ((g_reflectionCapturePending.load(std::memory_order_relaxed) &
+			kReflectionCaptureENBPuddleConsumer) == 0 ||
+			!a_context || a_context != trace.context || trace.outputCount == 0 || trace.boundSlots == 0) {
+			return;
+		}
+
+		winrt::com_ptr<ID3D11PixelShader> shader;
+		a_context->PSGetShader(shader.put(), nullptr, nullptr);
+		const auto shaderAddress = reinterpret_cast<std::uintptr_t>(shader.get());
+		const auto consumerKey = static_cast<std::uint64_t>(a_drawCaller) ^
+			(static_cast<std::uint64_t>(shaderAddress) + 0x9E3779B97F4A7C15ull +
+				(static_cast<std::uint64_t>(a_drawCaller) << 6) +
+				(static_cast<std::uint64_t>(a_drawCaller) >> 2));
+		if (!trace.consumerKeys.insert(consumerKey).second) {
+			return;
+		}
+		const auto consumerCount = trace.consumerKeys.size();
+
+		D3D11_VIEWPORT viewport{};
+		UINT viewportCount = 1;
+		a_context->RSGetViewports(&viewportCount, &viewport);
+		std::string slots;
+		for (std::size_t slot = 0; slot < 16; ++slot) {
+			if ((trace.boundSlots & (1u << slot)) != 0) {
+				slots += slots.empty() ? std::format("t{}", slot) : std::format(",t{}", slot);
+			}
+		}
+
+		DXGI_FORMAT outputFormat = DXGI_FORMAT_UNKNOWN;
+		UINT outputWidth = 0;
+		UINT outputHeight = 0;
+		winrt::com_ptr<ID3D11RenderTargetView> output;
+		a_context->OMGetRenderTargets(1, output.put(), nullptr);
+		if (output) {
+			D3D11_RENDER_TARGET_VIEW_DESC viewDesc{};
+			output->GetDesc(&viewDesc);
+			outputFormat = viewDesc.Format;
+			winrt::com_ptr<ID3D11Resource> outputResource;
+			output->GetResource(outputResource.put());
+			winrt::com_ptr<ID3D11Texture2D> outputTexture;
+			if (outputResource && SUCCEEDED(outputResource->QueryInterface(IID_PPV_ARGS(outputTexture.put())))) {
+				D3D11_TEXTURE2D_DESC textureDesc{};
+				outputTexture->GetDesc(&textureDesc);
+				outputWidth = textureDesc.Width;
+				outputHeight = textureDesc.Height;
+				if (outputFormat == DXGI_FORMAT_UNKNOWN) {
+					outputFormat = textureDesc.Format;
+				}
+			}
+		}
+
+		const auto enbModule = reinterpret_cast<std::uintptr_t>(FindENBModule());
+		MEMORY_BASIC_INFORMATION callerMemory{};
+		const bool callerIsENB = a_drawCaller && enbModule &&
+			VirtualQuery(reinterpret_cast<void*>(a_drawCaller), &callerMemory, sizeof(callerMemory)) == sizeof(callerMemory) &&
+			reinterpret_cast<std::uintptr_t>(callerMemory.AllocationBase) == enbModule;
+		const auto enbCode = callerIsENB ? GetENBExecutableCode(reinterpret_cast<HMODULE>(enbModule)) : std::nullopt;
+		const bool primaryWaterPass = callerIsENB && enbCode &&
+			IsENBPuddleWaterDrawReturnAddress(
+				reinterpret_cast<HMODULE>(enbModule), *enbCode, a_drawCaller);
+		if (callerIsENB) {
+			logger::info(
+				"[Reflection Capture] ENB puddle material consumer #{}: PS={} inputs={} viewport {:.3f}x{:.3f} output={}x{} format={} caller=ENB+0x{:X} waterPass={}",
+				consumerCount,
+				shaderAddress,
+				slots,
+				viewport.Width,
+				viewport.Height,
+				outputWidth,
+				outputHeight,
+				static_cast<UINT>(outputFormat),
+				a_drawCaller - enbModule,
+				primaryWaterPass);
+		} else {
+			logger::info(
+				"[Reflection Capture] ENB puddle material consumer #{}: PS={} inputs={} viewport {:.3f}x{:.3f} output={}x{} format={} caller=0x{:X}",
+				consumerCount,
+				shaderAddress,
+				slots,
+				viewport.Width,
+				viewport.Height,
+				outputWidth,
+				outputHeight,
+				static_cast<UINT>(outputFormat),
+				a_drawCaller);
+		}
+		// The broad identity trace finds many depth, lighting and post consumers.
+		// Dump only each distinct effect pass at the statically resolved primary
+		// water draw; this includes the stencil pass and the following color pass
+		// without stalling the frame on dozens of irrelevant readbacks.
+		if (primaryWaterPass) {
+			CaptureReflectionDrawState(
+				a_context, std::format("enb_puddle_water_pass_{:02}", consumerCount));
+		}
+	}
+
+	void FinishReflectionDrawCapture(
+		ID3D11DeviceContext* a_context,
+		std::uintptr_t a_drawCaller)
+	{
+		if (IsVanillaSSLRShader(a_context)) {
+			CaptureReflectionDrawState(a_context, "vanilla_sslr");
+			CompleteReflectionCapture(kReflectionCaptureVanillaSSLR);
+		} else if (IsENBReflectionCaptureDraw()) {
+			CaptureReflectionDrawState(a_context, "enb_reflection_ssr");
+			CompleteReflectionCapture(kReflectionCaptureENBReflection);
+		}
+		CaptureENBPuddleMaterialConsumer(a_context, a_drawCaller);
+		auto& trace = g_enbPuddleMaterialConsumerTrace;
+		if ((g_reflectionCapturePending.load(std::memory_order_relaxed) &
+			kReflectionCaptureENBPuddleConsumer) != 0 &&
+			a_context == trace.context && trace.drawsRemaining != 0 && --trace.drawsRemaining == 0) {
+			logger::info(
+				"[Reflection Capture] ENB puddle consumer enumeration complete after {} unique consumers",
+				trace.consumerKeys.size());
+			CompleteReflectionCapture(kReflectionCaptureENBPuddleConsumer);
+		}
+	}
+
+	void STDMETHODCALLTYPE VanillaSSLRDrawCaptureThunk(
+		ID3D11DeviceContext* a_context,
+		UINT a_vertexCount,
+		UINT a_startVertexLocation)
+	{
+		const auto draw = g_reflectionCaptureOriginalDraw;
+		if (!draw) {
+			return;
+		}
+		if (g_reflectionCapturePending.load(std::memory_order_relaxed) == 0) {
+			draw(a_context, a_vertexCount, a_startVertexLocation);
+			return;
+		}
+		const auto drawCaller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+		draw(a_context, a_vertexCount, a_startVertexLocation);
+		FinishReflectionDrawCapture(a_context, drawCaller);
+	}
+
+	void STDMETHODCALLTYPE VanillaSSLRDrawIndexedCaptureThunk(
+		ID3D11DeviceContext* a_context,
+		UINT a_indexCount,
+		UINT a_startIndexLocation,
+		INT a_baseVertexLocation)
+	{
+		const auto draw = g_reflectionCaptureOriginalDrawIndexed;
+		if (!draw) {
+			return;
+		}
+		if (g_reflectionCapturePending.load(std::memory_order_relaxed) == 0) {
+			draw(a_context, a_indexCount, a_startIndexLocation, a_baseVertexLocation);
+			return;
+		}
+		const auto drawCaller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+		draw(a_context, a_indexCount, a_startIndexLocation, a_baseVertexLocation);
+		FinishReflectionDrawCapture(a_context, drawCaller);
+	}
+
+	void STDMETHODCALLTYPE ReflectionDrawIndexedInstancedCaptureThunk(
+		ID3D11DeviceContext* a_context,
+		UINT a_indexCountPerInstance,
+		UINT a_instanceCount,
+		UINT a_startIndexLocation,
+		INT a_baseVertexLocation,
+		UINT a_startInstanceLocation)
+	{
+		const auto draw = g_reflectionCaptureOriginalDrawIndexedInstanced;
+		if (!draw) {
+			return;
+		}
+		if (g_reflectionCapturePending.load(std::memory_order_relaxed) == 0) {
+			draw(
+				a_context,
+				a_indexCountPerInstance,
+				a_instanceCount,
+				a_startIndexLocation,
+				a_baseVertexLocation,
+				a_startInstanceLocation);
+			return;
+		}
+		const auto drawCaller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+		draw(
+			a_context,
+			a_indexCountPerInstance,
+			a_instanceCount,
+			a_startIndexLocation,
+			a_baseVertexLocation,
+			a_startInstanceLocation);
+		FinishReflectionDrawCapture(a_context, drawCaller);
+	}
+
+	bool InstallReflectionDrawCaptureHook(ID3D11DeviceContext* a_context)
+	{
+		if ((g_reflectionCapturePending.load() &
+			(kReflectionCaptureVanillaSSLR | kReflectionCaptureENBPuddleConsumer)) == 0 ||
+			!a_context) {
+			return g_reflectionCaptureContext != nullptr;
+		}
+		if (g_reflectionCaptureContext) {
+			return g_reflectionCaptureContext == a_context;
+		}
+		auto** originalVTable = *reinterpret_cast<void***>(a_context);
+		if (!IsReadableProcessRange(
+				originalVTable, sizeof(void*) * kD3D11ContextVTableSize) ||
+			!originalVTable[kD3D11PSSetShaderResourcesVTableIndex] ||
+			!originalVTable[kD3D11DrawVTableIndex] ||
+			!originalVTable[kD3D11DrawIndexedVTableIndex] ||
+			!originalVTable[kD3D11DrawIndexedInstancedVTableIndex]) {
+			logger::warn("[Reflection Capture] Cannot inspect the ENB D3D11 context vtable");
+			return false;
+		}
+
+		auto captureVTable = std::make_unique<std::array<void*, kD3D11ContextVTableSize>>();
+		std::copy_n(originalVTable, captureVTable->size(), captureVTable->begin());
+		g_reflectionCaptureOriginalPSSetShaderResources =
+			reinterpret_cast<D3D11PSSetShaderResources_t>(
+				(*captureVTable)[kD3D11PSSetShaderResourcesVTableIndex]);
+		g_reflectionCaptureOriginalDraw =
+			reinterpret_cast<D3D11Draw_t>((*captureVTable)[kD3D11DrawVTableIndex]);
+		g_reflectionCaptureOriginalDrawIndexed =
+			reinterpret_cast<D3D11DrawIndexed_t>((*captureVTable)[kD3D11DrawIndexedVTableIndex]);
+		g_reflectionCaptureOriginalDrawIndexedInstanced =
+				reinterpret_cast<D3D11DrawIndexedInstanced_t>(
+				(*captureVTable)[kD3D11DrawIndexedInstancedVTableIndex]);
+		(*captureVTable)[kD3D11PSSetShaderResourcesVTableIndex] =
+			reinterpret_cast<void*>(&ReflectionPSSetShaderResourcesCaptureThunk);
+		(*captureVTable)[kD3D11DrawVTableIndex] = reinterpret_cast<void*>(&VanillaSSLRDrawCaptureThunk);
+		(*captureVTable)[kD3D11DrawIndexedVTableIndex] =
+			reinterpret_cast<void*>(&VanillaSSLRDrawIndexedCaptureThunk);
+		(*captureVTable)[kD3D11DrawIndexedInstancedVTableIndex] =
+			reinterpret_cast<void*>(&ReflectionDrawIndexedInstancedCaptureThunk);
+		if (!REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(a_context), captureVTable->data())) {
+			g_reflectionCaptureOriginalPSSetShaderResources = nullptr;
+			g_reflectionCaptureOriginalDraw = nullptr;
+			g_reflectionCaptureOriginalDrawIndexed = nullptr;
+			g_reflectionCaptureOriginalDrawIndexedInstanced = nullptr;
+			logger::warn("[Reflection Capture] Cannot install the ENB context capture vtable");
+			return false;
+		}
+		g_reflectionCaptureOriginalVTable = originalVTable;
+		g_reflectionCaptureContext = a_context;
+		g_reflectionCaptureVTable = std::move(captureVTable);
+		logger::info("[Reflection Capture] Armed scoped ENB context binding/draw capture");
 		return true;
 	}
 
@@ -2919,6 +3709,85 @@ PSOut8 PSMainMRT8(VSOut input)
 		bool active_{ false };
 	};
 
+	int ENBPuddleWaterRenderThunk(
+		void* a_this,
+		std::uint32_t a2,
+		std::uint32_t a3,
+		std::uint32_t a4)
+	{
+		const bool shouldCorrect =
+			ShouldUseENBProxyCompatibility() &&
+			TryGetENBBool(ENBBoolSetting::kPuddleReflections).value_or(true) &&
+			g_enbPuddleWaterConstantBufferOffset.has_value() &&
+			g_enbPuddleWaterTexture11Offset.has_value();
+
+		UINT width = 0;
+		UINT height = 0;
+		if (shouldCorrect) {
+			auto** texture11Slot = reinterpret_cast<ID3D11ShaderResourceView**>(
+				reinterpret_cast<std::byte*>(a_this) + *g_enbPuddleWaterTexture11Offset);
+			if (!IsReadableProcessRange(texture11Slot, sizeof(*texture11Slot)) ||
+				!GetENBShaderResourceDimensions(*texture11Slot, width, height)) {
+				width = 0;
+				height = 0;
+			}
+		}
+
+		// Fallout's BSWaterShader writes EConstantList0[0].xy (VPOSOffset) as
+		// reciprocal render-target dimensions. ENB's final water shaders address
+		// Texture9/Texture10 with that value, and use Texture11.GetDimensions as
+		// the allocation-domain anchor in their distorted variants. Rebase only
+		// VPOSOffset.xy to that bound allocation; every other constant is preserved.
+		const std::array<float, 2> reciprocalTexture11Size{
+			width ? 1.0f / static_cast<float>(width) : 0.0f,
+			height ? 1.0f / static_cast<float>(height) : 0.0f
+		};
+		const ScopedENBConstantBufferDimensions vposOffset(
+			width && height ? a_this : nullptr,
+			g_enbPuddleWaterConstantBufferOffset.value_or(0),
+			reciprocalTexture11Size,
+			g_enbPuddleWaterConstantBufferPatch);
+		if (shouldCorrect && !vposOffset.IsActive()) {
+			static bool loggedFailure = false;
+			if (!loggedFailure) {
+				logger::warn("[ENB SR] Puddle/water VPOSOffset allocation-domain correction is unavailable");
+				loggedFailure = true;
+			}
+		}
+		return g_enbPuddleWaterRender(a_this, a2, a3, a4);
+	}
+
+	class ScopedENBReflectionCapture
+	{
+	public:
+		explicit ScopedENBReflectionCapture(std::uint32_t a_technique)
+		{
+			if ((g_reflectionCapturePending.load() & kReflectionCaptureENBReflection) == 0 ||
+				a_technique != kENBReflectionSSRTechnique) {
+				return;
+			}
+			g_enbReflectionCaptureTechnique = a_technique;
+			++g_enbReflectionCaptureScopeDepth;
+			active_ = true;
+		}
+
+		~ScopedENBReflectionCapture()
+		{
+			if (active_) {
+				--g_enbReflectionCaptureScopeDepth;
+				if (g_enbReflectionCaptureScopeDepth == 0) {
+					g_enbReflectionCaptureTechnique = 0;
+				}
+			}
+		}
+
+		ScopedENBReflectionCapture(const ScopedENBReflectionCapture&) = delete;
+		ScopedENBReflectionCapture& operator=(const ScopedENBReflectionCapture&) = delete;
+
+	private:
+		bool active_ = false;
+	};
+
 	int ENBReflectionRenderThunk(
 		void* a_this,
 		std::uint32_t a2,
@@ -2931,8 +3800,7 @@ PSOut8 PSMainMRT8(VSOut input)
 		const bool shouldCorrect =
 			reflectionTechnique && ShouldUseENBProxyCompatibility() &&
 			TryGetENBBool(ENBBoolSetting::kReflections).value_or(true);
-		const ScopedENBReflectionColorInput colorInput(
-			a_this, shouldCorrect && technique == kENBReflectionSSRTechnique);
+		const ScopedENBReflectionCapture reflectionCapture(technique.value_or(0));
 		const ScopedENBRenderDomainViewport viewport(
 			a_this, shouldCorrect, kENBTexture0SRVOffset);
 		const bool shouldPatchConstants =
@@ -2955,14 +3823,6 @@ PSOut8 PSMainMRT8(VSOut input)
 			if (!loggedViewportFailure) {
 				logger::warn("[ENB SR] Reflection render-domain viewport correction is unavailable");
 				loggedViewportFailure = true;
-			}
-		}
-		if (shouldCorrect && technique == kENBReflectionSSRTechnique &&
-			!colorInput.IsActive()) {
-			static bool loggedColorInputFailure = false;
-			if (!loggedColorInputFailure) {
-				logger::warn("[ENB SR] Reflection color input substitution is unavailable");
-				loggedColorInputFailure = true;
 			}
 		}
 		return g_enbReflectionRender(a_this, a2, a3, a4);
@@ -3100,6 +3960,136 @@ PSOut8 PSMainMRT8(VSOut input)
 		}
 
 		return true;
+	}
+
+	std::uintptr_t FindENBPuddleDrawCallAddress(
+		HMODULE a_module,
+		const ENBCodeRange& a_code)
+	{
+		const auto handler = FindENBTechniqueHandler(
+			a_module, a_code, "Shader_418BF7EB", "EConstantList2");
+		if (!handler) {
+			return 0;
+		}
+		const auto function = FindENBContainingFunction(a_module, handler->entry);
+		if (!function) {
+			return 0;
+		}
+		constexpr std::array<std::uint8_t, 6> kDrawIndexedCall{
+			0xFF, 0x90, 0xA0, 0x00, 0x00, 0x00  // call qword ptr [rax+A0h]
+		};
+		for (auto cursor = function->begin; cursor + kDrawIndexedCall.size() <= function->end; ++cursor) {
+			if (std::equal(
+				kDrawIndexedCall.begin(), kDrawIndexedCall.end(),
+				reinterpret_cast<const std::uint8_t*>(cursor))) {
+				return cursor;
+			}
+		}
+		return 0;
+	}
+
+	void STDMETHODCALLTYPE ENBPuddleDrawCaptureThunk(
+		ID3D11DeviceContext* a_context,
+		UINT a_indexCount,
+		UINT a_instanceCount,
+		UINT a_startIndexLocation,
+		INT a_baseVertexLocation,
+		UINT a_startInstanceLocation,
+		D3D11DrawIndexedInstanced_t a_draw)
+	{
+		// The original indexed draw is invoked directly by ENB and therefore does
+		// not pass through the context vtable hook. Install the vtable first so
+		// subsequent draws on this exact context can be matched against its MRTs.
+		if ((g_reflectionCapturePending.load() & kReflectionCaptureENBPuddleConsumer) != 0) {
+			InstallReflectionDrawCaptureHook(a_context);
+		}
+		a_draw(
+			a_context, a_indexCount, a_instanceCount, a_startIndexLocation, a_baseVertexLocation, a_startInstanceLocation);
+		if ((g_reflectionCapturePending.load() & kReflectionCaptureENBPuddle) != 0) {
+			CaptureReflectionDrawState(a_context, "enb_puddle_material");
+			CompleteReflectionCapture(kReflectionCaptureENBPuddle);
+		}
+		ArmENBPuddleMaterialConsumerTrace(a_context);
+	}
+
+	bool InstallENBPuddleDrawCaptureHook(std::uintptr_t a_drawCall)
+	{
+		constexpr std::array<std::uint8_t, 6> kExpected{
+			0xFF, 0x90, 0xA0, 0x00, 0x00, 0x00
+		};
+		if (!a_drawCall || !std::equal(
+				kExpected.begin(), kExpected.end(),
+				reinterpret_cast<const std::uint8_t*>(a_drawCall))) {
+			logger::warn("[Reflection Capture] ENB puddle DrawIndexedInstanced call bytes do not match");
+			return false;
+		}
+		if (g_enbPuddleCaptureTrampoline.empty()) {
+			g_enbPuddleCaptureTrampoline.create(
+				kENBPuddleCaptureTrampolineSize, reinterpret_cast<void*>(a_drawCall));
+		}
+		auto* stub = static_cast<std::uint8_t*>(g_enbPuddleCaptureTrampoline.allocate(53));
+		if (!stub) {
+			logger::warn("[Reflection Capture] Cannot allocate ENB puddle capture trampoline");
+			return false;
+		}
+		const std::array<std::uint8_t, 53> stubTemplate{
+			0x48, 0x8B, 0x80, 0xA0, 0x00, 0x00, 0x00,             // mov rax,[rax+A0h]
+			0x48, 0x83, 0xEC, 0x38,                               // sub rsp,38h
+			0x48, 0x89, 0x44, 0x24, 0x30,                         // mov [rsp+30h],rax
+			0x48, 0x8B, 0x44, 0x24, 0x60,                         // mov rax,[rsp+60h]
+			0x48, 0x89, 0x44, 0x24, 0x20,                         // mov [rsp+20h],rax
+			0x48, 0x8B, 0x44, 0x24, 0x68,                         // mov rax,[rsp+68h]
+			0x48, 0x89, 0x44, 0x24, 0x28,                         // mov [rsp+28h],rax
+			0x48, 0xB8,                                           // mov rax,imm64
+			0, 0, 0, 0, 0, 0, 0, 0,
+			0xFF, 0xD0,                                           // call rax
+			0x48, 0x83, 0xC4, 0x38,                               // add rsp,38h
+			0xC3                                                  // ret
+		};
+		std::memcpy(stub, stubTemplate.data(), stubTemplate.size());
+		const auto helper = reinterpret_cast<std::uintptr_t>(&ENBPuddleDrawCaptureThunk);
+		std::memcpy(stub + 38, &helper, sizeof(helper));
+		const auto displacement64 =
+			reinterpret_cast<std::int64_t>(stub) - static_cast<std::int64_t>(a_drawCall + 5);
+		if (displacement64 < std::numeric_limits<std::int32_t>::min() ||
+			displacement64 > std::numeric_limits<std::int32_t>::max()) {
+			logger::warn("[Reflection Capture] ENB puddle trampoline is outside rel32 range");
+			return false;
+		}
+		std::array<std::uint8_t, 6> patch{ 0xE8, 0, 0, 0, 0, 0x90 };
+		const auto displacement = static_cast<std::int32_t>(displacement64);
+		std::memcpy(patch.data() + 1, &displacement, sizeof(displacement));
+		if (!REL::WriteSafeData(a_drawCall, patch)) {
+			logger::warn("[Reflection Capture] Cannot patch ENB puddle DrawIndexedInstanced call site");
+			return false;
+		}
+		logger::info("[Reflection Capture] ENB puddle material draw hook at RVA 0x{:X}",
+			a_drawCall - reinterpret_cast<std::uintptr_t>(FindENBModule()));
+		return true;
+	}
+
+	void UpdateReflectionCaptureRequest(bool a_enabled)
+	{
+		if (!a_enabled) {
+			g_reflectionCapturePending.store(0);
+			ResetReflectionCaptureTrace();
+			return;
+		}
+		if (g_reflectionCapturePending.load() != 0) {
+			return;
+		}
+		g_activeReflectionCaptureSerial.store(g_reflectionCaptureSerial.fetch_add(1) + 1);
+		const auto passes = kReflectionCaptureVanillaSSLR |
+			(enbLoaded ? (kReflectionCaptureENBPuddle | kReflectionCaptureENBReflection |
+				kReflectionCaptureENBPuddleConsumer) : 0u);
+		g_reflectionCapturePending.store(passes);
+		logger::info(
+			"[Reflection Capture] Armed capture {}. Vanilla SSLR{} draw bindings will be written as DDS.",
+			g_activeReflectionCaptureSerial.load(),
+			enbLoaded ? " plus ENB puddle material, its unique resource-identity consumers, and SSR reflection" : "");
+		if (enbLoaded) {
+			InstallENBScreenEffectRenderHooks();
+		}
 	}
 
 	bool CopyENBInputToRenderProxy(
@@ -3486,6 +4476,40 @@ PSOut8 PSMainMRT8(VSOut input)
 		const auto ssaoSetting = FindENBSettingStorage(module, *code, "EnableSSAO");
 		const auto detailedShadowSetting = FindENBSettingStorage(module, *code, "EnableDetailedShadow");
 		const auto depthOfFieldSetting = FindENBSettingStorage(module, *code, "EnableDepthOfField");
+		const auto puddleWaterHandler = FindENBPuddleWaterHandler(module, *code);
+		if (!g_enbPuddleWaterDrawReturnAddress) {
+			const auto drawCall = FindENBPuddleWaterDrawCallAddress(module, *code);
+			if (drawCall) {
+				g_enbPuddleWaterDrawReturnAddress = drawCall + 3;
+				logger::info(
+					"[Reflection Capture] ENB primary puddle/water pass draw at RVA 0x{:X}",
+					drawCall - reinterpret_cast<std::uintptr_t>(module));
+			}
+		}
+
+		if (!g_enbPuddleWaterRender) {
+			if (!puddleWaterHandler) {
+				logger::warn("[ENB SR] Cannot resolve the puddle/water VPOSOffset handler");
+			} else {
+				const auto trampoline = Detours::X64::DetourFunction(
+					puddleWaterHandler->entry,
+					reinterpret_cast<std::uintptr_t>(&ENBPuddleWaterRenderThunk));
+				if (trampoline) {
+					g_enbPuddleWaterConstantBufferOffset =
+						puddleWaterHandler->constantBufferOffset;
+					g_enbPuddleWaterTexture11Offset = puddleWaterHandler->texture11Offset;
+					g_enbPuddleWaterRender =
+						reinterpret_cast<ENBScreenEffectRender_t>(trampoline);
+					logger::info(
+						"[ENB SR] Puddle/water handler RVA 0x{:X}, EConstantList0 +0x{:X}, Texture11 +0x{:X}",
+						puddleWaterHandler->entry - reinterpret_cast<std::uintptr_t>(module),
+						puddleWaterHandler->constantBufferOffset,
+						puddleWaterHandler->texture11Offset);
+				} else {
+					logger::warn("[ENB SR] Failed to install the puddle/water VPOSOffset hook");
+				}
+			}
+		}
 
 		if (!g_enbReflectionRender) {
 			const auto handler = FindENBTechniqueHandler(
@@ -3524,6 +4548,16 @@ PSOut8 PSMainMRT8(VSOut input)
 				logger::warn("[ENB SR] DeferMix Draw call-site hook is unavailable");
 			} else {
 				g_enbDeferMixInstalled = true;
+			}
+		}
+
+		if (!g_enbPuddleCaptureInstalled &&
+			(g_reflectionCapturePending.load() & kReflectionCaptureENBPuddle) != 0) {
+			const auto puddleDrawCall = FindENBPuddleDrawCallAddress(module, *code);
+			if (!puddleDrawCall) {
+				logger::warn("[Reflection Capture] Cannot resolve ENB puddle material DrawIndexedInstanced handoff");
+			} else if (InstallENBPuddleDrawCaptureHook(puddleDrawCall)) {
+				g_enbPuddleCaptureInstalled = true;
 			}
 		}
 
@@ -4696,7 +5730,6 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately_First
 
 		const ScopedENBPrimaryCompositeScope primaryCompositeScope;
 		func(This, a2, a3);
-		CopyENBInputToRenderProxy(3);
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
@@ -4943,6 +5976,7 @@ void Upscaling::LoadSettings()
 {
 	const auto previousUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
 	const bool previousImageSpaceEffectLog = settings.imageSpaceEffectLog != 0;
+	const bool previousReflectionCapture = settings.reflectionCapture != 0;
 
 	CSimpleIniA ini;
 	ini.SetUnicode();
@@ -4960,9 +5994,13 @@ void Upscaling::LoadSettings()
 	settings.osdMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iOnScreenDisplay", 0), 0, 2));
 	settings.taggedTextureDebug = static_cast<uint>(ini.GetLongValue("Settings", "bTaggedTextureDebug", 0) == 1);
 	settings.imageSpaceEffectLog = static_cast<uint>(ini.GetLongValue("Settings", "bImageSpaceEffectLog", 0) == 1);
+	settings.reflectionCapture = static_cast<uint>(ini.GetLongValue("Settings", "bReflectionCapture", 0) == 1);
 	if (!previousImageSpaceEffectLog && settings.imageSpaceEffectLog != 0) {
 		ResetENBNativeImageSpaceEffectLog();
 		logger::info("[ENB IS Log] Enabled; waiting for active effects in the ENB native scope");
+	}
+	if (previousReflectionCapture != (settings.reflectionCapture != 0)) {
+		UpdateReflectionCaptureRequest(settings.reflectionCapture != 0);
 	}
 	const auto legacySharpness = ini.GetDoubleValue("Settings", "fRCASSharpness", 0.2);
 	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", legacySharpness)), 0.0f, 1.0f);
@@ -8001,37 +9039,159 @@ void Upscaling::DestroyUpscalingResources()
 	}
 }
 
+namespace
+{
+	struct alignas(16) SSLRCoordinateCB
+	{
+		float2 allocationUVScale;
+		float2 inverseAllocationUVScale;
+	};
+	static_assert(sizeof(SSLRCoordinateCB) == 16);
+
+	ID3D11Buffer* GetSSLRCoordinateBuffer(float a_widthScale, float a_heightScale)
+	{
+		static std::unique_ptr<ConstantBuffer> coordinateBuffer;
+		static SSLRCoordinateCB currentData{};
+		static bool initialized = false;
+
+		if (!coordinateBuffer) {
+			coordinateBuffer = std::make_unique<ConstantBuffer>(ConstantBufferDesc<SSLRCoordinateCB>(true));
+		}
+
+		const SSLRCoordinateCB data{
+			{ a_widthScale, a_heightScale },
+			{ 1.0f / std::max(a_widthScale, std::numeric_limits<float>::epsilon()),
+				1.0f / std::max(a_heightScale, std::numeric_limits<float>::epsilon()) }
+		};
+		if (!initialized || std::memcmp(&currentData, &data, sizeof(data)) != 0) {
+			coordinateBuffer->Update(data);
+			currentData = data;
+			initialized = true;
+		}
+
+		return coordinateBuffer->CB();
+	}
+
+	std::string_view DescribeSSLRInput(
+		const Upscaling* a_upscaling,
+		ID3D11ShaderResourceView* a_view,
+		std::array<char, 32>& a_storage)
+	{
+		if (!a_view) {
+			return "null";
+		}
+		if (a_upscaling) {
+			for (std::size_t target = 0; target < std::size(a_upscaling->originalRenderTargets); ++target) {
+				if (a_view == reinterpret_cast<ID3D11ShaderResourceView*>(
+						a_upscaling->originalRenderTargets[target].srView)) {
+					const auto result = std::format_to_n(
+						a_storage.data(), a_storage.size() - 1, "original[{}]", target);
+					const auto length = std::min<std::size_t>(
+						static_cast<std::size_t>(result.size), a_storage.size() - 1);
+					a_storage[length] = '\0';
+					return { a_storage.data(), length };
+				}
+				if (a_view == reinterpret_cast<ID3D11ShaderResourceView*>(
+						a_upscaling->proxyRenderTargets[target].srView)) {
+					const auto result = std::format_to_n(
+						a_storage.data(), a_storage.size() - 1, "proxy[{}]", target);
+					const auto length = std::min<std::size_t>(
+						static_cast<std::size_t>(result.size), a_storage.size() - 1);
+					a_storage[length] = '\0';
+					return { a_storage.data(), length };
+				}
+			}
+		}
+		return "external";
+	}
+
+	void LogSSLRBindings(
+		ID3D11DeviceContext* a_context,
+		float a_widthScale,
+		float a_heightScale)
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		if (!a_context || !upscaling || upscaling->settings.imageSpaceEffectLog == 0) {
+			return;
+		}
+
+		std::array<ID3D11ShaderResourceView*, 4> inputs{};
+		a_context->PSGetShaderResources(0, static_cast<UINT>(inputs.size()), inputs.data());
+		std::array<std::array<char, 32>, 4> inputNames{};
+		std::array<UINT, 4> widths{};
+		std::array<UINT, 4> heights{};
+		for (std::size_t index = 0; index < inputs.size(); ++index) {
+			GetENBShaderResourceDimensions(inputs[index], widths[index], heights[index]);
+			const auto name = DescribeSSLRInput(upscaling, inputs[index], inputNames[index]);
+			if (name.data() != inputNames[index].data()) {
+				const auto length = std::min(name.size(), inputNames[index].size() - 1);
+				std::memcpy(inputNames[index].data(), name.data(), length);
+				inputNames[index][length] = '\0';
+			}
+		}
+
+		winrt::com_ptr<ID3D11RenderTargetView> output;
+		a_context->OMGetRenderTargets(1, output.put(), nullptr);
+		UINT outputWidth = 0;
+		UINT outputHeight = 0;
+		GetENBRenderTargetDimensions(output.get(), outputWidth, outputHeight);
+
+		D3D11_VIEWPORT viewport{};
+		UINT viewportCount = 1;
+		a_context->RSGetViewports(&viewportCount, &viewport);
+
+		static std::array<ID3D11ShaderResourceView*, 4> previousInputs{};
+		static std::array<UINT, 4> previousWidths{};
+		static std::array<UINT, 4> previousHeights{};
+		static UINT previousOutputWidth = 0;
+		static UINT previousOutputHeight = 0;
+		static D3D11_VIEWPORT previousViewport{};
+		const bool unchanged = inputs == previousInputs && widths == previousWidths &&
+			heights == previousHeights && outputWidth == previousOutputWidth &&
+			outputHeight == previousOutputHeight &&
+			std::memcmp(&viewport, &previousViewport, sizeof(viewport)) == 0;
+		if (!unchanged) {
+			logger::info(
+				"[ENB SSLR] ratio={:.6f}x{:.6f} viewport={:.3f}x{:.3f} output={}x{} "
+				"t0={} {}x{} t1={} {}x{} t2={} {}x{} t3={} {}x{}",
+				a_widthScale,
+				a_heightScale,
+				viewport.Width,
+				viewport.Height,
+				outputWidth,
+				outputHeight,
+				inputNames[0].data(), widths[0], heights[0],
+				inputNames[1].data(), widths[1], heights[1],
+				inputNames[2].data(), widths[2], heights[2],
+				inputNames[3].data(), widths[3], heights[3]);
+			previousInputs = inputs;
+			previousWidths = widths;
+			previousHeights = heights;
+			previousOutputWidth = outputWidth;
+			previousOutputHeight = outputHeight;
+			previousViewport = viewport;
+		}
+
+		for (auto* input : inputs) {
+			if (input) {
+				input->Release();
+			}
+		}
+	}
+}
+
 void Upscaling::PatchSSRPrepassShader()
 {
 	static auto rendererData = RE::BSGraphics::GetRendererData();
 	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 	const float widthScale = renderTargetManager->dynamicWidthRatio;
 	const float heightScale = renderTargetManager->dynamicHeightRatio;
+	auto buffer = GetSSLRCoordinateBuffer(widthScale, heightScale);
 	if (widthScale == 1.0f && heightScale == 1.0f) {
 		return;
 	}
 
-	struct alignas(16) SSLRProjectionCB
-	{
-		float2 uvScale;
-		float2 inverseUVScale;
-	};
-	static_assert(sizeof(SSLRProjectionCB) == 16);
-
-	static std::unique_ptr<ConstantBuffer> projectionCB;
-	if (!projectionCB) {
-		projectionCB = std::make_unique<ConstantBuffer>(ConstantBufferDesc<SSLRProjectionCB>(true));
-	}
-
-	const SSLRProjectionCB data{
-		{ widthScale, heightScale },
-		{ 1.0f / std::max(widthScale, std::numeric_limits<float>::epsilon()),
-			1.0f / std::max(heightScale, std::numeric_limits<float>::epsilon()) }
-	};
-	projectionCB->Update(data);
-
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
-	auto buffer = projectionCB->CB();
 	context->PSSetConstantBuffers(13, 1, &buffer);
 	context->PSSetShader(GetBSImagespaceShaderSSLRPrepass(), nullptr, 0);
 }
@@ -8039,11 +9199,20 @@ void Upscaling::PatchSSRPrepassShader()
 void Upscaling::PatchSSRShader()
 {
 	static auto rendererData = RE::BSGraphics::GetRendererData();
+	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+	LogSSLRBindings(
+		context,
+		renderTargetManager->dynamicWidthRatio,
+		renderTargetManager->dynamicHeightRatio);
 
-	// Restore the otherwise-unused slot after the immediately preceding prepass.
-	ID3D11Buffer* nullBuffer = nullptr;
-	context->PSSetConstantBuffers(13, 1, &nullBuffer);
+	// The ray equation and depth-mip DDA stay in allocation UV. The scale
+	// supplies the active allocation bounds and converts confidence distances
+	// back to logical UV without perturbing integer mip-cell traversal.
+	auto buffer = GetSSLRCoordinateBuffer(
+		renderTargetManager->dynamicWidthRatio,
+		renderTargetManager->dynamicHeightRatio);
+	context->PSSetConstantBuffers(13, 1, &buffer);
 
 	// Replace the game's SSR pixel shader with our custom one that fixes scaled render targets
 	context->PSSetShader(GetBSImagespaceShaderSSLRRaytracing(), nullptr, 0);

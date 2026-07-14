@@ -17,6 +17,13 @@ cbuffer cb0 : register(b0)
   float4 cb0[1];
 }
 
+// xy is the active allocation-UV extent. zw converts allocation UV to
+// logical screen UV for resolution-independent confidence calculations.
+cbuffer cb13 : register(b13)
+{
+  float4 cb13[1];
+}
+
 #define cmp -
 
 void main(
@@ -85,7 +92,7 @@ void main(
     r6.xyz = r0.yyy * r0.xzw + r1.xyz;
     r0.y = rcp(r6.z);
     r3.xy = cmp(float2(0,0) >= r6.xy);
-    r4.zw = cmp(r6.xy >= float2(1,1));
+    r4.zw = cmp(r6.xy >= cb13[0].xy);
     r1.w = (int)r3.x | (int)r4.z;
     r1.w = (int)r3.y | (int)r1.w;
     r1.w = (int)r4.w | (int)r1.w;
@@ -142,7 +149,7 @@ void main(
       r1.w = 0;
     }
     r4.zw = cmp(float2(0,0) >= r6.xy);
-    r7.xy = cmp(r6.xy >= float2(1,1));
+    r7.xy = cmp(r6.xy >= cb13[0].xy);
     r4.z = (int)r4.z | (int)r7.x;
     r4.z = (int)r4.w | (int)r4.z;
     r4.z = (int)r7.y | (int)r4.z;
@@ -204,7 +211,7 @@ void main(
       r3.y = 2;
     }
     r4.zw = cmp(float2(0,0) >= r6.xy);
-    r7.xy = cmp(r6.xy >= float2(1,1));
+    r7.xy = cmp(r6.xy >= cb13[0].xy);
     r4.z = (int)r4.z | (int)r7.x;
     r4.z = (int)r4.w | (int)r4.z;
     r4.z = (int)r7.y | (int)r4.z;
@@ -266,7 +273,7 @@ void main(
       r3.y = 3;
     }
     r4.zw = cmp(float2(0,0) >= r6.xy);
-    r7.xy = cmp(r6.xy >= float2(1,1));
+    r7.xy = cmp(r6.xy >= cb13[0].xy);
     r4.z = (int)r4.z | (int)r7.x;
     r4.z = (int)r4.w | (int)r4.z;
     r4.z = (int)r7.y | (int)r4.z;
@@ -346,7 +353,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -424,7 +431,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -502,7 +509,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -580,7 +587,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -658,7 +665,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -736,7 +743,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -814,7 +821,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -892,7 +899,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -970,7 +977,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1048,7 +1055,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1126,7 +1133,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1204,7 +1211,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1282,7 +1289,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1360,7 +1367,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1438,7 +1445,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1516,7 +1523,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1594,7 +1601,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1672,7 +1679,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1750,7 +1757,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1828,7 +1835,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1906,7 +1913,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -1984,7 +1991,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -2062,7 +2069,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -2140,7 +2147,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -2218,7 +2225,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -2296,7 +2303,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -2374,7 +2381,7 @@ void main(
     }
     r4.z = cmp(r5.z >= 1);
     r7.xy = cmp(float2(0,0) >= r6.xy);
-    r7.zw = cmp(r6.xy >= float2(1,1));
+    r7.zw = cmp(r6.xy >= cb13[0].xy);
     r5.w = (int)r7.z | (int)r7.x;
     r5.w = (int)r7.y | (int)r5.w;
     r5.w = (int)r7.w | (int)r5.w;
@@ -2452,7 +2459,7 @@ void main(
     }
     r4.x = cmp(r5.z >= 1);
     r4.yz = cmp(float2(0,0) >= r6.xy);
-    r7.xy = cmp(r6.xy >= float2(1,1));
+    r7.xy = cmp(r6.xy >= cb13[0].xy);
     r4.y = (int)r4.y | (int)r7.x;
     r4.y = (int)r4.z | (int)r4.y;
     r4.y = (int)r7.y | (int)r4.y;
@@ -2507,7 +2514,7 @@ void main(
     r0.x = r0.x + r0.x;
     r0.x = min(1, r0.x);
     r0.x = -r0.x * r0.x + 1;
-    r0.zw = -r6.xy + r2.xy;
+    r0.zw = (-r6.xy + r2.xy) * cb13[0].zw;
     r0.z = dot(r0.zw, r0.zw);
     r0.z = sqrt(r0.z);
     r0.z = r0.z * -2 + 1;
@@ -2521,7 +2528,7 @@ void main(
     r0.x = r0.x * r0.y;
     r0.x = r0.x * r0.x;
     r0.yz = cmp(float2(0,0) >= r6.xy);
-    r1.xy = cmp(r6.xy >= float2(1,1));
+    r1.xy = cmp(r6.xy >= cb13[0].xy);
     r0.y = (int)r0.y | (int)r1.x;
     r0.y = (int)r0.z | (int)r0.y;
     r0.y = (int)r1.y | (int)r0.y;
