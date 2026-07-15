@@ -4374,9 +4374,39 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately
 		}
 		if (requiresOverride && enbCompatibilityActive &&
 			TryGetENBBool(ENBBoolSetting::kSubSurfaceScattering).value_or(false)) {
-			// This is the previous compatibility shape: execute the second
-			// BSDFComposite draw without changing its targets, depth, ratios, or viewport.
+			static auto rendererData = RE::BSGraphics::GetRendererData();
+			auto* context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+			std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>
+				drawViewports{};
+			UINT drawViewportCount = static_cast<UINT>(drawViewports.size());
+			context->RSGetViewports(&drawViewportCount, drawViewports.data());
+
+			// ENB's first SSS composite leaves its result in the original RT2.
+			// Bridge that result into the render-sized domain used by the later
+			// composite, but do not let the generic helpers replace or restore
+			// every render target and all of their metadata.
+			const std::initializer_list<int> targets{
+				20, 25, 57, 24, 23, 58, 59, 3, 9, 60, 61, 28, 2, 7, 4
+			};
+			const std::initializer_list<int> inputs{
+				20, 25, 57, 24, 23, 58, 59, 3, 9, 60, 61, 28, 2
+			};
+
+			upscaling->OverrideRenderTargetsSelective(targets, inputs);
+			upscaling->OverrideDepth(true);
+			SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
+			ApplyCurrentViewportDefault(renderTargetManager);
+			// DrawWorld selected RT1 and established the dynamic-resolution
+			// viewport immediately before this call. Ratio 1.0 makes the default
+			// viewport allocation-sized, so restore the caller's exact viewport
+			// for the draw without replacing RT1 or resampling its contents.
+			context->RSSetViewports(drawViewportCount, drawViewports.data());
 			func(This, a2, a3);
+			upscaling->ResetRenderTargetsSelective(targets, { 4 });
+			upscaling->ResetDepth();
+			SetDynamicResolutionRatio(
+				renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio);
+			ApplyCurrentViewportDefault(renderTargetManager);
 			return;
 		}
 		if (requiresOverride) {
