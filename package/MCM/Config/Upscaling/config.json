@@ -164,15 +164,6 @@
 			}
 		},
 		{
-			"id": "bReflectionCapture:Settings",
-			"text": "Reflection capture",
-			"type": "switcher",
-			"help": "Writes one DDS snapshot of the actual vanilla SSLR, ENB puddle material, and ENB SSR reflection draw inputs and outputs. This may briefly stall rendering. Toggle off and on to capture again. (Default: Disabled)",
-			"valueOptions": {
-				"sourceType": "ModSettingInt"
-			}
-		},
-		{
 			"text": "DYNAMIC MULTI FRAME GENERATION",
 			"type": "section"
 		},

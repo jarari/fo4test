@@ -91,7 +91,6 @@ public:
 		uint osdMode = 0;                                           ///< Debug OSD: 0=Off, 1=Compact, 2=Detailed
 		uint taggedTextureDebug = 0;                                ///< Debug tagged texture view: 0=Off, 1=On
 		uint imageSpaceEffectLog = 0;                               ///< Log unique active image-space effects in the ENB native scope
-		uint reflectionCapture = 0;                                 ///< One-shot DDS capture of vanilla SSLR and ENB puddle draw bindings
 		float sharpness = 0.2f;                                       ///< Upscaler sharpness: 0.0=off, 1.0=max
 	};
 
@@ -308,7 +307,6 @@ public:
 	 *
 	 * Injects custom SSR shader that properly handles scaled render targets
 	 */
-	void PatchSSRPrepassShader();
 	void PatchSSRShader();
 
 	/**
@@ -345,7 +343,6 @@ public:
 	 * @return Compiled pixel shader
 	 */
 	ID3D11PixelShader* GetBSImagespaceShaderSSLRRaytracing();
-	ID3D11PixelShader* GetBSImagespaceShaderSSLRPrepass();
 
 	/**
 	 * @brief Get constant buffer for upscaling parameters
@@ -490,7 +487,6 @@ private:
 	winrt::com_ptr<ID3D11ComputeShader> generateFrameGenerationUIColorAlphaCS;  ///< Reticle UI color/alpha extraction shader for frame generation
 	winrt::com_ptr<ID3D11ComputeShader> generateDLSSTransparencyMaskCS;  ///< DLSS transparency/history rejection mask
 	winrt::com_ptr<ID3D11ComputeShader> spatialFallbackUpscaleCS;       ///< Minimal local spatial fallback upscaler
-	winrt::com_ptr<ID3D11PixelShader> BSImagespaceShaderSSLRPrepass;     ///< Corrected SSR projection shader
 	winrt::com_ptr<ID3D11PixelShader> BSImagespaceShaderSSLRRaytracing;  ///< Custom SSR shader
 
 	std::unique_ptr<Texture2D> frameGenerationPreAlphaTexture;
