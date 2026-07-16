@@ -77,6 +77,7 @@ namespace
 	constexpr uint64_t kFeatureRetryGameFrames = 5;
 	constexpr uint32_t kFeatureFailuresBeforeRetryBlock = 3;
 	constexpr uint64_t kTextureMemoryUpgradeReserveBytes = 512ull * 1024ull * 1024ull;
+	constexpr UINT kENBTrackedPSResourceCount = 16;
 	constexpr std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>
 		kNullD3D11ShaderResources{};
 	FILETIME g_lastSettingsWriteTime{};
@@ -93,6 +94,9 @@ namespace
 	winrt::com_ptr<ID3D11RasterizerState> g_enbScaleCopyRasterizerState;
 	winrt::com_ptr<ID3D11Device> g_enbNativeDevice;
 	winrt::com_ptr<ID3D11DeviceContext> g_enbNativeContext;
+	winrt::com_ptr<ID3D11DeviceContext1> g_enbNativeContext1;
+	winrt::com_ptr<ID3DDeviceContextState> g_enbScaleCopyContextState;
+	bool g_enbScaleCopyContextStateInitialized = false;
 	winrt::com_ptr<ID3D11Texture2D> g_enbNativeDepth;
 	winrt::com_ptr<ID3D11ShaderResourceView> g_enbNativeDepthSRV;
 	winrt::com_ptr<ID3D11RenderTargetView> g_enbNativeDepthRTV;
@@ -102,7 +106,13 @@ namespace
 	std::uint32_t* g_enbFullHeight = nullptr;
 	using ENBScreenEffectRender_t = int (*)(void*, std::uint32_t, std::uint32_t, std::uint32_t);
 	using D3D11Draw_t = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
+	using ENBPSSetShader_t = void (STDMETHODCALLTYPE*)(
+		ID3D11DeviceContext*,
+		ID3D11PixelShader*,
+		ID3D11ClassInstance* const*,
+		UINT);
 	ENBScreenEffectRender_t g_enbDetailedShadowRender = nullptr;
+	ENBPSSetShader_t g_enbPSSetShader = nullptr;
 	bool g_enbDetailedShadowUsesFirstPersonModelPath = false;
 	struct ENBDetailedShadowBufferLayout
 	{
@@ -368,8 +378,7 @@ namespace
 	class ScopedENBHDRFinalCompositeEffects
 	{
 	public:
-		ScopedENBHDRFinalCompositeEffects(void* a_effect, int32_t a_effectIndex) :
-			previousEffects_(g_enbHDRFinalCompositeEffects)
+		ScopedENBHDRFinalCompositeEffects(void* a_effect, int32_t a_effectIndex)
 		{
 			if (!a_effect || g_enbNativeImageSpaceParamScopeDepth <= 0 || a_effectIndex != 3) {
 				return;
@@ -383,6 +392,7 @@ namespace
 				return;
 			}
 
+			previousEffects_ = g_enbHDRFinalCompositeEffects;
 			g_enbHDRFinalCompositeEffects = { childEffects[2], childEffects[3] };
 			active_ = true;
 		}
@@ -412,15 +422,15 @@ namespace
 	class ScopedENBNativeImageSpaceShaders
 	{
 	public:
-		ScopedENBNativeImageSpaceShaders(void* a_effect, int32_t a_effectIndex) :
-			previousShaders_(g_enbNativeImageSpaceShaders),
-			previousCount_(g_enbNativeImageSpaceShaderCount)
+		ScopedENBNativeImageSpaceShaders(void* a_effect, int32_t a_effectIndex)
 		{
 			if (!a_effect || g_enbNativeImageSpaceParamScopeDepth <= 0 ||
 				!IsENBNativeImageSpaceEffectIndex(a_effectIndex)) {
 				return;
 			}
 
+			previousShaders_ = g_enbNativeImageSpaceShaders;
+			previousCount_ = g_enbNativeImageSpaceShaderCount;
 			g_enbNativeImageSpaceShaders.fill(nullptr);
 			if (a_effectIndex == 15) {
 				// GammaCorrectLUT is itself a BSImagespaceShader rather than a
@@ -556,8 +566,7 @@ namespace
 	class ScopedENBRefractionCompositeEffect
 	{
 	public:
-		ScopedENBRefractionCompositeEffect(void* a_effect, int32_t a_effectIndex) :
-			previousEffect_(g_enbRefractionCompositeEffect)
+		ScopedENBRefractionCompositeEffect(void* a_effect, int32_t a_effectIndex)
 		{
 			if (!a_effect || g_enbNativeImageSpaceParamScopeDepth <= 0 || a_effectIndex != 5) {
 				return;
@@ -571,6 +580,7 @@ namespace
 				return;
 			}
 
+			previousEffect_ = g_enbRefractionCompositeEffect;
 			g_enbRefractionCompositeEffect = effectList[0];
 			active_ = true;
 		}
@@ -892,18 +902,36 @@ namespace
 		if (!g_enbNativeContext || g_enbNativeContext.get() == a_wrappedContext) {
 			return false;
 		}
+		struct Cache
+		{
+			ID3D11DeviceContext* nativeContext{};
+			ID3D11DeviceContext* wrappedContext{};
+			bool canBypass{};
+		};
+		static Cache cache;
+		if (cache.nativeContext == g_enbNativeContext.get() &&
+			cache.wrappedContext == a_wrappedContext) {
+			return cache.canBypass;
+		}
 
 		auto*** const object = reinterpret_cast<void***>(g_enbNativeContext.get());
 		if (!object || !*object || !**object) {
+			cache = { g_enbNativeContext.get(), a_wrappedContext, false };
 			return false;
 		}
 
 		MEMORY_BASIC_INFORMATION memory{};
 		if (VirtualQuery(**object, &memory, sizeof(memory)) != sizeof(memory)) {
+			cache = { g_enbNativeContext.get(), a_wrappedContext, false };
 			return false;
 		}
 		const auto enbModule = FindENBModule();
-		return enbModule && memory.AllocationBase != enbModule;
+		cache = {
+			g_enbNativeContext.get(),
+			a_wrappedContext,
+			enbModule && memory.AllocationBase != enbModule
+		};
+		return cache.canBypass;
 	}
 
 	bool EnsureENBScaleCopyResources(ID3D11Device* a_device)
@@ -1172,6 +1200,54 @@ PSOut8 PSMainMRT8(VSOut input)
 		return true;
 	}
 
+	bool EnsureENBScaleCopyContextState(
+		ID3D11Device* a_device,
+		ID3D11DeviceContext* a_context)
+	{
+		static ID3D11DeviceContext* unsupportedContext = nullptr;
+		if (g_enbNativeContext1 && g_enbScaleCopyContextState &&
+			g_enbNativeContext1.get() == a_context) {
+			return true;
+		}
+		if (!a_device || !a_context || a_context != g_enbNativeContext.get()) {
+			return false;
+		}
+		if (unsupportedContext == a_context) {
+			return false;
+		}
+
+		g_enbScaleCopyContextStateInitialized = false;
+		g_enbScaleCopyContextState = nullptr;
+		g_enbNativeContext1 = nullptr;
+		winrt::com_ptr<ID3D11Device1> device1;
+		winrt::com_ptr<ID3D11DeviceContext1> context1;
+		if (FAILED(a_device->QueryInterface(IID_PPV_ARGS(device1.put()))) ||
+			FAILED(a_context->QueryInterface(IID_PPV_ARGS(context1.put())))) {
+			unsupportedContext = a_context;
+			return false;
+		}
+
+		const auto featureLevel = a_device->GetFeatureLevel();
+		D3D_FEATURE_LEVEL chosenFeatureLevel{};
+		winrt::com_ptr<ID3DDeviceContextState> contextState;
+		if (FAILED(device1->CreateDeviceContextState(
+				0,
+				&featureLevel,
+				1,
+				D3D11_SDK_VERSION,
+				__uuidof(ID3D11DeviceContext1),
+				&chosenFeatureLevel,
+				contextState.put())) ||
+			!contextState) {
+			unsupportedContext = a_context;
+			return false;
+		}
+
+		g_enbNativeContext1 = std::move(context1);
+		g_enbScaleCopyContextState = std::move(contextState);
+		return true;
+	}
+
 	struct ENBScaleCopyJob
 	{
 		ID3D11Texture2D* sourceTexture{ nullptr };
@@ -1179,8 +1255,6 @@ PSOut8 PSMainMRT8(VSOut input)
 		ID3D11RenderTargetView* destinationRTV{ nullptr };
 		ID3D11Texture2D* destinationTexture{ nullptr };
 		D3D11_TEXTURE2D_DESC destinationDesc{};
-		DXGI_FORMAT sourceViewFormat{ DXGI_FORMAT_UNKNOWN };
-		DXGI_FORMAT destinationViewFormat{ DXGI_FORMAT_UNKNOWN };
 	};
 
 	class ScopedENBProxyPromotionBoundary
@@ -1199,12 +1273,12 @@ PSOut8 PSMainMRT8(VSOut input)
 				&savedDSV_);
 			context_->PSGetShaderResources(
 				0,
-				D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+				kENBTrackedPSResourceCount,
 				savedPSResources_.data());
 
 			context_->PSSetShaderResources(
 				0,
-				D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+				kENBTrackedPSResourceCount,
 				kNullD3D11ShaderResources.data());
 			context_->OMSetRenderTargets(0, nullptr, nullptr);
 			active_ = true;
@@ -1222,7 +1296,7 @@ PSOut8 PSMainMRT8(VSOut input)
 			// bind. Internal promotion draws run on the native context between them.
 			context_->PSSetShaderResources(
 				0,
-				D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+				kENBTrackedPSResourceCount,
 				savedPSResources_.data());
 			context_->OMSetRenderTargets(
 				D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
@@ -1252,7 +1326,7 @@ PSOut8 PSMainMRT8(VSOut input)
 	private:
 		ID3D11DeviceContext* context_{ nullptr };
 		bool active_{ false };
-		std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> savedPSResources_{};
+		std::array<ID3D11ShaderResourceView*, kENBTrackedPSResourceCount> savedPSResources_{};
 		std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> savedRTVs_{};
 		ID3D11DepthStencilView* savedDSV_{ nullptr };
 	};
@@ -1274,39 +1348,49 @@ PSOut8 PSMainMRT8(VSOut input)
 				a_savedPSResourceCount,
 				1,
 				D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT);
-			context_->VSGetShader(savedVS_.put(), nullptr, nullptr);
-			context_->PSGetShader(savedPS_.put(), nullptr, nullptr);
-			context_->GSGetShader(savedGS_.put(), nullptr, nullptr);
-			context_->HSGetShader(savedHS_.put(), nullptr, nullptr);
-			context_->DSGetShader(savedDS_.put(), nullptr, nullptr);
-			context_->IAGetInputLayout(savedInputLayout_.put());
-			context_->IAGetPrimitiveTopology(&savedTopology_);
-			context_->PSGetSamplers(0, 1, savedSampler_.put());
-			context_->PSGetShaderResources(0, savedPSResourceCount_, savedPSResources_.data());
-			context_->OMGetRenderTargets(
-				D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
-				savedRTVs_.data(),
-				&savedDSV_);
-			context_->OMGetBlendState(savedBlendState_.put(), savedBlendFactor_, &savedSampleMask_);
-			context_->OMGetDepthStencilState(savedDepthStencilState_.put(), &savedStencilRef_);
-			context_->RSGetState(savedRasterizerState_.put());
-			savedViewportCount_ = static_cast<UINT>(savedViewports_.size());
-			context_->RSGetViewports(&savedViewportCount_, savedViewports_.data());
+			if (EnsureENBScaleCopyContextState(a_device, a_context)) {
+				g_enbNativeContext1->SwapDeviceContextState(
+					g_enbScaleCopyContextState.get(),
+					savedContextState_.put());
+				usesContextState_ = savedContextState_ != nullptr;
+			}
+			if (!usesContextState_) {
+				context_->VSGetShader(savedVS_.put(), nullptr, nullptr);
+				context_->PSGetShader(savedPS_.put(), nullptr, nullptr);
+				context_->GSGetShader(savedGS_.put(), nullptr, nullptr);
+				context_->HSGetShader(savedHS_.put(), nullptr, nullptr);
+				context_->DSGetShader(savedDS_.put(), nullptr, nullptr);
+				context_->IAGetInputLayout(savedInputLayout_.put());
+				context_->IAGetPrimitiveTopology(&savedTopology_);
+				context_->PSGetSamplers(0, 1, savedSampler_.put());
+				context_->PSGetShaderResources(0, savedPSResourceCount_, savedPSResources_.data());
+				context_->OMGetRenderTargets(
+					D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+					savedRTVs_.data(),
+					&savedDSV_);
+				context_->OMGetBlendState(savedBlendState_.put(), savedBlendFactor_, &savedSampleMask_);
+				context_->OMGetDepthStencilState(savedDepthStencilState_.put(), &savedStencilRef_);
+				context_->RSGetState(savedRasterizerState_.put());
+				savedViewportCount_ = static_cast<UINT>(savedViewports_.size());
+				context_->RSGetViewports(&savedViewportCount_, savedViewports_.data());
+			}
 
-			context_->PSSetShaderResources(0, savedPSResourceCount_, kNullD3D11ShaderResources.data());
-			const float blendFactor[4]{};
-			context_->OMSetBlendState(g_enbScaleCopyBlendState.get(), blendFactor, 0xffffffff);
-			context_->OMSetDepthStencilState(g_enbScaleCopyDepthStencilState.get(), 0);
-			context_->RSSetState(g_enbScaleCopyRasterizerState.get());
-			context_->IASetInputLayout(nullptr);
-			context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-			context_->VSSetShader(g_enbScaleCopyVS.get(), nullptr, 0);
-			context_->PSSetShader(g_enbScaleCopyPS.get(), nullptr, 0);
-			context_->GSSetShader(nullptr, nullptr, 0);
-			context_->HSSetShader(nullptr, nullptr, 0);
-			context_->DSSetShader(nullptr, nullptr, 0);
-			ID3D11SamplerState* sampler = g_enbScaleCopySampler.get();
-			context_->PSSetSamplers(0, 1, &sampler);
+			if (!usesContextState_ || !g_enbScaleCopyContextStateInitialized) {
+				context_->PSSetShaderResources(0, savedPSResourceCount_, kNullD3D11ShaderResources.data());
+				const float blendFactor[4]{};
+				context_->OMSetBlendState(g_enbScaleCopyBlendState.get(), blendFactor, 0xffffffff);
+				context_->OMSetDepthStencilState(g_enbScaleCopyDepthStencilState.get(), 0);
+				context_->RSSetState(g_enbScaleCopyRasterizerState.get());
+				context_->IASetInputLayout(nullptr);
+				context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+				context_->VSSetShader(g_enbScaleCopyVS.get(), nullptr, 0);
+				context_->PSSetShader(g_enbScaleCopyPS.get(), nullptr, 0);
+				context_->GSSetShader(nullptr, nullptr, 0);
+				context_->HSSetShader(nullptr, nullptr, 0);
+				context_->DSSetShader(nullptr, nullptr, 0);
+				ID3D11SamplerState* sampler = g_enbScaleCopySampler.get();
+				context_->PSSetSamplers(0, 1, &sampler);
+			}
 			active_ = true;
 		}
 
@@ -1317,6 +1401,14 @@ PSOut8 PSMainMRT8(VSOut input)
 			}
 
 			context_->PSSetShaderResources(0, savedPSResourceCount_, kNullD3D11ShaderResources.data());
+			if (usesContextState_) {
+				g_enbNativeContext1->SwapDeviceContextState(
+					savedContextState_.get(),
+					g_enbScaleCopyContextState.put());
+				g_enbScaleCopyContextStateInitialized = g_enbScaleCopyContextState != nullptr;
+				return;
+			}
+
 			context_->VSSetShader(savedVS_.get(), nullptr, 0);
 			context_->PSSetShader(savedPS_.get(), nullptr, 0);
 			context_->GSSetShader(savedGS_.get(), nullptr, 0);
@@ -1357,6 +1449,7 @@ PSOut8 PSMainMRT8(VSOut input)
 		ScopedENBScaleCopyState& operator=(const ScopedENBScaleCopyState&) = delete;
 
 		bool IsActive() const { return active_; }
+		bool UsesContextState() const { return usesContextState_; }
 
 		bool Draw(
 			ID3D11ShaderResourceView* a_sourceSRV,
@@ -1430,9 +1523,7 @@ PSOut8 PSMainMRT8(VSOut input)
 					job.destinationDesc.Width != first.destinationDesc.Width ||
 					job.destinationDesc.Height != first.destinationDesc.Height ||
 					job.destinationDesc.SampleDesc.Count != first.destinationDesc.SampleDesc.Count ||
-					job.destinationDesc.SampleDesc.Quality != first.destinationDesc.SampleDesc.Quality ||
-					job.sourceViewFormat != first.sourceViewFormat ||
-					job.destinationViewFormat != first.destinationViewFormat) {
+					job.destinationDesc.SampleDesc.Quality != first.destinationDesc.SampleDesc.Quality) {
 					return false;
 				}
 				sources[i] = job.sourceSRV;
@@ -1474,7 +1565,9 @@ PSOut8 PSMainMRT8(VSOut input)
 
 		ID3D11DeviceContext* context_{ nullptr };
 		bool active_{ false };
+		bool usesContextState_{ false };
 		UINT savedPSResourceCount_{ 1 };
+		winrt::com_ptr<ID3DDeviceContextState> savedContextState_;
 		winrt::com_ptr<ID3D11VertexShader> savedVS_;
 		winrt::com_ptr<ID3D11PixelShader> savedPS_;
 		winrt::com_ptr<ID3D11GeometryShader> savedGS_;
@@ -1506,14 +1599,16 @@ PSOut8 PSMainMRT8(VSOut input)
 		UINT a_outputHeight = 0)
 	{
 		auto* resourceDevice = a_device;
+		auto* resourceContext = a_context;
 		if (EnsureENBNativeD3D11Context(a_destinationTexture) &&
 			CanBypassENBD3D11Context(a_context)) {
-			// Create helper shaders/states on the same real device used by the
-			// native fast path. ENB's context wrapper can forward those native
-			// objects, while the inverse is not guaranteed for wrapper-created ones.
+			// Helper copies do not participate in ENB's pass classification. Submit
+			// them on the real context so every state transition avoids the wrapper
+			// and can use the D3D11.1 context-state fast path.
 			resourceDevice = g_enbNativeDevice.get();
+			resourceContext = g_enbNativeContext.get();
 		}
-		ScopedENBScaleCopyState state(resourceDevice, a_context);
+		ScopedENBScaleCopyState state(resourceDevice, resourceContext);
 		return state.Draw(
 			a_sourceSRV,
 			a_destinationRTV,
@@ -2020,6 +2115,40 @@ PSOut8 PSMainMRT8(VSOut input)
 			protection == PAGE_WRITECOPY ||
 			protection == PAGE_EXECUTE_READWRITE ||
 			protection == PAGE_EXECUTE_WRITECOPY;
+	}
+
+	bool IsReadableProcessRange(const void* a_address, std::size_t a_size)
+	{
+		if (!a_address || a_size == 0) {
+			return false;
+		}
+
+		const auto begin = reinterpret_cast<std::uintptr_t>(a_address);
+		if (begin > std::numeric_limits<std::uintptr_t>::max() - a_size) {
+			return false;
+		}
+		const auto end = begin + a_size;
+		auto current = begin;
+		while (current < end) {
+			MEMORY_BASIC_INFORMATION memory{};
+			if (VirtualQuery(reinterpret_cast<const void*>(current), &memory, sizeof(memory)) !=
+					sizeof(memory) ||
+				memory.State != MEM_COMMIT ||
+				(memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+				return false;
+			}
+
+			const auto regionBegin = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+			if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - regionBegin) {
+				return false;
+			}
+			const auto regionEnd = regionBegin + memory.RegionSize;
+			if (current < regionBegin || regionEnd <= current) {
+				return false;
+			}
+			current = std::min(end, regionEnd);
+		}
+		return true;
 	}
 
 	bool TryResolveENBRIPRelativeLEA(
@@ -3010,6 +3139,548 @@ PSOut8 PSMainMRT8(VSOut input)
 		return g_enbDepthOfFieldRender(a_this, a2, a3, a4);
 	}
 
+	constexpr std::uint32_t kENBSSSProjectionShaderHash = 0xB0CA0F9C;
+	constexpr std::size_t kENBSSSProjectionShaderSize = 8848;
+	// ENB 0.501 wrapper layout. Installation rejects every other ENB version.
+	constexpr std::ptrdiff_t kENBPixelShaderHashOffset = 0x8;
+	constexpr std::ptrdiff_t kENBPixelShaderNativeAlternateOffset = 0x2D0;
+	constexpr std::ptrdiff_t kENBPixelShaderBytecodeOffset = 0x2D8;
+	constexpr std::ptrdiff_t kENBPixelShaderBytecodeSizeOffset = 0x2E0;
+	// Exact immediate locations in the checksum-gated 8,848-byte shader revision.
+	constexpr std::size_t kENBProjectionScaleImmediateOffset = 0x73C;
+	constexpr std::size_t kENBProjectionOffsetImmediateOffset = 0x750;
+	constexpr std::array<std::uint8_t, 16> kENBSSSProjectionShaderChecksum{
+		0x4A, 0xAB, 0x0D, 0xBF, 0xF5, 0xC1, 0x44, 0xE4,
+		0x3B, 0x06, 0x70, 0x25, 0xC8, 0xB4, 0x68, 0xA5
+	};
+
+	struct ENBSSSProjectionShaderCache
+	{
+		ID3D11Device* device{};
+		UINT outputWidth{};
+		UINT outputHeight{};
+		float viewportWidth{};
+		float viewportHeight{};
+		winrt::com_ptr<ID3D11PixelShader> shader;
+	};
+	struct ENBSSSProjectionBinding
+	{
+		ID3D11PixelShader* wrapper{};
+		ID3D11PixelShader** alternateSlot{};
+		ID3D11PixelShader* originalAlternate{};
+	};
+
+	ENBSSSProjectionShaderCache g_enbSSSProjectionShaderCache;
+	ENBSSSProjectionBinding g_enbSSSProjectionBinding;
+	std::uintptr_t* g_enbPSSetShaderVtableSlot = nullptr;
+	bool g_enbPSSetShaderHookInstalled = false;
+	bool g_enbSSSProjectionDiscoveryActive = false;
+	bool g_enbSSSProjectionDiscoveryRejected = false;
+
+	std::array<std::uint32_t, 4> ComputeDXBCChecksum(
+		const std::uint8_t* a_container,
+		std::size_t a_containerSize)
+	{
+		constexpr std::array<std::uint32_t, 64> shifts{
+			7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+			5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+			4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+			6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+		};
+		constexpr std::array<std::uint32_t, 64> constants{
+			0xD76AA478, 0xE8C7B756, 0x242070DB, 0xC1BDCEEE,
+			0xF57C0FAF, 0x4787C62A, 0xA8304613, 0xFD469501,
+			0x698098D8, 0x8B44F7AF, 0xFFFF5BB1, 0x895CD7BE,
+			0x6B901122, 0xFD987193, 0xA679438E, 0x49B40821,
+			0xF61E2562, 0xC040B340, 0x265E5A51, 0xE9B6C7AA,
+			0xD62F105D, 0x02441453, 0xD8A1E681, 0xE7D3FBC8,
+			0x21E1CDE6, 0xC33707D6, 0xF4D50D87, 0x455A14ED,
+			0xA9E3E905, 0xFCEFA3F8, 0x676F02D9, 0x8D2A4C8A,
+			0xFFFA3942, 0x8771F681, 0x6D9D6122, 0xFDE5380C,
+			0xA4BEEA44, 0x4BDECFA9, 0xF6BB4B60, 0xBEBFBC70,
+			0x289B7EC6, 0xEAA127FA, 0xD4EF3085, 0x04881D05,
+			0xD9D4D039, 0xE6DB99E5, 0x1FA27CF8, 0xC4AC5665,
+			0xF4292244, 0x432AFF97, 0xAB9423A7, 0xFC93A039,
+			0x655B59C3, 0x8F0CCC92, 0xFFEFF47D, 0x85845DD1,
+			0x6FA87E4F, 0xFE2CE6E0, 0xA3014314, 0x4E0811A1,
+			0xF7537E82, 0xBD3AF235, 0x2AD7D2BB, 0xEB86D391
+		};
+
+		if (!a_container || a_containerSize < 20) {
+			return {};
+		}
+		const auto* data = a_container + 20;
+		const auto dataSize = a_containerSize - 20;
+		const auto completeSize = dataSize - dataSize % 64;
+		const auto tailSize = dataSize - completeSize;
+		std::vector<std::uint8_t> padded(data, data + completeSize);
+		padded.reserve(completeSize + 128);
+		const auto appendWord = [&padded](std::uint32_t a_value) {
+			const auto offset = padded.size();
+			padded.resize(offset + sizeof(a_value));
+			std::memcpy(padded.data() + offset, &a_value, sizeof(a_value));
+		};
+
+		const auto bitLength = static_cast<std::uint32_t>(dataSize * 8);
+		const auto finalWord = (bitLength >> 2) | 1u;
+		const auto* tail = data + completeSize;
+		if (tailSize >= 56) {
+			padded.insert(padded.end(), tail, tail + tailSize);
+			padded.push_back(0x80);
+			padded.resize(padded.size() + 63 - tailSize, 0);
+			appendWord(bitLength);
+			padded.resize(padded.size() + 56, 0);
+			appendWord(finalWord);
+		} else {
+			appendWord(bitLength);
+			padded.insert(padded.end(), tail, tail + tailSize);
+			padded.push_back(0x80);
+			padded.resize(padded.size() + 55 - tailSize, 0);
+			appendWord(finalWord);
+		}
+
+		std::array<std::uint32_t, 4> state{
+			0x67452301,
+			0xEFCDAB89,
+			0x98BADCFE,
+			0x10325476
+		};
+		const auto rotateLeft = [](std::uint32_t a_value, std::uint32_t a_shift) {
+			return (a_value << a_shift) | (a_value >> (32 - a_shift));
+		};
+		for (std::size_t blockOffset = 0; blockOffset < padded.size(); blockOffset += 64) {
+			std::array<std::uint32_t, 16> words{};
+			std::memcpy(words.data(), padded.data() + blockOffset, 64);
+			auto a = state[0];
+			auto b = state[1];
+			auto c = state[2];
+			auto d = state[3];
+			for (std::uint32_t index = 0; index < 64; ++index) {
+				std::uint32_t function = 0;
+				std::uint32_t wordIndex = 0;
+				if (index < 16) {
+					function = (b & c) | (~b & d);
+					wordIndex = index;
+				} else if (index < 32) {
+					function = (d & b) | (~d & c);
+					wordIndex = (5 * index + 1) % 16;
+				} else if (index < 48) {
+					function = b ^ c ^ d;
+					wordIndex = (3 * index + 5) % 16;
+				} else {
+					function = c ^ (b | ~d);
+					wordIndex = (7 * index) % 16;
+				}
+
+				const auto nextB = b + rotateLeft(
+					a + function + constants[index] + words[wordIndex],
+					shifts[index]);
+				a = d;
+				d = c;
+				c = b;
+				b = nextB;
+			}
+			state[0] += a;
+			state[1] += b;
+			state[2] += c;
+			state[3] += d;
+		}
+		return state;
+	}
+
+	bool IsSupportedENBSSSProjectionShader(const void* a_bytecode, std::uint32_t a_size)
+	{
+		if (!a_bytecode || a_size != kENBSSSProjectionShaderSize ||
+			!IsReadableProcessRange(a_bytecode, a_size) ||
+			std::memcmp(a_bytecode, "DXBC", 4) != 0 ||
+			std::memcmp(
+				static_cast<const std::byte*>(a_bytecode) + 4,
+				kENBSSSProjectionShaderChecksum.data(),
+				kENBSSSProjectionShaderChecksum.size()) != 0) {
+			return false;
+		}
+		std::uint32_t containerSize = 0;
+		std::memcpy(
+			&containerSize,
+			static_cast<const std::byte*>(a_bytecode) + 24,
+			sizeof(containerSize));
+		return containerSize == a_size;
+	}
+
+	winrt::com_ptr<ID3D11PixelShader> CreateENBSSSProjectionShader(
+		ID3D11Device* a_device,
+		const void* a_bytecode,
+		std::uint32_t a_bytecodeSize,
+		UINT a_outputWidth,
+		UINT a_outputHeight,
+		const D3D11_VIEWPORT& a_viewport)
+	{
+		winrt::com_ptr<ID3D11PixelShader> result;
+		std::vector<std::uint8_t> patched(a_bytecodeSize);
+		std::memcpy(patched.data(), a_bytecode, patched.size());
+
+		const float projectionScaleX =
+			2.0f * static_cast<float>(a_outputWidth) / a_viewport.Width;
+		const float projectionScaleY =
+			2.0f * static_cast<float>(a_outputHeight) / a_viewport.Height;
+		// Exact live-test edit: change only the first two immediates of each
+		// float4 used by the cubemap view-ray projection MAD.
+		const std::array<float, 2> projectionScale{
+			projectionScaleX,
+			projectionScaleY
+		};
+		const std::array<float, 2> projectionOffset{
+			-1.0f,
+			1.0f - projectionScaleY
+		};
+		std::memcpy(
+			patched.data() + kENBProjectionScaleImmediateOffset,
+			projectionScale.data(),
+			sizeof(projectionScale));
+		std::memcpy(
+			patched.data() + kENBProjectionOffsetImmediateOffset,
+			projectionOffset.data(),
+			sizeof(projectionOffset));
+		const auto checksum = ComputeDXBCChecksum(patched.data(), patched.size());
+		std::memcpy(patched.data() + 4, checksum.data(), sizeof(checksum));
+
+		const auto hr = a_device->CreatePixelShader(
+			patched.data(),
+			patched.size(),
+			nullptr,
+			result.put());
+		if (FAILED(hr) || !result) {
+			logger::warn(
+				"[ENB SSS] Cannot create projection shader 0x{:08X}: 0x{:08X}",
+				kENBSSSProjectionShaderHash,
+				static_cast<std::uint32_t>(hr));
+			return {};
+		}
+
+		logger::info(
+			"[ENB SSS] Projection shader 0x{:08X}: output={}x{}, viewport="
+			"({:.3f},{:.3f}) {:.3f}x{:.3f}, mad=({:.6f},{:.6f})+({:.6f},{:.6f})",
+			kENBSSSProjectionShaderHash,
+			a_outputWidth,
+			a_outputHeight,
+			a_viewport.TopLeftX,
+			a_viewport.TopLeftY,
+			a_viewport.Width,
+			a_viewport.Height,
+			projectionScaleX,
+			projectionScaleY,
+			projectionOffset[0],
+			projectionOffset[1]);
+		return result;
+	}
+
+	ID3D11PixelShader* GetENBSSSProjectionShader(
+		ID3D11DeviceContext* a_context,
+		ID3D11PixelShader* a_originalShader,
+		const void* a_bytecode,
+		std::uint32_t a_bytecodeSize)
+	{
+		if (!a_context || !a_originalShader ||
+			!IsSupportedENBSSSProjectionShader(a_bytecode, a_bytecodeSize)) {
+			return nullptr;
+		}
+
+		D3D11_VIEWPORT viewport{};
+		UINT viewportCount = 1;
+		a_context->RSGetViewports(&viewportCount, &viewport);
+		if (viewportCount != 1 || !std::isfinite(viewport.TopLeftX) ||
+			!std::isfinite(viewport.TopLeftY) || !std::isfinite(viewport.Width) ||
+			!std::isfinite(viewport.Height) || viewport.Width < 1.0f ||
+			viewport.Height < 1.0f) {
+			return nullptr;
+		}
+
+		winrt::com_ptr<ID3D11RenderTargetView> output;
+		a_context->OMGetRenderTargets(1, output.put(), nullptr);
+		UINT outputWidth = 0;
+		UINT outputHeight = 0;
+		if (!GetENBRenderTargetDimensions(output.get(), outputWidth, outputHeight)) {
+			return nullptr;
+		}
+
+		constexpr float kViewportTolerance = 0.5f;
+		if (viewport.TopLeftX < -kViewportTolerance ||
+			viewport.TopLeftY < -kViewportTolerance ||
+			viewport.TopLeftX + viewport.Width >
+				static_cast<float>(outputWidth) + kViewportTolerance ||
+			viewport.TopLeftY + viewport.Height >
+				static_cast<float>(outputHeight) + kViewportTolerance) {
+			return nullptr;
+		}
+		// The accepted live test covered the zero-origin SSS viewport. Do not infer
+		// a projection convention for a different viewport placement.
+		if (std::abs(viewport.TopLeftX) >= 0.01f ||
+			std::abs(viewport.TopLeftY) >= 0.01f) {
+			return nullptr;
+		}
+		if (std::abs(viewport.Width - static_cast<float>(outputWidth)) < 0.01f &&
+			std::abs(viewport.Height - static_cast<float>(outputHeight)) < 0.01f) {
+			return nullptr;
+		}
+
+		winrt::com_ptr<ID3D11Device> device;
+		a_originalShader->GetDevice(device.put());
+		if (!device) {
+			return nullptr;
+		}
+
+		if (g_enbSSSProjectionShaderCache.shader &&
+			g_enbSSSProjectionShaderCache.device == device.get() &&
+			g_enbSSSProjectionShaderCache.outputWidth == outputWidth &&
+			g_enbSSSProjectionShaderCache.outputHeight == outputHeight &&
+			g_enbSSSProjectionShaderCache.viewportWidth == viewport.Width &&
+			g_enbSSSProjectionShaderCache.viewportHeight == viewport.Height) {
+			return g_enbSSSProjectionShaderCache.shader.get();
+		}
+
+		auto shader = CreateENBSSSProjectionShader(
+			device.get(),
+			a_bytecode,
+			a_bytecodeSize,
+			outputWidth,
+			outputHeight,
+			viewport);
+		if (!shader) {
+			return nullptr;
+		}
+
+		g_enbSSSProjectionShaderCache = {
+			device.get(),
+			outputWidth,
+			outputHeight,
+			viewport.Width,
+			viewport.Height,
+			std::move(shader)
+		};
+		return g_enbSSSProjectionShaderCache.shader.get();
+	}
+
+	ID3D11PixelShader* PrepareENBSSSProjectionSubstitution(
+		ID3D11DeviceContext* a_context,
+		ID3D11PixelShader* a_shaderWrapper,
+		ID3D11PixelShader*** a_alternateShaderSlot)
+	{
+		if (!g_enbSSSProjectionDiscoveryActive || !a_context || !a_shaderWrapper ||
+			!a_alternateShaderSlot || !IsReadableProcessRange(
+				a_shaderWrapper,
+				kENBPixelShaderBytecodeSizeOffset + sizeof(std::uint32_t))) {
+			return nullptr;
+		}
+
+		const auto shader = reinterpret_cast<std::byte*>(a_shaderWrapper);
+		std::uint32_t hash = 0;
+		std::memcpy(&hash, shader + kENBPixelShaderHashOffset, sizeof(hash));
+		if (hash != kENBSSSProjectionShaderHash) {
+			return nullptr;
+		}
+
+		auto** alternateShaderSlot = reinterpret_cast<ID3D11PixelShader**>(
+			shader + kENBPixelShaderNativeAlternateOffset);
+		if (!IsWritableProcessAddress(alternateShaderSlot) || !*alternateShaderSlot) {
+			return nullptr;
+		}
+
+		const void* bytecode = nullptr;
+		std::uint32_t bytecodeSize = 0;
+		std::memcpy(
+			&bytecode,
+			shader + kENBPixelShaderBytecodeOffset,
+			sizeof(bytecode));
+		std::memcpy(
+			&bytecodeSize,
+			shader + kENBPixelShaderBytecodeSizeOffset,
+			sizeof(bytecodeSize));
+		if (!IsSupportedENBSSSProjectionShader(bytecode, bytecodeSize)) {
+			g_enbSSSProjectionDiscoveryRejected = true;
+			return nullptr;
+		}
+		auto* replacement = GetENBSSSProjectionShader(
+			a_context,
+			*alternateShaderSlot,
+			bytecode,
+			bytecodeSize);
+		if (replacement) {
+			*a_alternateShaderSlot = alternateShaderSlot;
+		}
+		return replacement;
+	}
+
+	void RemoveENBSSSProjectionDiscoveryHook()
+	{
+		g_enbSSSProjectionDiscoveryActive = false;
+		if (!g_enbPSSetShaderHookInstalled || !g_enbPSSetShaderVtableSlot || !g_enbPSSetShader) {
+			return;
+		}
+
+		const auto original = reinterpret_cast<std::uintptr_t>(g_enbPSSetShader);
+		if (REL::WriteSafeData(
+				reinterpret_cast<std::uintptr_t>(g_enbPSSetShaderVtableSlot),
+				original)) {
+			g_enbPSSetShaderHookInstalled = false;
+		}
+	}
+
+	bool IsENBSSSProjectionSubstitutionActive()
+	{
+		return g_enbSSSProjectionBinding.alternateSlot &&
+			IsReadableProcessRange(
+				g_enbSSSProjectionBinding.alternateSlot,
+				sizeof(*g_enbSSSProjectionBinding.alternateSlot)) &&
+			g_enbSSSProjectionShaderCache.shader &&
+			*g_enbSSSProjectionBinding.alternateSlot == g_enbSSSProjectionShaderCache.shader.get();
+	}
+
+	bool IsENBSSSProjectionSubstitutionCurrent()
+	{
+		if (!IsENBSSSProjectionSubstitutionActive()) {
+			return false;
+		}
+
+		static auto* renderTargetManager = Util::RenderTargetManager_GetSingleton();
+		static auto* gameViewport = Util::State_GetSingleton();
+		if (!renderTargetManager || !gameViewport) {
+			return false;
+		}
+		const auto expectedViewportWidth = std::max(
+			1u,
+			static_cast<UINT>(
+				static_cast<float>(gameViewport->screenWidth) * renderTargetManager->dynamicWidthRatio));
+		const auto expectedViewportHeight = std::max(
+			1u,
+			static_cast<UINT>(
+				static_cast<float>(gameViewport->screenHeight) * renderTargetManager->dynamicHeightRatio));
+		return g_enbSSSProjectionShaderCache.outputWidth == gameViewport->screenWidth &&
+			g_enbSSSProjectionShaderCache.outputHeight == gameViewport->screenHeight &&
+			std::abs(g_enbSSSProjectionShaderCache.viewportWidth -
+				static_cast<float>(expectedViewportWidth)) < 0.5f &&
+			std::abs(g_enbSSSProjectionShaderCache.viewportHeight -
+				static_cast<float>(expectedViewportHeight)) < 0.5f;
+	}
+
+	void ResetENBSSSProjectionSubstitution()
+	{
+		RemoveENBSSSProjectionDiscoveryHook();
+		if (IsENBSSSProjectionSubstitutionActive() &&
+			IsWritableProcessAddress(g_enbSSSProjectionBinding.alternateSlot)) {
+			*g_enbSSSProjectionBinding.alternateSlot =
+				g_enbSSSProjectionBinding.originalAlternate;
+		}
+		g_enbSSSProjectionBinding = {};
+	}
+
+	void STDMETHODCALLTYPE ENBPSSetShaderThunk(
+		ID3D11DeviceContext* a_context,
+		ID3D11PixelShader* a_shaderWrapper,
+		ID3D11ClassInstance* const* a_classInstances,
+		UINT a_classInstanceCount)
+	{
+		ID3D11PixelShader** alternateShaderSlot = nullptr;
+		ID3D11PixelShader* replacement = nullptr;
+		try {
+			replacement = PrepareENBSSSProjectionSubstitution(
+				a_context,
+				a_shaderWrapper,
+				&alternateShaderSlot);
+		} catch (const std::exception& e) {
+			logger::warn("[ENB SSS] Projection shader preparation failed: {}", e.what());
+		} catch (...) {
+			logger::warn("[ENB SSS] Projection shader preparation failed with an unknown exception");
+		}
+
+		if (replacement && alternateShaderSlot) {
+			// Keep the confirmed live-test edit on the single validated wrapper.
+			// The hook is removed before forwarding this bind, so all subsequent
+			// PSSetShader calls return to ENB's original vtable entry.
+			g_enbSSSProjectionBinding = {
+				a_shaderWrapper,
+				alternateShaderSlot,
+				*alternateShaderSlot
+			};
+			*alternateShaderSlot = replacement;
+			RemoveENBSSSProjectionDiscoveryHook();
+		}
+
+		g_enbPSSetShader(
+			a_context,
+			a_shaderWrapper,
+			a_classInstances,
+			a_classInstanceCount);
+	}
+
+	bool BeginENBSSSProjectionDiscovery()
+	{
+		static bool supportChecked = false;
+		static bool supported = false;
+		static bool installedLogWritten = false;
+		static auto* rendererData = RE::BSGraphics::GetRendererData();
+		auto* context = rendererData ?
+			reinterpret_cast<ID3D11DeviceContext*>(rendererData->context) : nullptr;
+		if (!enbLoaded || !context || g_enbSSSProjectionDiscoveryRejected ||
+			IsENBSSSProjectionSubstitutionCurrent()) {
+			return false;
+		}
+		if (g_enbSSSProjectionBinding.alternateSlot) {
+			ResetENBSSSProjectionSubstitution();
+		}
+
+		if (!supportChecked) {
+			const auto module = FindENBModule();
+			const auto getVersion = module ? reinterpret_cast<ENB_SDK::_ENBGetVersion>(
+				GetProcAddress(module, "ENBGetVersion")) : nullptr;
+			if (!getVersion) {
+				logger::warn("[ENB SSS] Cannot query ENB version; projection correction is disabled");
+				return false;
+			}
+
+			const auto version = getVersion();
+			supportChecked = true;
+			if (version != 501) {
+				logger::info(
+					"[ENB SSS] ENB {} is not the validated 0.501 build; projection correction is disabled",
+					version);
+				return false;
+			}
+
+			constexpr std::uint32_t kPSSetShaderVtableIndex = 9;
+			const auto code = GetENBExecutableCode(module);
+			const auto vtable = *reinterpret_cast<std::uintptr_t**>(context);
+			const auto psSetShader = vtable ? vtable[kPSSetShaderVtableIndex] : 0;
+			if (!code || psSetShader < reinterpret_cast<std::uintptr_t>(code->begin) ||
+				psSetShader >= reinterpret_cast<std::uintptr_t>(code->begin + code->size)) {
+				logger::warn("[ENB SSS] The immediate context is not the validated ENB wrapper");
+				return false;
+			}
+
+			g_enbPSSetShader = reinterpret_cast<ENBPSSetShader_t>(psSetShader);
+			g_enbPSSetShaderVtableSlot = &vtable[kPSSetShaderVtableIndex];
+			supported = true;
+		}
+		if (!supported || !g_enbPSSetShaderVtableSlot || !g_enbPSSetShader) {
+			return false;
+		}
+
+		const auto hook = reinterpret_cast<std::uintptr_t>(&ENBPSSetShaderThunk);
+		if (!REL::WriteSafeData(
+				reinterpret_cast<std::uintptr_t>(g_enbPSSetShaderVtableSlot),
+				hook)) {
+			logger::warn("[ENB SSS] Failed to arm the ENB PSSetShader projection discovery hook");
+			return false;
+		}
+
+		g_enbPSSetShaderHookInstalled = true;
+		g_enbSSSProjectionDiscoveryActive = true;
+		if (!installedLogWritten) {
+			installedLogWritten = true;
+			logger::info("[ENB SSS] Armed the one-shot ENB 0.501 projection discovery hook");
+		}
+		return true;
+	}
+
 	void InstallENBScreenEffectRenderHooks()
 	{
 		if (!enbLoaded) {
@@ -3300,8 +3971,9 @@ PSOut8 PSMainMRT8(VSOut input)
 			workContext = g_enbNativeContext.get();
 		}
 
-		const float clearColor[4]{};
-		workContext->ClearUnorderedAccessViewFloat(a_upscalingInput->uav.get(), clearColor);
+		// Temporal upscalers consume only the supplied render rectangle. The rest
+		// of this native allocation is intentionally undefined on the ordinary
+		// CopyResource path as well, so a full-surface UAV clear is redundant.
 		return ScaleCopyRenderTarget(
 			workDevice,
 			workContext,
@@ -3404,12 +4076,6 @@ PSOut8 PSMainMRT8(VSOut input)
 				destinationTexture
 			};
 			destinationTexture->GetDesc(&job.destinationDesc);
-			D3D11_SHADER_RESOURCE_VIEW_DESC sourceViewDesc{};
-			D3D11_RENDER_TARGET_VIEW_DESC destinationViewDesc{};
-			sourceSRV->GetDesc(&sourceViewDesc);
-			destinationRTV->GetDesc(&destinationViewDesc);
-			job.sourceViewFormat = sourceViewDesc.Format;
-			job.destinationViewFormat = destinationViewDesc.Format;
 			jobs[jobCount++] = job;
 		}
 
@@ -3447,20 +4113,23 @@ PSOut8 PSMainMRT8(VSOut input)
 			return;
 		}
 
-		std::array<ID3D11UnorderedAccessView*, D3D11_PS_CS_UAV_REGISTER_COUNT> boundOMUAVs{};
-		g_enbNativeContext->OMGetRenderTargetsAndUnorderedAccessViews(
-			0,
-			nullptr,
-			nullptr,
-			0,
-			static_cast<UINT>(boundOMUAVs.size()),
-			boundOMUAVs.data());
-		const bool hasBoundOMUAV = std::ranges::any_of(boundOMUAVs, [](const auto* a_view) {
-			return a_view != nullptr;
-		});
-		for (auto* view : boundOMUAVs) {
-			if (view) {
-				view->Release();
+		bool hasBoundOMUAV = false;
+		if (!state.UsesContextState()) {
+			std::array<ID3D11UnorderedAccessView*, D3D11_PS_CS_UAV_REGISTER_COUNT> boundOMUAVs{};
+			g_enbNativeContext->OMGetRenderTargetsAndUnorderedAccessViews(
+				0,
+				nullptr,
+				nullptr,
+				0,
+				static_cast<UINT>(boundOMUAVs.size()),
+				boundOMUAVs.data());
+			hasBoundOMUAV = std::ranges::any_of(boundOMUAVs, [](const auto* a_view) {
+				return a_view != nullptr;
+			});
+			for (auto* view : boundOMUAVs) {
+				if (view) {
+					view->Release();
+				}
 			}
 		}
 
@@ -3500,9 +4169,7 @@ PSOut8 PSMainMRT8(VSOut input)
 					jobs[j].destinationDesc.Width != jobs[i].destinationDesc.Width ||
 					jobs[j].destinationDesc.Height != jobs[i].destinationDesc.Height ||
 					jobs[j].destinationDesc.SampleDesc.Count != jobs[i].destinationDesc.SampleDesc.Count ||
-					jobs[j].destinationDesc.SampleDesc.Quality != jobs[i].destinationDesc.SampleDesc.Quality ||
-					jobs[j].sourceViewFormat != jobs[i].sourceViewFormat ||
-					jobs[j].destinationViewFormat != jobs[i].destinationViewFormat) {
+					jobs[j].destinationDesc.SampleDesc.Quality != jobs[i].destinationDesc.SampleDesc.Quality) {
 					continue;
 				}
 				batch[batchSize] = &jobs[j];
@@ -4024,11 +4691,15 @@ struct BSImagespaceShader_Render_ENBFinalComposite
 {
 	static void thunk(void* This, void* a_geometry, void* a_shaderParams)
 	{
-		const bool nativeENBScope = g_enbNativeImageSpaceParamScopeDepth > 0;
+		if (g_enbNativeImageSpaceParamScopeDepth <= 0) {
+			func(This, a_geometry, a_shaderParams);
+			return;
+		}
+
 		const bool isHDRFinalComposite = IsENBHDRFinalCompositeEffect(This);
 		const bool isRefractionComposite = This && This == g_enbRefractionCompositeEffect;
 		const bool isNativeEffectShader = IsENBNativeImageSpaceShader(This);
-		if (!nativeENBScope || (!isHDRFinalComposite && !isRefractionComposite && !isNativeEffectShader)) {
+		if (!isHDRFinalComposite && !isRefractionComposite && !isNativeEffectShader) {
 			func(This, a_geometry, a_shaderParams);
 			return;
 		}
@@ -4158,18 +4829,26 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately
 		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
 		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
 		const bool enbCompatibilityActive = IsENBSRCompatibilityActive(upscaling->upscaleMethod);
+		const bool useENBSSSProjection = requiresOverride && enbCompatibilityActive &&
+			IsENBSubSurfaceScatteringActive();
+		if (!useENBSSSProjection) {
+			ResetENBSSSProjectionSubstitution();
+		}
 
 		if (ShouldBypassDynamicResolutionHooksForInactiveENB()) {
 			func(This, a2, a3);
 			return;
 		}
-		if (requiresOverride && enbCompatibilityActive &&
-			IsENBSubSurfaceScatteringActive()) {
+		if (useENBSSSProjection) {
 			// Preserve Fallout's prepared DRS pass exactly. Runtime tracing confirmed
-			// that its deferred-light shader already separates render-domain NDC from
-			// native-allocation texture UV. Do not alter targets, viewport, ratios, or
-			// producer projection constants at this handoff.
+			// that the pass and all allocation-domain 2D samples must remain intact.
+			// Discover the confirmed wrapper once, then leave its alternate shader
+			// substituted while this compatibility path remains active.
+			const bool discoveryArmed = BeginENBSSSProjectionDiscovery();
 			func(This, a2, a3);
+			if (discoveryArmed) {
+				RemoveENBSSSProjectionDiscoveryHook();
+			}
 			return;
 		}
 		if (requiresOverride) {
@@ -4220,6 +4899,14 @@ struct ImageSpaceManager_RenderEffect
 {
 	static void thunk(void* This, void* a_effect, int a_targetA, int a_targetB, void* a_params)
 	{
+		// This detour observes every Fallout image-space effect. The ENB tracking
+		// work is useful only inside the two native ENB ranges; avoid the effect
+		// array scan and four scoped trackers on the ordinary render path.
+		if (g_enbNativeImageSpaceParamScopeDepth <= 0) {
+			func(This, a_effect, a_targetA, a_targetB, a_params);
+			return;
+		}
+
 		const auto effectIndex = FindEffectIndex(This, a_effect);
 		LogENBNativeImageSpaceEffect(a_effect, effectIndex, a_targetA, a_targetB);
 		const ScopedImageSpaceEffectNativeParams forceNativeParams(a_effect, effectIndex);
@@ -4714,6 +5401,7 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 	previousWidthRatio = a_currentWidthRatio;
 	previousHeightRatio = a_currentHeightRatio;
 	previousNeedsUpscalingTexture = needsUpscalingTexture;
+	ResetENBSSSProjectionSubstitution();
 
 	// Recreate render targets with new dimensions
 	for (int i = 0; i < ARRAYSIZE(renderTargetsPatch); i++)
@@ -6619,10 +7307,25 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 
 	D3D11_TEXTURE2D_DESC inputDesc{};
 	upscalingTexture->resource->GetDesc(&inputDesc);
+	inputDesc.Width = std::min<UINT>(
+		inputDesc.Width,
+		std::max(1u, static_cast<UINT>(a_renderSize.x)));
+	inputDesc.Height = std::min<UINT>(
+		inputDesc.Height,
+		std::max(1u, static_cast<UINT>(a_renderSize.y)));
 	inputDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 	inputDesc.MiscFlags = 0;
 	EnsureSharedD3D12Texture(inputDesc, fsrInputSharedTextures[frameIndex], fsrInputD3D12[frameIndex], false);
-	context->CopyResource(fsrInputSharedTextures[frameIndex]->resource.get(), upscalingTexture->resource.get());
+	const D3D11_BOX colorSourceBox{ 0, 0, 0, inputDesc.Width, inputDesc.Height, 1 };
+	context->CopySubresourceRegion(
+		fsrInputSharedTextures[frameIndex]->resource.get(),
+		0,
+		0,
+		0,
+		0,
+		upscalingTexture->resource.get(),
+		0,
+		&colorSourceBox);
 
 	D3D11_TEXTURE2D_DESC outputDesc = inputDesc;
 	outputDesc.Width = static_cast<UINT>(a_displaySize.x);
@@ -6817,10 +7520,30 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		if (useD3D12DLSS) {
 			D3D11_TEXTURE2D_DESC dlssInputDesc{};
 			upscalingTexture->resource->GetDesc(&dlssInputDesc);
+			dlssInputDesc.Width = std::min<UINT>(
+				dlssInputDesc.Width,
+				std::max(1u, static_cast<UINT>(a_renderSize.x)));
+			dlssInputDesc.Height = std::min<UINT>(
+				dlssInputDesc.Height,
+				std::max(1u, static_cast<UINT>(a_renderSize.y)));
 			dlssInputDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 			dlssInputDesc.MiscFlags = 0;
 			EnsureSharedD3D12Texture(dlssInputDesc, dlssInputSharedTextures[frameIndex], dlssInputD3D12[frameIndex], false);
-			context->CopyResource(dlssInputSharedTextures[frameIndex]->resource.get(), upscalingTexture->resource.get());
+			const D3D11_BOX colorSourceBox{
+				0, 0, 0,
+				dlssInputDesc.Width,
+				dlssInputDesc.Height,
+				1
+			};
+			context->CopySubresourceRegion(
+				dlssInputSharedTextures[frameIndex]->resource.get(),
+				0,
+				0,
+				0,
+				0,
+				upscalingTexture->resource.get(),
+				0,
+				&colorSourceBox);
 
 			if (settings.sharpness > 0.0f) {
 				auto sharpenedDesc = frameBufferDesc;
@@ -6909,10 +7632,15 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			}
 			hudlessDesc.MiscFlags = 0;
 			EnsureSharedD3D12Texture(hudlessDesc, dlssgHUDLessSharedTextures[frameIndex], dlssgHUDLessD3D12[frameIndex], false);
-			if (canExtractReticleUI) {
-				context->CopyResource(dlssgHUDLessSharedTextures[frameIndex]->resource.get(), frameGenerationPreAlphaTexture->resource.get());
-			} else {
-				context->CopyResource(dlssgHUDLessSharedTextures[frameIndex]->resource.get(), frameBufferTexture);
+			// DLSS writes the complete display-sized output before this resource is
+			// consumed by present or frame generation. Initializing it from D3D11 is
+			// a redundant full-resolution copy on the SR path.
+			if (!useD3D12DLSS) {
+				if (canExtractReticleUI) {
+					context->CopyResource(dlssgHUDLessSharedTextures[frameIndex]->resource.get(), frameGenerationPreAlphaTexture->resource.get());
+				} else {
+					context->CopyResource(dlssgHUDLessSharedTextures[frameIndex]->resource.get(), frameBufferTexture);
+				}
 			}
 		}
 
