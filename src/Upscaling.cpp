@@ -744,6 +744,15 @@ namespace
 		return enbLoaded && TryGetENBBool(ENBBoolSetting::kUseEffect).value_or(false);
 	}
 
+	bool IsENBSubSurfaceScatteringActive()
+	{
+		// The SSS compatibility path is valid only while ENB's master effect and
+		// the effect-specific switch are both enabled. Keep this as one predicate
+		// so a future SSS hook cannot accidentally bypass the master UseEffect gate.
+		return IsENBUseEffectActive() &&
+			TryGetENBBool(ENBBoolSetting::kSubSurfaceScattering).value_or(false);
+	}
+
 	bool ShouldBypassDynamicResolutionHooksForInactiveENB()
 	{
 		const auto useEffect = TryGetENBBool(ENBBoolSetting::kUseEffect);
@@ -2013,205 +2022,6 @@ PSOut8 PSMainMRT8(VSOut input)
 			protection == PAGE_EXECUTE_WRITECOPY;
 	}
 
-	bool IsReadableProcessRange(const void* a_address, std::size_t a_size)
-	{
-		MEMORY_BASIC_INFORMATION memory{};
-		if (!a_address || a_size == 0 ||
-			VirtualQuery(a_address, &memory, sizeof(memory)) != sizeof(memory) ||
-			memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
-			return false;
-		}
-
-		const auto begin = reinterpret_cast<std::uintptr_t>(a_address);
-		const auto regionBegin = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
-		const auto regionEnd = regionBegin + memory.RegionSize;
-		return begin >= regionBegin && begin <= regionEnd && a_size <= regionEnd - begin;
-	}
-
-	struct ENBFunctionRange
-	{
-		std::uintptr_t begin;
-		std::uintptr_t end;
-	};
-
-	struct ENBLogicalFunction
-	{
-		std::uintptr_t entry;
-		std::vector<ENBFunctionRange> fragments;
-	};
-
-	struct ENBRuntimeFunctionTable
-	{
-		std::uintptr_t base;
-		std::uintptr_t imageEnd;
-		const RUNTIME_FUNCTION* functions;
-		std::size_t count;
-	};
-
-	std::optional<ENBRuntimeFunctionTable> GetENBRuntimeFunctionTable(HMODULE a_module)
-	{
-		if (!a_module) {
-			return std::nullopt;
-		}
-
-		const auto base = reinterpret_cast<std::uintptr_t>(a_module);
-		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-		if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
-			return std::nullopt;
-		}
-		const auto ntAddress = base + static_cast<std::uintptr_t>(dos->e_lfanew);
-		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(ntAddress);
-		if (nt->Signature != IMAGE_NT_SIGNATURE ||
-			nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-			nt->OptionalHeader.SizeOfImage == 0) {
-			return std::nullopt;
-		}
-
-		const auto imageSize = static_cast<std::uintptr_t>(nt->OptionalHeader.SizeOfImage);
-		const auto imageEnd = base + imageSize;
-		if (imageEnd < base) {
-			return std::nullopt;
-		}
-		const auto& directory =
-			nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-		if (!directory.VirtualAddress || directory.Size < sizeof(RUNTIME_FUNCTION) ||
-			directory.VirtualAddress >= imageSize ||
-			directory.Size > imageSize - directory.VirtualAddress) {
-			return std::nullopt;
-		}
-
-		return ENBRuntimeFunctionTable{
-			base,
-			imageEnd,
-			reinterpret_cast<const RUNTIME_FUNCTION*>(base + directory.VirtualAddress),
-			directory.Size / sizeof(RUNTIME_FUNCTION)
-		};
-	}
-
-	std::optional<std::size_t> FindENBRuntimeFunctionIndex(
-		const ENBRuntimeFunctionTable& a_table,
-		const RUNTIME_FUNCTION& a_function)
-	{
-		for (std::size_t i = 0; i < a_table.count; ++i) {
-			const auto& candidate = a_table.functions[i];
-			if (candidate.BeginAddress == a_function.BeginAddress &&
-				candidate.EndAddress == a_function.EndAddress &&
-				candidate.UnwindData == a_function.UnwindData) {
-				return i;
-			}
-		}
-		return std::nullopt;
-	}
-
-	std::optional<std::size_t> ResolveENBRuntimeFunctionRoot(
-		const ENBRuntimeFunctionTable& a_table,
-		std::size_t a_index)
-	{
-		// The Windows x64 ABI limits chained unwind records to 32. Keep the same
-		// bound here, and reject malformed cycles instead of detouring an interior
-		// fragment with the logical handler's ABI.
-		constexpr std::size_t kMaxUnwindChainLength = 32;
-		constexpr std::uint8_t kUnwindVersion = 1;
-		constexpr std::uint8_t kUnwindFlagExceptionHandler = 1;
-		constexpr std::uint8_t kUnwindFlagTerminationHandler = 2;
-		constexpr std::uint8_t kUnwindFlagChainInfo = 4;
-		std::array<std::size_t, kMaxUnwindChainLength> visited{};
-		std::size_t visitedCount = 0;
-
-		for (;;) {
-			if (a_index >= a_table.count || visitedCount >= visited.size()) {
-				return std::nullopt;
-			}
-			if (std::find(visited.begin(), visited.begin() + visitedCount, a_index) !=
-				visited.begin() + visitedCount) {
-				return std::nullopt;
-			}
-			visited[visitedCount++] = a_index;
-
-			const auto& function = a_table.functions[a_index];
-			if (function.BeginAddress >= function.EndAddress ||
-				function.EndAddress > a_table.imageEnd - a_table.base ||
-				(function.UnwindData & 1u) != 0 ||
-				function.UnwindData >= a_table.imageEnd - a_table.base ||
-				4u > a_table.imageEnd - a_table.base - function.UnwindData) {
-				return std::nullopt;
-			}
-
-			const auto* unwind = reinterpret_cast<const std::uint8_t*>(
-				a_table.base + function.UnwindData);
-			const auto version = unwind[0] & 7u;
-			const auto flags = unwind[0] >> 3;
-			if (version != kUnwindVersion ||
-				(flags & ~(kUnwindFlagExceptionHandler |
-					kUnwindFlagTerminationHandler | kUnwindFlagChainInfo)) != 0) {
-				return std::nullopt;
-			}
-			if ((flags & kUnwindFlagChainInfo) == 0) {
-				return a_index;
-			}
-			if ((flags & (kUnwindFlagExceptionHandler | kUnwindFlagTerminationHandler)) != 0) {
-				return std::nullopt;
-			}
-
-			const auto unwindCodeCount = static_cast<std::size_t>(unwind[2]);
-			const auto alignedCodeCount = (unwindCodeCount + 1u) & ~std::size_t{ 1 };
-			const auto chainOffset = 4u + alignedCodeCount * 2u;
-			if (chainOffset > a_table.imageEnd - a_table.base - function.UnwindData ||
-				sizeof(RUNTIME_FUNCTION) >
-					a_table.imageEnd - a_table.base - function.UnwindData - chainOffset) {
-				return std::nullopt;
-			}
-
-			RUNTIME_FUNCTION parent{};
-			std::memcpy(&parent, unwind + chainOffset, sizeof(parent));
-			const auto parentIndex = FindENBRuntimeFunctionIndex(a_table, parent);
-			if (!parentIndex) {
-				return std::nullopt;
-			}
-			a_index = *parentIndex;
-		}
-	}
-
-	std::optional<ENBLogicalFunction> FindENBContainingFunction(
-		HMODULE a_module,
-		std::uintptr_t a_address)
-	{
-		const auto table = GetENBRuntimeFunctionTable(a_module);
-		if (!table || a_address < table->base || a_address >= table->imageEnd) {
-			return std::nullopt;
-		}
-
-		const auto rva = static_cast<DWORD>(a_address - table->base);
-		std::optional<std::size_t> containingIndex;
-		for (std::size_t i = 0; i < table->count; ++i) {
-			if (rva >= table->functions[i].BeginAddress &&
-				rva < table->functions[i].EndAddress) {
-				containingIndex = i;
-				break;
-			}
-		}
-		if (!containingIndex) {
-			return std::nullopt;
-		}
-
-		const auto rootIndex = ResolveENBRuntimeFunctionRoot(*table, *containingIndex);
-		if (!rootIndex) {
-			return std::nullopt;
-		}
-
-		ENBLogicalFunction result{ table->base + table->functions[*rootIndex].BeginAddress, {} };
-		for (std::size_t i = 0; i < table->count; ++i) {
-			const auto candidateRoot = ResolveENBRuntimeFunctionRoot(*table, i);
-			if (candidateRoot && *candidateRoot == *rootIndex) {
-				result.fragments.push_back(ENBFunctionRange{
-					table->base + table->functions[i].BeginAddress,
-					table->base + table->functions[i].EndAddress
-				});
-			}
-		}
-		return result.fragments.empty() ? std::nullopt : std::optional{ std::move(result) };
-	}
-
 	bool TryResolveENBRIPRelativeLEA(
 		const std::uint8_t* a_instruction,
 		std::uintptr_t& a_target)
@@ -2631,18 +2441,6 @@ PSOut8 PSMainMRT8(VSOut input)
 			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
 	}
 
-	constexpr std::ptrdiff_t kENBDeviceContextOffset = 0x6C20;
-	ID3D11DeviceContext* GetENBDeviceContext(void* a_this)
-	{
-		if (!a_this) {
-			return nullptr;
-		}
-
-		auto** contextSlot = reinterpret_cast<ID3D11DeviceContext**>(
-			reinterpret_cast<std::byte*>(a_this) + kENBDeviceContextOffset);
-		return *contextSlot;
-	}
-
 	bool GetENBRenderTargetDimensions(
 		ID3D11RenderTargetView* a_view,
 		UINT& a_width,
@@ -2851,6 +2649,7 @@ PSOut8 PSMainMRT8(VSOut input)
 
 		return true;
 	}
+
 	bool CopyENBInputToRenderProxy(
 		Upscaling* a_upscaling,
 		ID3D11DeviceContext* a_context,
@@ -2891,15 +2690,6 @@ PSOut8 PSMainMRT8(VSOut input)
 		};
 		a_context->CopySubresourceRegion(destination, 0, 0, 0, 0, source, 0, &sourceBox);
 		return true;
-	}
-
-	bool CopyENBInputToRenderProxy(int a_target)
-	{
-		auto* rendererData = RE::BSGraphics::GetRendererData();
-		return rendererData && CopyENBInputToRenderProxy(
-			Upscaling::GetSingleton(),
-			reinterpret_cast<ID3D11DeviceContext*>(rendererData->context),
-			a_target);
 	}
 
 	void CopyENBInputsToRenderProxies(std::initializer_list<int> a_targets)
@@ -3235,6 +3025,7 @@ PSOut8 PSMainMRT8(VSOut input)
 		const auto ssaoSetting = FindENBSettingStorage(module, *code, "EnableSSAO");
 		const auto detailedShadowSetting = FindENBSettingStorage(module, *code, "EnableDetailedShadow");
 		const auto depthOfFieldSetting = FindENBSettingStorage(module, *code, "EnableDepthOfField");
+
 		if (!g_enbDeferMixInstalled && ssaoSetting) {
 			const auto ssaoEntry = FindENBSSAORenderEntry(*code, ssaoSetting);
 			const auto compositeWrapperEntry = FindENBSSAOCompositeWrapper(*code, ssaoEntry);
@@ -4373,40 +4164,12 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately
 			return;
 		}
 		if (requiresOverride && enbCompatibilityActive &&
-			TryGetENBBool(ENBBoolSetting::kSubSurfaceScattering).value_or(false)) {
-			static auto rendererData = RE::BSGraphics::GetRendererData();
-			auto* context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
-			std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>
-				drawViewports{};
-			UINT drawViewportCount = static_cast<UINT>(drawViewports.size());
-			context->RSGetViewports(&drawViewportCount, drawViewports.data());
-
-			// ENB's first SSS composite leaves its result in the original RT2.
-			// Bridge that result into the render-sized domain used by the later
-			// composite, but do not let the generic helpers replace or restore
-			// every render target and all of their metadata.
-			const std::initializer_list<int> targets{
-				20, 25, 57, 24, 23, 58, 59, 3, 9, 60, 61, 28, 2, 7, 4
-			};
-			const std::initializer_list<int> inputs{
-				20, 25, 57, 24, 23, 58, 59, 3, 9, 60, 61, 28, 2
-			};
-
-			upscaling->OverrideRenderTargetsSelective(targets, inputs);
-			upscaling->OverrideDepth(true);
-			SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
-			ApplyCurrentViewportDefault(renderTargetManager);
-			// DrawWorld selected RT1 and established the dynamic-resolution
-			// viewport immediately before this call. Ratio 1.0 makes the default
-			// viewport allocation-sized, so restore the caller's exact viewport
-			// for the draw without replacing RT1 or resampling its contents.
-			context->RSSetViewports(drawViewportCount, drawViewports.data());
+			IsENBSubSurfaceScatteringActive()) {
+			// Preserve Fallout's prepared DRS pass exactly. Runtime tracing confirmed
+			// that its deferred-light shader already separates render-domain NDC from
+			// native-allocation texture UV. Do not alter targets, viewport, ratios, or
+			// producer projection constants at this handoff.
 			func(This, a2, a3);
-			upscaling->ResetRenderTargetsSelective(targets, { 4 });
-			upscaling->ResetDepth();
-			SetDynamicResolutionRatio(
-				renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio);
-			ApplyCurrentViewportDefault(renderTargetManager);
 			return;
 		}
 		if (requiresOverride) {
