@@ -334,7 +334,6 @@ public:
 	ID3D11ComputeShader* GetOverrideDepthCS();
 	ID3D11ComputeShader* GetCopyDepthToFrameGenerationCS();
 	ID3D11ComputeShader* GetGenerateFrameGenerationBuffersCS();
-	ID3D11ComputeShader* GetGenerateFrameGenerationUIColorAlphaCS();
 	ID3D11ComputeShader* GetGenerateDLSSTransparencyMaskCS();
 	ID3D11ComputeShader* GetSpatialFallbackUpscaleCS();
 
@@ -394,7 +393,6 @@ public:
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssgHUDLessSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssgMotionVectorSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssgDepthSharedTextures;
-	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssgUIColorAlphaSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssTransparencyMaskSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrInputSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrOutputSharedTextures;
@@ -409,7 +407,6 @@ public:
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssgHUDLessD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssgMotionVectorD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssgDepthD3D12;
-	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssgUIColorAlphaD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssTransparencyMaskD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> fsrInputD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> fsrOutputD3D12;
@@ -484,8 +481,7 @@ private:
 	winrt::com_ptr<ID3D11ComputeShader> overrideLinearDepthCS;       ///< Linear depth upscaling shader
 	winrt::com_ptr<ID3D11ComputeShader> overrideDepthCS;             ///< Depth copy shader
 	winrt::com_ptr<ID3D11ComputeShader> copyDepthToFrameGenerationCS;  ///< Depth copy shader for frame generation inputs
-	winrt::com_ptr<ID3D11ComputeShader> generateFrameGenerationBuffersCS;  ///< Motion/depth reticle fix shader for frame generation inputs
-	winrt::com_ptr<ID3D11ComputeShader> generateFrameGenerationUIColorAlphaCS;  ///< Reticle UI color/alpha extraction shader for frame generation
+	winrt::com_ptr<ID3D11ComputeShader> generateFrameGenerationBuffersCS;  ///< First-person alpha motion/depth fix shader for frame generation inputs
 	winrt::com_ptr<ID3D11ComputeShader> generateDLSSTransparencyMaskCS;  ///< DLSS transparency/history rejection mask
 	winrt::com_ptr<ID3D11ComputeShader> spatialFallbackUpscaleCS;       ///< Minimal local spatial fallback upscaler
 	winrt::com_ptr<ID3D11PixelShader> BSImagespaceShaderSSLRRaytracing;  ///< Custom SSR shader

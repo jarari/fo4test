@@ -4756,7 +4756,7 @@ struct DrawWorld_Render_PreUI_Forward
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
-bool frameGenerationReticleFix = false;
+bool frameGenerationFirstPersonAlphaFix = false;
 
 /** @brief Hook forward rendering to capture frame-generation motion/depth inputs */
 struct DrawWorld_FrameGenerationForward
@@ -4765,24 +4765,24 @@ struct DrawWorld_FrameGenerationForward
 	{
 		func(This);
 
-		if (!frameGenerationReticleFix) {
+		if (!frameGenerationFirstPersonAlphaFix) {
 			Upscaling::GetSingleton()->CopyFrameGenerationBuffers();
 		}
 
-		frameGenerationReticleFix = false;
+		frameGenerationFirstPersonAlphaFix = false;
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
-/** @brief Hook reticle rendering to mask reticles out of frame-generation motion/depth inputs */
-struct DrawWorld_FrameGenerationReticle
+/** @brief Hook first-person alpha rendering to repair its frame-generation motion/depth inputs */
+struct DrawWorld_FrameGenerationFirstPersonAlpha
 {
 	static void thunk(void* This)
 	{
 		auto upscaling = Upscaling::GetSingleton();
 		upscaling->PreFrameGenerationAlpha();
 		func(This);
-		frameGenerationReticleFix = upscaling->PostFrameGenerationAlpha();
+		frameGenerationFirstPersonAlphaFix = upscaling->PostFrameGenerationAlpha();
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
@@ -5045,9 +5045,11 @@ void Upscaling::InstallHooks()
 	stl::write_thunk_call<ForwardAlphaImpl_FinishAccumulating_Standard_PostResolveDepth>(
 		REL::ID{ 338205, 2318315 }.address() + (isOG ? 0x1DC : 0x4C6));
 
-	// Capture reticle-safe motion vectors and depth for frame generation.
+	// Capture first-person-alpha-safe motion vectors and depth for frame generation.
 	stl::detour_thunk<DrawWorld_FrameGenerationForward>(REL::ID{ 656535, 2318315 });
-	stl::write_thunk_call<DrawWorld_FrameGenerationReticle>(
+	// ForwardAlphaImpl + 0x253 (OG) / +0x53D (AE) calls the first-person
+	// accumulator's RenderAlphaGeometry; it is not a screen-space reticle draw.
+	stl::write_thunk_call<DrawWorld_FrameGenerationFirstPersonAlpha>(
 		REL::ID{ 338205, 2318315 }.address() + (isOG ? 0x253 : 0x53D));
 
 	// This hook also owns native-AA evaluation and frame-generation input capture.
@@ -6566,15 +6568,6 @@ ID3D11ComputeShader* Upscaling::GetGenerateFrameGenerationBuffersCS()
 	return generateFrameGenerationBuffersCS.get();
 }
 
-ID3D11ComputeShader* Upscaling::GetGenerateFrameGenerationUIColorAlphaCS()
-{
-	if (!generateFrameGenerationUIColorAlphaCS) {
-		logger::debug("Compiling GenerateUIColorAlphaCS.hlsl");
-		generateFrameGenerationUIColorAlphaCS.attach((ID3D11ComputeShader*)Util::CompileShader(L"Data/F4SE/Plugins/FrameGeneration/GenerateUIColorAlphaCS.hlsl", {}, "cs_5_0"));
-	}
-	return generateFrameGenerationUIColorAlphaCS.get();
-}
-
 ID3D11ComputeShader* Upscaling::GetGenerateDLSSTransparencyMaskCS()
 {
 	if (!generateDLSSTransparencyMaskCS) {
@@ -7607,20 +7600,12 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			dlssD3D12TransparencyMaskReady[frameIndex] = false;
 		}
 
-		D3D11_TEXTURE2D_DESC preAlphaDesc{};
-		if (frameGenerationPreAlphaTexture && frameGenerationPreAlphaTexture->resource) {
-			frameGenerationPreAlphaTexture->resource->GetDesc(&preAlphaDesc);
-		}
-		const bool canExtractReticleUI =
-			usePatchedFrameGenerationBuffers &&
-			frameGenerationPreAlphaReady &&
-			frameGenerationPreAlphaFrame == gameViewport->frameCount &&
-			frameGenerationPreAlphaTexture &&
-			frameGenerationPreAlphaTexture->srv &&
-			preAlphaDesc.Width == frameBufferDesc.Width &&
-			preAlphaDesc.Height == frameBufferDesc.Height &&
-			preAlphaDesc.Format == frameBufferDesc.Format;
-		if (reuseFSRResourcesForFrameGeneration && !canExtractReticleUI && !useD3D12DLSS) {
+		// The pre/post-alpha hook surrounds the first-person accumulator's
+		// RenderAlphaGeometry call. Its difference is 3D scene content in the
+		// render-resolution domain, not display-space UI. Keep using it to repair
+		// motion/depth, but never remove it from HUD-less color or tag it for UI
+		// recomposition: doing so produces a reduced duplicate at the upper-left.
+		if (reuseFSRResourcesForFrameGeneration && !useD3D12DLSS) {
 			dlssgHUDLessSharedTextures[frameIndex] = nullptr;
 			dlssgHUDLessD3D12[frameIndex].copy_from(fsrOutputD3D12[frameIndex].get());
 		} else {
@@ -7635,11 +7620,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			// consumed by present or frame generation. Initializing it from D3D11 is
 			// a redundant full-resolution copy on the SR path.
 			if (!useD3D12DLSS) {
-				if (canExtractReticleUI) {
-					context->CopyResource(dlssgHUDLessSharedTextures[frameIndex]->resource.get(), frameGenerationPreAlphaTexture->resource.get());
-				} else {
-					context->CopyResource(dlssgHUDLessSharedTextures[frameIndex]->resource.get(), frameBufferTexture);
-				}
+				context->CopyResource(dlssgHUDLessSharedTextures[frameIndex]->resource.get(), frameBufferTexture);
 			}
 		}
 
@@ -7717,43 +7698,6 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			}
 		}
 
-		DXGI_FORMAT uiFormat = DXGI_FORMAT_UNKNOWN;
-		if (canExtractReticleUI) {
-			auto uiDesc = frameBufferDesc;
-			uiDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-			uiDesc.MiscFlags = 0;
-			EnsureSharedD3D12Texture(uiDesc, dlssgUIColorAlphaSharedTextures[frameIndex], dlssgUIColorAlphaD3D12[frameIndex], true);
-			if (dlssgUIColorAlphaSharedTextures[frameIndex] && dlssgUIColorAlphaSharedTextures[frameIndex]->uav) {
-				auto shader = GetGenerateFrameGenerationUIColorAlphaCS();
-				if (shader) {
-					ID3D11ShaderResourceView* views[] = {
-						frameGenerationPreAlphaTexture->srv.get(),
-						frameBufferSRV
-					};
-					context->CSSetShaderResources(0, ARRAYSIZE(views), views);
-
-					ID3D11UnorderedAccessView* uavs[] = {
-						dlssgUIColorAlphaSharedTextures[frameIndex]->uav.get()
-					};
-					context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
-					context->CSSetShader(shader, nullptr, 0);
-					context->Dispatch(static_cast<UINT>(std::ceil(frameBufferDesc.Width / 8.0f)), static_cast<UINT>(std::ceil(frameBufferDesc.Height / 8.0f)), 1);
-
-					ID3D11ShaderResourceView* nullViews[2] = {};
-					context->CSSetShaderResources(0, ARRAYSIZE(nullViews), nullViews);
-					ID3D11UnorderedAccessView* nullUavs[1] = {};
-					context->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
-					ID3D11ComputeShader* nullShader = nullptr;
-					context->CSSetShader(nullShader, nullptr, 0);
-					uiFormat = uiDesc.Format;
-				} else {
-					dlssgUIColorAlphaD3D12[frameIndex] = nullptr;
-				}
-			}
-		} else {
-			dlssgUIColorAlphaD3D12[frameIndex] = nullptr;
-		}
-
 		bool useDLSSGThisFrame = useFrameGeneration;
 		if (useDLSSGThisFrame) {
 			streamline->UpdateReflex(settings.reflexMode, true);
@@ -7775,7 +7719,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		}
 		const auto dlssgInputSize = float2(static_cast<float>(sharedMotionVectorDesc.Width), static_cast<float>(sharedMotionVectorDesc.Height));
 		if (useDLSSGThisFrame) {
-			if (!streamline->UpdateDLSSG(true, settings.frameGenerationMode, settings.dlssgGeneratedFrames + 1, settings.dynamicMFGEnabled != 0, settings.dynamicMFGTargetFPS, dlssgInputSize, a_displaySize, frameBufferDesc.Format, sharedMotionVectorDesc.Format, sharedDepthDesc.Format, uiFormat)) {
+			if (!streamline->UpdateDLSSG(true, settings.frameGenerationMode, settings.dlssgGeneratedFrames + 1, settings.dynamicMFGEnabled != 0, settings.dynamicMFGTargetFPS, dlssgInputSize, a_displaySize, frameBufferDesc.Format, sharedMotionVectorDesc.Format, sharedDepthDesc.Format, DXGI_FORMAT_UNKNOWN)) {
 				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "DLSS-G options");
 				useDLSSGThisFrame = false;
 				if (!useD3D12DLSS) {
@@ -8021,7 +7965,6 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 	auto* color = dlssgHUDLessD3D12[a_frameIndex].get();
 	auto* motionVectors = dlssgMotionVectorD3D12[a_frameIndex].get();
 	auto* depth = dlssgDepthD3D12[a_frameIndex].get();
-	auto* uiColorAlpha = dlssgUIColorAlphaD3D12[a_frameIndex].get();
 	if (!color || !motionVectors || !depth || !a_commandList) {
 		fsrFrameGenerationInputsReady[a_frameIndex] = false;
 		ReportFeatureRequestFailure(FeatureRequest::kFSRFrameGeneration, "FSR frame generation inputs");
@@ -8029,14 +7972,11 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 	}
 
 	const auto shaderReadState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-	D3D12_RESOURCE_BARRIER beforeDispatch[4]{};
+	D3D12_RESOURCE_BARRIER beforeDispatch[3]{};
 	UINT beforeDispatchCount = 0;
 	beforeDispatch[beforeDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(color, D3D12_RESOURCE_STATE_COMMON, shaderReadState);
 	beforeDispatch[beforeDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(motionVectors, D3D12_RESOURCE_STATE_COMMON, shaderReadState);
 	beforeDispatch[beforeDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(depth, D3D12_RESOURCE_STATE_COMMON, shaderReadState);
-	if (uiColorAlpha) {
-		beforeDispatch[beforeDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(uiColorAlpha, D3D12_RESOURCE_STATE_COMMON, shaderReadState);
-	}
 	a_commandList->ResourceBarrier(beforeDispatchCount, beforeDispatch);
 
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
@@ -8048,7 +7988,7 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 		motionVectors,
 		depth,
 		color,
-		uiColorAlpha,
+		nullptr,
 		jitter,
 		dlssgInputRenderSizes[a_frameIndex],
 		dlssgInputDisplaySizes[a_frameIndex],
@@ -8056,14 +7996,11 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 		fsrFrameGenerationFrameIDs[a_frameIndex],
 		true);
 
-	D3D12_RESOURCE_BARRIER afterDispatch[4]{};
+	D3D12_RESOURCE_BARRIER afterDispatch[3]{};
 	UINT afterDispatchCount = 0;
 	afterDispatch[afterDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(color, shaderReadState, D3D12_RESOURCE_STATE_COMMON);
 	afterDispatch[afterDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(motionVectors, shaderReadState, D3D12_RESOURCE_STATE_COMMON);
 	afterDispatch[afterDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(depth, shaderReadState, D3D12_RESOURCE_STATE_COMMON);
-	if (uiColorAlpha) {
-		afterDispatch[afterDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(uiColorAlpha, shaderReadState, D3D12_RESOURCE_STATE_COMMON);
-	}
 	a_commandList->ResourceBarrier(afterDispatchCount, afterDispatch);
 
 	fsrFrameGenerationInputsReady[a_frameIndex] = false;
@@ -8099,7 +8036,7 @@ void Upscaling::TagDLSSGInputs(ID3D12GraphicsCommandList* a_commandList, uint32_
 		hudlessColor,
 		dlssgMotionVectorD3D12[a_frameIndex].get(),
 		dlssgDepthD3D12[a_frameIndex].get(),
-		dlssgUIColorAlphaD3D12[a_frameIndex].get(),
+		nullptr,
 		a_commandList,
 		frameTokenIndex,
 		dlssgInputRenderSizes[a_frameIndex],
@@ -8192,7 +8129,6 @@ void Upscaling::DestroyUpscalingResources()
 		dlssgHUDLessSharedTextures[i] = nullptr;
 		dlssgMotionVectorSharedTextures[i] = nullptr;
 		dlssgDepthSharedTextures[i] = nullptr;
-		dlssgUIColorAlphaSharedTextures[i] = nullptr;
 		dlssTransparencyMaskSharedTextures[i] = nullptr;
 		debugMotionVectorSharedTextures[i] = nullptr;
 		fsrInputSharedTextures[i] = nullptr;
@@ -8205,7 +8141,6 @@ void Upscaling::DestroyUpscalingResources()
 		dlssgHUDLessD3D12[i] = nullptr;
 		dlssgMotionVectorD3D12[i] = nullptr;
 		dlssgDepthD3D12[i] = nullptr;
-		dlssgUIColorAlphaD3D12[i] = nullptr;
 		dlssTransparencyMaskD3D12[i] = nullptr;
 		debugMotionVectorD3D12[i] = nullptr;
 		fsrInputD3D12[i] = nullptr;
