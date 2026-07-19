@@ -1,12 +1,10 @@
 #include "Util.h"
 
-#include <algorithm>
 #include <cmath>
 #include <d3dcompiler.h>
 #include <winrt/base.h>
 
 #include "RE/M/Main.h"
-#include "RE/P/PlayerCamera.h"
 
 namespace Util
 {
@@ -15,43 +13,40 @@ namespace Util
 		return DirectX::XMMATRIX(a_matrix[0], a_matrix[1], a_matrix[2], a_matrix[3]);
 	}
 
-	float VerticalFOVFromProjection(const DirectX::XMMATRIX& a_projection)
+	bool TryGetVerticalFOVFromProjection(const DirectX::XMMATRIX& a_projection, float& a_verticalFOV)
 	{
 		DirectX::XMFLOAT4X4 projection{};
 		DirectX::XMStoreFloat4x4(&projection, a_projection);
 
-		const auto yScale = std::abs(projection._22);
-		return yScale > 0.0f ? 2.0f * std::atan(1.0f / yScale) : 0.0f;
-	}
-
-	float VerticalFOVFromProjection(const __m128* a_projection)
-	{
-		return VerticalFOVFromProjection(ToXMMatrix(a_projection));
-	}
-
-	bool IsPlausibleVerticalFOV(float a_fov)
-	{
-		return a_fov > 0.2f && a_fov < 2.8f;
-	}
-
-	float VerticalFOVFromHorizontalDegrees(float a_horizontalDegrees, float a_aspectRatio)
-	{
-		constexpr auto pi = 3.14159265358979323846f;
-		const auto horizontalDegrees = std::clamp(a_horizontalDegrees, 1.0f, 170.0f);
-		const auto horizontalRadians = horizontalDegrees * pi / 180.0f;
-		const auto aspectRatio = std::max(a_aspectRatio, 0.001f);
-		return 2.0f * std::atan(std::tan(horizontalRadians * 0.5f) / aspectRatio);
-	}
-
-	float PlayerCameraVerticalFOV(float a_aspectRatio)
-	{
-		const auto playerCamera = RE::PlayerCamera::GetSingleton();
-		if (!playerCamera) {
-			return 0.0f;
+		for (std::size_t row = 0; row < 4; ++row) {
+			for (std::size_t column = 0; column < 4; ++column) {
+				if (!std::isfinite(projection.m[row][column])) {
+					return false;
+				}
+			}
 		}
 
-		const auto horizontalFOV = playerCamera->worldFOV + playerCamera->fovAdjustCurrent + playerCamera->fovAnimatorAdjust;
-		return VerticalFOVFromHorizontalDegrees(horizontalFOV, a_aspectRatio);
+		// Fallout 4 builds its perspective projection with positive X/Y scales,
+		// M34 == 1, and M44 == 0. Validate that shape instead of rejecting narrow
+		// but legitimate scope FOVs with an arbitrary angle threshold.
+		constexpr auto perspectiveTolerance = 1.0e-5f;
+		if (projection._11 <= 0.0f ||
+			projection._22 <= 0.0f ||
+			projection._33 <= 0.0f ||
+			projection._43 >= 0.0f ||
+			std::abs(projection._34 - 1.0f) > perspectiveTolerance ||
+			std::abs(projection._44) > perspectiveTolerance) {
+			return false;
+		}
+
+		constexpr auto pi = 3.14159265358979323846f;
+		const auto verticalFOV = 2.0f * std::atan2(1.0f, projection._22);
+		if (!std::isfinite(verticalFOV) || verticalFOV <= 0.0f || verticalFOV >= pi) {
+			return false;
+		}
+
+		a_verticalFOV = verticalFOV;
+		return true;
 	}
 
 	const RE::BSGraphics::CameraStateData* GetWorldCameraStateData()
@@ -72,20 +67,16 @@ namespace Util
 		return selected;
 	}
 
-	CameraProjection GetCameraProjection(float a_aspectRatio)
+	CameraProjection GetCameraProjection()
 	{
 		CameraProjection result{};
-		result.playerCameraFOV = PlayerCameraVerticalFOV(a_aspectRatio);
-		const auto* cameraState = GetWorldCameraStateData();
-		if (!cameraState) {
-			result.cameraFOV = result.playerCameraFOV;
+		result.cameraState = GetWorldCameraStateData();
+		if (!result.cameraState) {
 			return result;
 		}
 
-		result.cameraViewToClip = ToXMMatrix(cameraState->camViewData.projMat);
-		result.fovA = VerticalFOVFromProjection(result.cameraViewToClip);
-		result.usedMatrixFOV = IsPlausibleVerticalFOV(result.fovA);
-		result.cameraFOV = result.usedMatrixFOV ? result.fovA : result.playerCameraFOV;
+		result.cameraViewToClip = ToXMMatrix(result.cameraState->camViewData.projMat);
+		result.usedMatrixFOV = TryGetVerticalFOVFromProjection(result.cameraViewToClip, result.cameraFOV);
 		return result;
 	}
 

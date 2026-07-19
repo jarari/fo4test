@@ -518,9 +518,8 @@ bool FidelityFX::ConfigureFrameGeneration(
 	prepare.renderSize = { static_cast<uint32_t>(a_renderSize.x), static_cast<uint32_t>(a_renderSize.y) };
 	prepare.cameraNear = *reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
 	prepare.cameraFar = *reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
-	const auto aspectRatio = a_displaySize.y > 0.0f ? a_displaySize.x / a_displaySize.y : 0.0f;
-	const auto cameraProjection = Util::GetCameraProjection(aspectRatio);
-	const auto* cameraState = Util::GetWorldCameraStateData();
+	const auto cameraProjection = Util::GetCameraProjection();
+	const auto* cameraState = cameraProjection.cameraState;
 	if (!cameraState || !cameraProjection.usedMatrixFOV) {
 		logger::warn(
 			"[FidelityFX] Frame generation prepare has no valid world camera: camera={} fov={} matrixFov={}",

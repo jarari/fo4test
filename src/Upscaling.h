@@ -438,6 +438,7 @@ public:
 	bool d3d12DLSSMenuSuspended = false;
 	bool dlssgMenuResumeReady = true;
 	uint32_t dlssgStableGameplayFrames = 0;
+	bool scopeMenuOpen = false;
 	bool temporalFeaturesBlocked = false;
 	bool frameGenerationActive = false;
 	bool fsrFrameGenerationActive = false;

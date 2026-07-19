@@ -6,12 +6,9 @@ namespace Util
 {
 	struct CameraProjection
 	{
+		const RE::BSGraphics::CameraStateData* cameraState{ nullptr };
 		DirectX::XMMATRIX cameraViewToClip;
 		float cameraFOV{ 0.0f };
-		float fovA{ 0.0f };
-		float fovB{ 0.0f };
-		float playerCameraFOV{ 0.0f };
-		bool usedAlternateProjectionOrder{ false };
 		bool usedMatrixFOV{ false };
 	};
 
@@ -102,13 +99,9 @@ namespace Util
 	}
 
 	DirectX::XMMATRIX ToXMMatrix(const __m128* a_matrix);
-	float VerticalFOVFromProjection(const DirectX::XMMATRIX& a_projection);
-	float VerticalFOVFromProjection(const __m128* a_projection);
-	bool IsPlausibleVerticalFOV(float a_fov);
-	float VerticalFOVFromHorizontalDegrees(float a_horizontalDegrees, float a_aspectRatio);
-	float PlayerCameraVerticalFOV(float a_aspectRatio);
+	bool TryGetVerticalFOVFromProjection(const DirectX::XMMATRIX& a_projection, float& a_verticalFOV);
 	const RE::BSGraphics::CameraStateData* GetWorldCameraStateData();
-	CameraProjection GetCameraProjection(float a_aspectRatio);
+	CameraProjection GetCameraProjection();
 
 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program = "main");
 }

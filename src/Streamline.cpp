@@ -1219,11 +1219,11 @@ bool Streamline::UpdateConstants(float2 a_jitter, bool a_includeCameraData)
 	const RE::BSGraphics::CameraStateData* cameraState = nullptr;
 	Util::CameraProjection cameraProjection{};
 	if (a_includeCameraData) {
-		cameraState = Util::GetWorldCameraStateData();
 		const auto aspectRatio = gameViewport->screenHeight > 0 ?
 			static_cast<float>(gameViewport->screenWidth) / static_cast<float>(gameViewport->screenHeight) :
 			1.0f;
-		cameraProjection = Util::GetCameraProjection(aspectRatio);
+		cameraProjection = Util::GetCameraProjection();
+		cameraState = cameraProjection.cameraState;
 		if (!cameraState || !cameraProjection.usedMatrixFOV) {
 			logger::error(
 				"[Streamline] Full common constants have no valid world camera frame={} camera={} fov={} matrixFov={}",

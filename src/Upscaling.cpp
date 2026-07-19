@@ -5210,6 +5210,9 @@ RE::BSEventNotifyControl Upscaling::ProcessEvent(const RE::MenuOpenCloseEvent& a
 			singleton->LoadSettings();
 		}
 	}
+	if (a_event.menuName == "ScopeMenu") {
+		singleton->scopeMenuOpen = a_event.opening;
+	}
 
 	return RE::BSEventNotifyControl::kContinue;
 }
@@ -6439,12 +6442,8 @@ void Upscaling::ReportFeatureRequestFailure(FeatureRequest a_feature, std::strin
 
 	ClearFrameFeatureRequests();
 
-	static auto gameViewport = Util::State_GetSingleton();
-	const auto aspectRatio = gameViewport && gameViewport->screenHeight > 0 ?
-		static_cast<float>(gameViewport->screenWidth) / static_cast<float>(gameViewport->screenHeight) :
-		1.0f;
-	const auto* cameraState = Util::GetWorldCameraStateData();
-	const auto cameraProjection = Util::GetCameraProjection(aspectRatio);
+	const auto cameraProjection = Util::GetCameraProjection();
+	const auto* cameraState = cameraProjection.cameraState;
 	const auto* ui = RE::UI::GetSingleton();
 	const auto menuMode = ui ? ui->menuMode : 0;
 	const auto itemMenuMode = ui ? ui->itemMenuMode.load_unchecked() : 0;
@@ -7180,7 +7179,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			}
 			runSpatialFallbackNow("D3D12 FSR input failure");
 		} else if (!fsrFrameGenerationActive) {
-			const auto usePresentOverride = getD3D12FSROutput() != nullptr;
+			const auto usePresentOverride = getD3D12FSROutput() != nullptr && !scopeMenuOpen;
 			const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(false, true, false, !usePresentOverride);
 			if (d3d12Result.fsr) {
 				if (usePresentOverride && prepareD3D12PresentOverrideUI() && setD3D12PresentOverride(getD3D12FSROutput())) {
@@ -7254,7 +7253,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		const bool hasPresentOverrideOutput =
 			dlssPresentOverrideReady ||
 			(requestedD3D12FSR && getD3D12FSROutput());
-		const auto usePresentOverride = hasPresentOverrideOutput;
+		const auto usePresentOverride = hasPresentOverrideOutput && !scopeMenuOpen;
 		const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(
 			requestedD3D12DLSS,
 			requestedD3D12FSR,
