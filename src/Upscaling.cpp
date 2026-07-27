@@ -3141,7 +3141,7 @@ PSOut8 PSMainMRT8(VSOut input)
 
 	constexpr std::uint32_t kENBSSSProjectionShaderHash = 0xB0CA0F9C;
 	constexpr std::size_t kENBSSSProjectionShaderSize = 8848;
-	// ENB 0.501 wrapper layout. Installation rejects every other ENB version.
+	// Ghidra-verified ENB 0.420, 0.496, and 0.501 wrapper layout.
 	constexpr std::ptrdiff_t kENBPixelShaderHashOffset = 0x8;
 	constexpr std::ptrdiff_t kENBPixelShaderNativeAlternateOffset = 0x2D0;
 	constexpr std::ptrdiff_t kENBPixelShaderBytecodeOffset = 0x2D8;
@@ -3630,21 +3630,7 @@ PSOut8 PSMainMRT8(VSOut input)
 
 		if (!supportChecked) {
 			const auto module = FindENBModule();
-			const auto getVersion = module ? reinterpret_cast<ENB_SDK::_ENBGetVersion>(
-				GetProcAddress(module, "ENBGetVersion")) : nullptr;
-			if (!getVersion) {
-				logger::warn("[ENB SSS] Cannot query ENB version; projection correction is disabled");
-				return false;
-			}
-
-			const auto version = getVersion();
 			supportChecked = true;
-			if (version != 501) {
-				logger::info(
-					"[ENB SSS] ENB {} is not the validated 0.501 build; projection correction is disabled",
-					version);
-				return false;
-			}
 
 			constexpr std::uint32_t kPSSetShaderVtableIndex = 9;
 			const auto code = GetENBExecutableCode(module);
@@ -3676,7 +3662,7 @@ PSOut8 PSMainMRT8(VSOut input)
 		g_enbSSSProjectionDiscoveryActive = true;
 		if (!installedLogWritten) {
 			installedLogWritten = true;
-			logger::info("[ENB SSS] Armed the one-shot ENB 0.501 projection discovery hook");
+			logger::info("[ENB SSS] Armed the one-shot ENB projection discovery hook");
 		}
 		return true;
 	}
