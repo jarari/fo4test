@@ -120,7 +120,6 @@ namespace
 		std::size_t gpuBufferOffset;
 	};
 	std::optional<ENBDetailedShadowBufferLayout> g_enbDetailedShadowBufferLayout;
-	ENBScreenEffectRender_t g_enbDepthOfFieldRender = nullptr;
 	constexpr std::size_t kENBDeferMixTrampolineSize = 64;
 	REL::Trampoline g_enbDeferMixTrampoline{ "ENB DeferMix"sv };
 	bool g_enbDeferMixInstalled = false;
@@ -3100,44 +3099,45 @@ PSOut8 PSMainMRT8(VSOut input)
 		return result;
 	}
 
-	class ScopedENBDepthOfFieldDepth
+	class ScopedENBTextureDepthBinding
 	{
 	public:
-		ScopedENBDepthOfFieldDepth()
+		explicit ScopedENBTextureDepthBinding(bool a_nativeDepthReady)
 		{
-			auto* upscaling = Upscaling::GetSingleton();
-			if (g_enbNativeImageSpaceParamScopeDepth <= 0 ||
-				(originalDynamicWidthRatio == 1.0f && originalDynamicHeightRatio == 1.0f) ||
-				!upscaling || !IsENBSRCompatibilityActive(upscaling->upscaleMethod) ||
-				!g_enbDepthTextureSRVSlot || !g_enbNativeDepthSRV) {
+			auto* replacement = g_enbNativeDepthSRV.get();
+			if (!a_nativeDepthReady || !g_enbDepthTextureSRVSlot || !replacement) {
 				return;
 			}
 
-			original_ = *g_enbDepthTextureSRVSlot;
-			*g_enbDepthTextureSRVSlot = g_enbNativeDepthSRV.get();
+			slot_ = g_enbDepthTextureSRVSlot;
+			original_ = *slot_;
+			replacement_ = replacement;
+			if (original_ == replacement_) {
+				return;
+			}
+
+			*slot_ = replacement_;
 			active_ = true;
 		}
 
-		~ScopedENBDepthOfFieldDepth()
+		~ScopedENBTextureDepthBinding()
 		{
-			if (active_) {
-				*g_enbDepthTextureSRVSlot = original_;
+			// Do not overwrite a resource ENB may have recreated while the scope
+			// was active.
+			if (active_ && *slot_ == replacement_) {
+				*slot_ = original_;
 			}
 		}
 
-		ScopedENBDepthOfFieldDepth(const ScopedENBDepthOfFieldDepth&) = delete;
-		ScopedENBDepthOfFieldDepth& operator=(const ScopedENBDepthOfFieldDepth&) = delete;
+		ScopedENBTextureDepthBinding(const ScopedENBTextureDepthBinding&) = delete;
+		ScopedENBTextureDepthBinding& operator=(const ScopedENBTextureDepthBinding&) = delete;
 
 	private:
+		ID3D11ShaderResourceView** slot_ = nullptr;
 		ID3D11ShaderResourceView* original_ = nullptr;
+		ID3D11ShaderResourceView* replacement_ = nullptr;
 		bool active_ = false;
 	};
-
-	int ENBDepthOfFieldRenderThunk(void* a_this, std::uint32_t a2, std::uint32_t a3, std::uint32_t a4)
-	{
-		const ScopedENBDepthOfFieldDepth depthBridge;
-		return g_enbDepthOfFieldRender(a_this, a2, a3, a4);
-	}
 
 	constexpr std::uint32_t kENBSSSProjectionShaderHash = 0xB0CA0F9C;
 	constexpr std::size_t kENBSSSProjectionShaderSize = 8848;
@@ -3744,24 +3744,17 @@ PSOut8 PSMainMRT8(VSOut input)
 			}
 		}
 
-		if (!g_enbDepthOfFieldRender && depthOfFieldSetting) {
+		if (!g_enbDepthTextureSRVSlot && depthOfFieldSetting) {
+			// DepthOfField is only the discovery anchor. This global SRV slot is
+			// shared by ENB's SSAO, main effect, DOF, and postpass renderers.
 			const auto depthOfFieldEntry = FindENBDepthOfFieldRenderEntry(*code, depthOfFieldSetting);
 			const auto textureDepthName = FindENBModuleString(module, "TextureDepth");
 			const auto depthTextureSRVSlot =
 				FindENBDepthTextureSRVSlot(depthOfFieldEntry, textureDepthName);
 			if (!depthOfFieldEntry || !depthTextureSRVSlot) {
-				logger::warn("[ENB SR] Cannot resolve the DepthOfField depth bridge");
+				logger::warn("[ENB SR] Cannot resolve the shared TextureDepth SRV binding");
 			} else {
 				g_enbDepthTextureSRVSlot = depthTextureSRVSlot;
-				const auto trampoline = Detours::X64::DetourFunction(
-					depthOfFieldEntry,
-					reinterpret_cast<std::uintptr_t>(&ENBDepthOfFieldRenderThunk));
-				if (trampoline) {
-					g_enbDepthOfFieldRender = reinterpret_cast<ENBScreenEffectRender_t>(trampoline);
-				} else {
-					g_enbDepthTextureSRVSlot = nullptr;
-					logger::warn("[ENB SR] Failed to install DepthOfField depth bridge hook");
-				}
 			}
 		}
 	}
@@ -4528,6 +4521,9 @@ struct DrawWorld_Imagespace_RenderEffectRange
 					PrimeENBPrepassNativeColor(device, context, nativeScene);
 				}
 				{
+					// ENB otherwise captures the native DSV allocation 1:1 and
+					// leaves its dynamic-resolution render rectangle unexpanded.
+					const ScopedENBTextureDepthBinding bindENBTextureDepth(nativeDepthReady);
 					const ScopedENBPrepassDepthBridgeActivation bridgeENBPrepassDepth(shouldPrimeENBPrepass);
 					const ScopedENBNativeImageSpaceParams forceNativeImageSpaceParams;
 					func(This, a2, a3, a4, a5);
@@ -5141,6 +5137,11 @@ struct SamplerStates
 void Upscaling::LoadSettings()
 {
 	const auto previousUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
+	const auto previousQualityMode = settings.qualityMode;
+	const auto previousFrameGenerationMode = settings.frameGenerationMode;
+	const auto previousDLSSGGeneratedFrames = settings.dlssgGeneratedFrames;
+	const auto previousDynamicMFGEnabled = settings.dynamicMFGEnabled;
+	const auto previousDLSSModelPreset = settings.dlssModelPreset;
 	const bool previousImageSpaceEffectLog = settings.imageSpaceEffectLog != 0;
 
 	CSimpleIniA ini;
@@ -5168,6 +5169,14 @@ void Upscaling::LoadSettings()
 
 	auto streamline = Streamline::GetSingleton();
 	const auto currentUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
+	if (previousUpscaleMethodPreference != currentUpscaleMethodPreference ||
+		previousQualityMode != settings.qualityMode ||
+		previousFrameGenerationMode != settings.frameGenerationMode ||
+		previousDLSSGGeneratedFrames != settings.dlssgGeneratedFrames ||
+		previousDynamicMFGEnabled != settings.dynamicMFGEnabled ||
+		previousDLSSModelPreset != settings.dlssModelPreset) {
+		streamline->RequestTemporalReset();
+	}
 	const auto switchedBetweenD3D12Upscalers =
 		(previousUpscaleMethodPreference == UpscaleMethod::kFSR && currentUpscaleMethodPreference == UpscaleMethod::kDLSS) ||
 		(previousUpscaleMethodPreference == UpscaleMethod::kDLSS && currentUpscaleMethodPreference == UpscaleMethod::kFSR);
@@ -5406,6 +5415,7 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 	previousWidthRatio = a_currentWidthRatio;
 	previousHeightRatio = a_currentHeightRatio;
 	previousNeedsUpscalingTexture = needsUpscalingTexture;
+	Streamline::GetSingleton()->RequestTemporalReset();
 	ResetENBSSSProjectionSubstitution();
 
 	// Recreate render targets with new dimensions
@@ -6697,7 +6707,11 @@ void Upscaling::UpdateUpscaling()
 	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 
 	auto streamline = Streamline::GetSingleton();
+	const auto temporalFeaturesWereBlocked = temporalFeaturesBlocked;
 	temporalFeaturesBlocked = ShouldBlockTemporalFeatures();
+	if (temporalFeaturesWereBlocked != temporalFeaturesBlocked) {
+		streamline->RequestTemporalReset();
+	}
 	const bool dx12Ready = DX12SwapChain::GetSingleton()->IsReady();
 
 	upscaleMethodNoMenu = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
@@ -7701,14 +7715,14 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		bool useDLSSGThisFrame = useFrameGeneration;
 		if (useDLSSGThisFrame) {
 			streamline->UpdateReflex(settings.reflexMode, true);
-			if (!streamline->UpdateConstants(jitter, true)) {
-				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "Streamline full common constants");
+			if (!streamline->UpdateConstants(jitter)) {
+				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "Streamline common constants");
 				useDLSSGThisFrame = false;
 			}
 		}
 		if (useD3D12DLSS && !useDLSSGThisFrame) {
 			streamline->UpdateReflex(settings.reflexMode, false);
-			if (!streamline->UpdateConstants(jitter, false)) {
+			if (!streamline->UpdateConstants(jitter)) {
 				ReportFeatureRequestFailure(FeatureRequest::kDLSS, "Streamline SR common constants");
 				frameBufferResource->Release();
 				return;
@@ -7755,7 +7769,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 	context->CopyResource(dlssgHUDLessTexture->resource.get(), frameBufferResource);
 
 	streamline->UpdateReflex(settings.reflexMode, true);
-	if (!streamline->UpdateConstants(jitter, true)) {
+	if (!streamline->UpdateConstants(jitter)) {
 		ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "Streamline common constants");
 		frameBufferResource->Release();
 		return;

@@ -8,6 +8,86 @@
 
 namespace Util
 {
+	namespace
+	{
+		bool Normalize(DirectX::XMFLOAT3& a_vector)
+		{
+			const auto lengthSq =
+				a_vector.x * a_vector.x +
+				a_vector.y * a_vector.y +
+				a_vector.z * a_vector.z;
+			if (!std::isfinite(lengthSq) || lengthSq <= 0.0f) {
+				return false;
+			}
+
+			const auto invLength = 1.0f / std::sqrt(lengthSq);
+			a_vector.x *= invLength;
+			a_vector.y *= invLength;
+			a_vector.z *= invLength;
+			return true;
+		}
+
+		float AlignmentScore(const CameraBasis& a_basis, const RE::BSGraphics::ViewData& a_viewData)
+		{
+			const auto alignment = [](const DirectX::XMFLOAT3& a_vector, const __m128& a_reference) {
+				return std::abs(
+					a_vector.x * a_reference.m128_f32[0] +
+					a_vector.y * a_reference.m128_f32[1] +
+					a_vector.z * a_reference.m128_f32[2]);
+			};
+
+			return
+				alignment(a_basis.right, a_viewData.viewRight) +
+				alignment(a_basis.up, a_viewData.viewUp) +
+				alignment(a_basis.forward, a_viewData.viewDir);
+		}
+
+		bool Orthonormalize(CameraBasis& a_basis)
+		{
+			if (!Normalize(a_basis.right) || !Normalize(a_basis.forward)) {
+				return false;
+			}
+
+			// Match Streamline's left-handed camera basis convention.
+			a_basis.up = {
+				a_basis.forward.y * a_basis.right.z - a_basis.forward.z * a_basis.right.y,
+				a_basis.forward.z * a_basis.right.x - a_basis.forward.x * a_basis.right.z,
+				a_basis.forward.x * a_basis.right.y - a_basis.forward.y * a_basis.right.x
+			};
+			if (!Normalize(a_basis.up)) {
+				return false;
+			}
+
+			a_basis.right = {
+				a_basis.up.y * a_basis.forward.z - a_basis.up.z * a_basis.forward.y,
+				a_basis.up.z * a_basis.forward.x - a_basis.up.x * a_basis.forward.z,
+				a_basis.up.x * a_basis.forward.y - a_basis.up.y * a_basis.forward.x
+			};
+			return Normalize(a_basis.right);
+		}
+
+		bool TrySetCameraProjection(CameraProjection& a_result, const DirectX::XMMATRIX& a_projection)
+		{
+			float verticalFOV = 0.0f;
+			if (!TryGetVerticalFOVFromProjection(a_projection, verticalFOV)) {
+				return false;
+			}
+
+			DirectX::XMFLOAT4X4 projection{};
+			DirectX::XMStoreFloat4x4(&projection, a_projection);
+			const auto aspectRatio = projection._22 / projection._11;
+			if (!std::isfinite(aspectRatio) || aspectRatio <= 0.0f) {
+				return false;
+			}
+
+			a_result.cameraViewToClip = a_projection;
+			a_result.cameraFOV = verticalFOV;
+			a_result.cameraAspectRatio = aspectRatio;
+			a_result.usedMatrixFOV = true;
+			return true;
+		}
+	}
+
 	DirectX::XMMATRIX ToXMMatrix(const __m128* a_matrix)
 	{
 		return DirectX::XMMATRIX(a_matrix[0], a_matrix[1], a_matrix[2], a_matrix[3]);
@@ -75,9 +155,69 @@ namespace Util
 			return result;
 		}
 
-		result.cameraViewToClip = ToXMMatrix(result.cameraState->camViewData.projMat);
-		result.usedMatrixFOV = TryGetVerticalFOVFromProjection(result.cameraViewToClip, result.cameraFOV);
+		const auto& viewData = result.cameraState->camViewData;
+		const auto view = ToXMMatrix(viewData.viewMat);
+		const auto viewProjUnjittered = ToXMMatrix(viewData.viewProjUnjittered);
+		DirectX::XMVECTOR determinant{};
+		const auto cameraToWorld = DirectX::XMMatrixInverse(&determinant, view);
+		const auto det = DirectX::XMVectorGetX(determinant);
+		if (std::isfinite(det) && det != 0.0f) {
+			// Fallout stores row-major matrices, but test both multiplication
+			// orders so this remains correct if a runtime exposes transposed data.
+			const auto rowMajorProjection = DirectX::XMMatrixMultiply(cameraToWorld, viewProjUnjittered);
+			const auto transposedProjection = DirectX::XMMatrixMultiply(viewProjUnjittered, cameraToWorld);
+			if (TrySetCameraProjection(result, rowMajorProjection) ||
+				TrySetCameraProjection(result, transposedProjection)) {
+				return result;
+			}
+		}
+
+		// A non-jittered camera-cache entry can safely provide its projection
+		// directly. Never fall back to projMat on a jittered entry because
+		// Streamline receives the pixel jitter separately.
+		if (!result.cameraState->useJitter) {
+			TrySetCameraProjection(result, ToXMMatrix(viewData.projMat));
+		}
 		return result;
+	}
+
+	bool TryGetCameraBasis(const RE::BSGraphics::ViewData& a_viewData, CameraBasis& a_basis)
+	{
+		const auto view = ToXMMatrix(a_viewData.viewMat);
+		DirectX::XMVECTOR determinant{};
+		const auto cameraToWorld = DirectX::XMMatrixInverse(&determinant, view);
+		const auto det = DirectX::XMVectorGetX(determinant);
+		if (std::isfinite(det) && det != 0.0f) {
+			DirectX::XMFLOAT4X4 matrix{};
+			DirectX::XMStoreFloat4x4(&matrix, cameraToWorld);
+
+			CameraBasis rows{
+				{ matrix._11, matrix._12, matrix._13 },
+				{ matrix._21, matrix._22, matrix._23 },
+				{ matrix._31, matrix._32, matrix._33 }
+			};
+			CameraBasis columns{
+				{ matrix._11, matrix._21, matrix._31 },
+				{ matrix._12, matrix._22, matrix._32 },
+				{ matrix._13, matrix._23, matrix._33 }
+			};
+			const auto rowsValid = Orthonormalize(rows);
+			const auto columnsValid = Orthonormalize(columns);
+			if (rowsValid || columnsValid) {
+				a_basis =
+					columnsValid && (!rowsValid || AlignmentScore(columns, a_viewData) > AlignmentScore(rows, a_viewData)) ?
+					columns :
+					rows;
+				return true;
+			}
+		}
+
+		a_basis = {
+			{ a_viewData.viewRight.m128_f32[0], a_viewData.viewRight.m128_f32[1], a_viewData.viewRight.m128_f32[2] },
+			{ a_viewData.viewUp.m128_f32[0], a_viewData.viewUp.m128_f32[1], a_viewData.viewUp.m128_f32[2] },
+			{ a_viewData.viewDir.m128_f32[0], a_viewData.viewDir.m128_f32[1], a_viewData.viewDir.m128_f32[2] }
+		};
+		return Orthonormalize(a_basis);
 	}
 
 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program)

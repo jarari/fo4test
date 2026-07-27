@@ -73,89 +73,6 @@ namespace
 		return ((resourceRequirements.required_resources | resourceRequirements.optional_resources) & reactiveMask) != 0;
 	}
 
-	bool Normalize3(float (&a_vector)[3])
-	{
-		const auto lengthSq =
-			a_vector[0] * a_vector[0] +
-			a_vector[1] * a_vector[1] +
-			a_vector[2] * a_vector[2];
-		if (lengthSq <= 0.0f || !std::isfinite(lengthSq)) {
-			return false;
-		}
-
-		const auto invLength = 1.0f / std::sqrt(lengthSq);
-		a_vector[0] *= invLength;
-		a_vector[1] *= invLength;
-		a_vector[2] *= invLength;
-		return true;
-	}
-
-	float AlignmentScore(const float (&a_right)[3], const float (&a_up)[3], const float (&a_forward)[3], const RE::BSGraphics::ViewData& a_viewData)
-	{
-		const auto dot = [](const float (&a)[3], const __m128& b) {
-			return std::abs(
-				a[0] * b.m128_f32[0] +
-				a[1] * b.m128_f32[1] +
-				a[2] * b.m128_f32[2]);
-		};
-
-		return dot(a_right, a_viewData.viewRight) + dot(a_up, a_viewData.viewUp) + dot(a_forward, a_viewData.viewDir);
-	}
-
-	void CopyVector(float (&a_dst)[3], const float (&a_src)[3])
-	{
-		a_dst[0] = a_src[0];
-		a_dst[1] = a_src[1];
-		a_dst[2] = a_src[2];
-	}
-
-	void CopyVector(float (&a_dst)[3], const __m128& a_src)
-	{
-		a_dst[0] = a_src.m128_f32[0];
-		a_dst[1] = a_src.m128_f32[1];
-		a_dst[2] = a_src.m128_f32[2];
-	}
-
-	void FillCameraBasis(const RE::BSGraphics::ViewData& a_viewData, float (&a_right)[3], float (&a_up)[3], float (&a_forward)[3])
-	{
-		CopyVector(a_right, a_viewData.viewRight);
-		CopyVector(a_up, a_viewData.viewUp);
-		CopyVector(a_forward, a_viewData.viewDir);
-
-		const auto viewMatrix = Util::ToXMMatrix(a_viewData.viewMat);
-		DirectX::XMVECTOR determinant{};
-		const auto inverseView = DirectX::XMMatrixInverse(&determinant, viewMatrix);
-		const auto det = DirectX::XMVectorGetX(determinant);
-		if (det == 0.0f || !std::isfinite(det)) {
-			return;
-		}
-
-		DirectX::XMFLOAT4X4 matrix{};
-		DirectX::XMStoreFloat4x4(&matrix, inverseView);
-
-		float rowRight[3]{ matrix._11, matrix._12, matrix._13 };
-		float rowUp[3]{ matrix._21, matrix._22, matrix._23 };
-		float rowForward[3]{ matrix._31, matrix._32, matrix._33 };
-		float colRight[3]{ matrix._11, matrix._21, matrix._31 };
-		float colUp[3]{ matrix._12, matrix._22, matrix._32 };
-		float colForward[3]{ matrix._13, matrix._23, matrix._33 };
-
-		const auto rowsValid = Normalize3(rowRight) && Normalize3(rowUp) && Normalize3(rowForward);
-		const auto columnsValid = Normalize3(colRight) && Normalize3(colUp) && Normalize3(colForward);
-		const auto useColumns =
-			columnsValid &&
-			(!rowsValid || AlignmentScore(colRight, colUp, colForward, a_viewData) > AlignmentScore(rowRight, rowUp, rowForward, a_viewData));
-
-		if (useColumns) {
-			CopyVector(a_right, colRight);
-			CopyVector(a_up, colUp);
-			CopyVector(a_forward, colForward);
-		} else if (rowsValid) {
-			CopyVector(a_right, rowRight);
-			CopyVector(a_up, rowUp);
-			CopyVector(a_forward, rowForward);
-		}
-	}
 }
 
 void FidelityFX::CreateFSRResources()
@@ -533,23 +450,23 @@ bool FidelityFX::ConfigureFrameGeneration(
 	prepare.frameID = a_frameID;
 	prepare.reset = false;
 
-	auto& viewData = cameraState->camViewData;
-	float cameraRight[3]{};
-	float cameraUp[3]{};
-	float cameraForward[3]{};
-	FillCameraBasis(viewData, cameraRight, cameraUp, cameraForward);
+	Util::CameraBasis cameraBasis{};
+	if (!Util::TryGetCameraBasis(cameraState->camViewData, cameraBasis)) {
+		logger::warn("[FidelityFX] Frame generation prepare has no valid orthonormal camera basis");
+		return false;
+	}
 	prepare.cameraPosition[0] = cameraState->currentPosAdjust.x;
 	prepare.cameraPosition[1] = cameraState->currentPosAdjust.y;
 	prepare.cameraPosition[2] = cameraState->currentPosAdjust.z;
-	prepare.cameraForward[0] = cameraForward[0];
-	prepare.cameraForward[1] = cameraForward[1];
-	prepare.cameraForward[2] = cameraForward[2];
-	prepare.cameraUp[0] = cameraUp[0];
-	prepare.cameraUp[1] = cameraUp[1];
-	prepare.cameraUp[2] = cameraUp[2];
-	prepare.cameraRight[0] = cameraRight[0];
-	prepare.cameraRight[1] = cameraRight[1];
-	prepare.cameraRight[2] = cameraRight[2];
+	prepare.cameraForward[0] = cameraBasis.forward.x;
+	prepare.cameraForward[1] = cameraBasis.forward.y;
+	prepare.cameraForward[2] = cameraBasis.forward.z;
+	prepare.cameraUp[0] = cameraBasis.up.x;
+	prepare.cameraUp[1] = cameraBasis.up.y;
+	prepare.cameraUp[2] = cameraBasis.up.z;
+	prepare.cameraRight[0] = cameraBasis.right.x;
+	prepare.cameraRight[1] = cameraBasis.right.y;
+	prepare.cameraRight[2] = cameraBasis.right.z;
 
 	const auto result = ffx::Dispatch(frameGenContext, prepare);
 	if (result != ffx::ReturnCode::Ok) {

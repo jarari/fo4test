@@ -9,7 +9,15 @@ namespace Util
 		const RE::BSGraphics::CameraStateData* cameraState{ nullptr };
 		DirectX::XMMATRIX cameraViewToClip;
 		float cameraFOV{ 0.0f };
+		float cameraAspectRatio{ 0.0f };
 		bool usedMatrixFOV{ false };
+	};
+
+	struct CameraBasis
+	{
+		DirectX::XMFLOAT3 right{};
+		DirectX::XMFLOAT3 up{};
+		DirectX::XMFLOAT3 forward{};
 	};
 
 	enum class RenderTarget
@@ -102,6 +110,7 @@ namespace Util
 	bool TryGetVerticalFOVFromProjection(const DirectX::XMMATRIX& a_projection, float& a_verticalFOV);
 	const RE::BSGraphics::CameraStateData* GetWorldCameraStateData();
 	CameraProjection GetCameraProjection();
+	bool TryGetCameraBasis(const RE::BSGraphics::ViewData& a_viewData, CameraBasis& a_basis);
 
 	ID3D11DeviceChild* CompileShader(const wchar_t* FilePath, const std::vector<std::pair<const char*, const char*>>& Defines, const char* ProgramType, const char* Program = "main");
 }

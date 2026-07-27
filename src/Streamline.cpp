@@ -143,6 +143,26 @@ namespace
 		}
 		return anyNonZero;
 	}
+
+	bool TryInvertMatrix(const DirectX::XMMATRIX& a_matrix, DirectX::XMMATRIX& a_inverse)
+	{
+		if (!IsUsableMatrix(a_matrix)) {
+			return false;
+		}
+
+		DirectX::XMVECTOR determinant{};
+		a_inverse = DirectX::XMMatrixInverse(&determinant, a_matrix);
+		const auto det = DirectX::XMVectorGetX(determinant);
+		return std::isfinite(det) && det != 0.0f && IsUsableMatrix(a_inverse);
+	}
+
+	bool IsFinitePosition(const RE::NiPoint3& a_position)
+	{
+		return
+			std::isfinite(a_position.x) &&
+			std::isfinite(a_position.y) &&
+			std::isfinite(a_position.z);
+	}
 }
 
 void Streamline::LoadInterposer()
@@ -260,6 +280,10 @@ void Streamline::Shutdown()
 	swapChain = nullptr;
 	swapChainDesc = {};
 	constantsFrameIndex = std::numeric_limits<uint32_t>::max();
+	lastConstantsFrameIndex = std::numeric_limits<uint32_t>::max();
+	lastTemporalResetFrameIndex = std::numeric_limits<uint32_t>::max();
+	constantsReferenceCamera = nullptr;
+	temporalResetPending = true;
 	markerFrameIndex = std::numeric_limits<uint32_t>::max();
 	lastDLSSGStatus = std::numeric_limits<uint32_t>::max();
 	lastDLSSGPresentedFrames = std::numeric_limits<uint32_t>::max();
@@ -455,6 +479,12 @@ bool Streamline::EnsureFrameToken(uint32_t a_frameIndex)
 	return true;
 }
 
+void Streamline::RequestTemporalReset()
+{
+	temporalResetPending = true;
+	constantsFrameIndex = std::numeric_limits<uint32_t>::max();
+}
+
 sl::FrameToken* Streamline::GetFrameTokenForFrame(uint32_t a_frameIndex)
 {
 	if (!initialized || !slGetNewFrameToken) {
@@ -628,6 +658,7 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		return true;
 	}
 
+	const auto hadConfiguredOptions = currentDLSSGMode != sl::DLSSGMode::eCount;
 	sl::DLSSGOptions options{};
 	options.mode = mode;
 	options.numFramesToGenerate = generatedFrames;
@@ -664,6 +695,9 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	currentDepthFormat = a_depthFormat;
 	currentUIFormat = a_uiFormat;
 	dlssgActive = mode != sl::DLSSGMode::eOff;
+	if (hadConfiguredOptions && lastTemporalResetFrameIndex != constantsFrameIndex) {
+		RequestTemporalReset();
+	}
 
 	return true;
 }
@@ -678,6 +712,7 @@ void Streamline::RequestDLSSGDisable()
 	}
 
 	pendingDLSSGDisable = true;
+	RequestTemporalReset();
 }
 
 bool Streamline::DisableDLSSGNow()
@@ -938,6 +973,7 @@ float Streamline::GetReflexLatencyMs()
 
 void Streamline::ResetOptionCaches()
 {
+	RequestTemporalReset();
 	currentD3D12DLSSOptionsValid = false;
 	currentD3D12DLSSMode = sl::DLSSMode::eOff;
 	currentD3D12DLSSOutputWidth = 0;
@@ -957,6 +993,7 @@ bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWi
 		return true;
 	}
 
+	const auto hadValidOptions = currentD3D12DLSSOptionsValid;
 	sl::DLSSOptions dlssOptions{};
 	dlssOptions.mode = a_mode;
 	dlssOptions.outputWidth = a_outputWidth;
@@ -974,6 +1011,9 @@ bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWi
 	currentD3D12DLSSOutputWidth = a_outputWidth;
 	currentD3D12DLSSOutputHeight = a_outputHeight;
 	currentD3D12DLSSModelPreset = a_dlssModelPreset;
+	if (hadValidOptions && lastTemporalResetFrameIndex != constantsFrameIndex) {
+		RequestTemporalReset();
+	}
 	return true;
 }
 
@@ -1186,107 +1226,124 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	return true;
 }
 
-bool Streamline::UpdateConstants(float2 a_jitter, bool a_includeCameraData)
+bool Streamline::UpdateConstants(float2 a_jitter)
 {
 	static auto gameViewport = Util::State_GetSingleton();
+	if (!gameViewport) {
+		return false;
+	}
+
 	const auto currentFrameIndex = gameViewport->frameCount;
-	if (constantsFrameIndex == currentFrameIndex && frameToken &&
-		(!a_includeCameraData || constantsIncludeCameraData)) {
+	if (constantsFrameIndex == currentFrameIndex && frameToken) {
 		return true;
+	}
+	if (lastConstantsFrameIndex != std::numeric_limits<uint32_t>::max() &&
+		currentFrameIndex != lastConstantsFrameIndex + 1) {
+		RequestTemporalReset();
 	}
 
 	if (!EnsureFrameToken(currentFrameIndex)) {
 		return false;
 	}
 
-	sl::Constants slConstants = {};
-	// The original D3D11 DLSS path used minimal camera constants successfully.
-	// Only frame generation needs the full world-camera payload below.
-	slConstants.cameraNear = 0.0f;
-	slConstants.cameraFar = 1.0f;
+	const auto cameraProjection = Util::GetCameraProjection();
+	const auto* cameraState = cameraProjection.cameraState;
+	if (!cameraState || !cameraProjection.usedMatrixFOV ||
+		!std::isfinite(a_jitter.x) || !std::isfinite(a_jitter.y) ||
+		!IsFinitePosition(cameraState->currentPosAdjust)) {
+		logger::error(
+			"[Streamline] Common constants have no valid world camera frame={} camera={} fov={} aspect={} matrixFov={}",
+			currentFrameIndex,
+			static_cast<const void*>(cameraState),
+			cameraProjection.cameraFOV,
+			cameraProjection.cameraAspectRatio,
+			cameraProjection.usedMatrixFOV);
+		return false;
+	}
+
+	static auto cameraNear = reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
+	static auto cameraFar = reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
+	if (!std::isfinite(*cameraNear) || !std::isfinite(*cameraFar) ||
+		*cameraNear <= 0.0f || *cameraFar <= *cameraNear) {
+		logger::error("[Streamline] Common constants have invalid camera planes near={} far={}", *cameraNear, *cameraFar);
+		return false;
+	}
+
+	const auto& viewData = cameraState->camViewData;
+	Util::CameraBasis cameraBasis{};
+	if (!Util::TryGetCameraBasis(viewData, cameraBasis)) {
+		logger::error("[Streamline] Common constants have no valid orthonormal camera basis");
+		return false;
+	}
+
+	DirectX::XMMATRIX clipToCameraView{};
+	DirectX::XMMATRIX clipToCurrentWorld{};
+	DirectX::XMMATRIX prevClipToClip{};
+	const auto currentViewProj = Util::ToXMMatrix(viewData.currentViewProjUnjittered);
+	const auto previousViewProj = Util::ToXMMatrix(viewData.previousViewProjUnjittered);
+	if (!TryInvertMatrix(cameraProjection.cameraViewToClip, clipToCameraView) ||
+		!TryInvertMatrix(currentViewProj, clipToCurrentWorld) ||
+		!IsUsableMatrix(previousViewProj)) {
+		logger::error("[Streamline] Common constants have invalid camera transforms frame={}", currentFrameIndex);
+		return false;
+	}
+
+	const auto clipToPrevClip = DirectX::XMMatrixMultiply(clipToCurrentWorld, previousViewProj);
+	if (!IsUsableMatrix(clipToPrevClip) ||
+		!TryInvertMatrix(clipToPrevClip, prevClipToClip)) {
+		logger::error("[Streamline] Common constants have invalid camera transforms frame={}", currentFrameIndex);
+		return false;
+	}
+
+	if (constantsReferenceCamera && constantsReferenceCamera != cameraState->referenceCamera) {
+		RequestTemporalReset();
+	}
+	const auto resetHistory = temporalResetPending;
+
+	sl::Constants slConstants{};
+	slConstants.cameraViewToClip = ToSLMatrix(cameraProjection.cameraViewToClip);
+	slConstants.clipToCameraView = ToSLMatrix(clipToCameraView);
+	slConstants.clipToPrevClip = ToSLMatrix(clipToPrevClip);
+	slConstants.prevClipToClip = ToSLMatrix(prevClipToClip);
+	slConstants.cameraNear = *cameraNear;
+	slConstants.cameraFar = *cameraFar;
+	slConstants.cameraAspectRatio = cameraProjection.cameraAspectRatio;
+	slConstants.cameraFOV = cameraProjection.cameraFOV;
 	slConstants.cameraMotionIncluded = sl::Boolean::eTrue;
-	slConstants.cameraPinholeOffset = { 0.f, 0.f };
+	slConstants.cameraPinholeOffset = { 0.0f, 0.0f };
+	slConstants.cameraPos = { cameraState->currentPosAdjust.x, cameraState->currentPosAdjust.y, cameraState->currentPosAdjust.z };
+	slConstants.cameraFwd = { cameraBasis.forward.x, cameraBasis.forward.y, cameraBasis.forward.z };
+	slConstants.cameraUp = { cameraBasis.up.x, cameraBasis.up.y, cameraBasis.up.z };
+	slConstants.cameraRight = { cameraBasis.right.x, cameraBasis.right.y, cameraBasis.right.z };
 	slConstants.depthInverted = sl::Boolean::eFalse;
-	slConstants.jitterOffset = { -a_jitter.x, -a_jitter.y};
-	slConstants.mvecScale = { 1, 1 };
-	slConstants.reset = sl::Boolean::eFalse;
+	slConstants.jitterOffset = { -a_jitter.x, -a_jitter.y };
+	slConstants.mvecScale = { 1.0f, 1.0f };
+	slConstants.reset = resetHistory ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	slConstants.motionVectors3D = sl::Boolean::eFalse;
-	slConstants.motionVectorsInvalidValue = FLT_MIN;
 	slConstants.orthographicProjection = sl::Boolean::eFalse;
 	slConstants.motionVectorsDilated = sl::Boolean::eTrue;
 	slConstants.motionVectorsJittered = sl::Boolean::eFalse;
 
-	const RE::BSGraphics::CameraStateData* cameraState = nullptr;
-	Util::CameraProjection cameraProjection{};
-	if (a_includeCameraData) {
-		const auto aspectRatio = gameViewport->screenHeight > 0 ?
-			static_cast<float>(gameViewport->screenWidth) / static_cast<float>(gameViewport->screenHeight) :
-			1.0f;
-		cameraProjection = Util::GetCameraProjection();
-		cameraState = cameraProjection.cameraState;
-		if (!cameraState || !cameraProjection.usedMatrixFOV) {
-			logger::error(
-				"[Streamline] Full common constants have no valid world camera frame={} camera={} fov={} matrixFov={}",
-				currentFrameIndex,
-				static_cast<const void*>(cameraState),
-				cameraProjection.cameraFOV,
-				cameraProjection.usedMatrixFOV);
-			return false;
-		}
-
-		static auto cameraNear = reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
-		static auto cameraFar = reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
-		const auto& viewData = cameraState->camViewData;
-		slConstants.cameraNear = *cameraNear;
-		slConstants.cameraFar = *cameraFar;
-		slConstants.cameraAspectRatio = aspectRatio;
-		slConstants.cameraFOV = cameraProjection.cameraFOV;
-		slConstants.cameraPos = { cameraState->currentPosAdjust.x, cameraState->currentPosAdjust.y, cameraState->currentPosAdjust.z };
-		slConstants.cameraFwd = { viewData.viewDir.m128_f32[0], viewData.viewDir.m128_f32[1], viewData.viewDir.m128_f32[2] };
-		slConstants.cameraUp = { viewData.viewUp.m128_f32[0], viewData.viewUp.m128_f32[1], viewData.viewUp.m128_f32[2] };
-		slConstants.cameraRight = { viewData.viewRight.m128_f32[0], viewData.viewRight.m128_f32[1], viewData.viewRight.m128_f32[2] };
-		slConstants.cameraViewToClip = ToSLMatrix(cameraProjection.cameraViewToClip);
-
-		const auto currentViewProj = Util::ToXMMatrix(viewData.currentViewProjUnjittered);
-		const auto previousViewProj = Util::ToXMMatrix(viewData.previousViewProjUnjittered);
-		if (IsUsableMatrix(currentViewProj) && IsUsableMatrix(previousViewProj)) {
-			DirectX::XMVECTOR currentDeterminant{};
-			const auto clipToCurrentWorld = DirectX::XMMatrixInverse(&currentDeterminant, currentViewProj);
-			const auto determinant = DirectX::XMVectorGetX(currentDeterminant);
-			if (determinant != 0.0f && std::isfinite(determinant) && IsUsableMatrix(clipToCurrentWorld)) {
-				const auto clipToPrevClip = DirectX::XMMatrixMultiply(clipToCurrentWorld, previousViewProj);
-				DirectX::XMVECTOR previousDeterminant{};
-				const auto prevClipToClip = DirectX::XMMatrixInverse(&previousDeterminant, clipToPrevClip);
-				const auto previousDet = DirectX::XMVectorGetX(previousDeterminant);
-				if (previousDet != 0.0f && std::isfinite(previousDet) && IsUsableMatrix(prevClipToClip)) {
-					slConstants.clipToCameraView = ToSLMatrix(DirectX::XMMatrixInverse(nullptr, cameraProjection.cameraViewToClip));
-					slConstants.clipToPrevClip = ToSLMatrix(clipToPrevClip);
-					slConstants.prevClipToClip = ToSLMatrix(prevClipToClip);
-				} else {
-					recalculateCameraMatrices(slConstants);
-				}
-			} else {
-				recalculateCameraMatrices(slConstants);
-			}
-		} else {
-			recalculateCameraMatrices(slConstants);
-		}
-	}
-
 	if (SL_FAILED(res, slSetConstants(slConstants, *frameToken, viewport))) {
 		logger::error(
-			"[Streamline] Could not set constants: {} frame={} token={} fullCamera={} camera={} fov={}",
+			"[Streamline] Could not set constants: {} frame={} token={} camera={} fov={} aspect={} reset={}",
 			magic_enum::enum_name(res),
 			currentFrameIndex,
 			static_cast<std::uint32_t>(*frameToken),
-			a_includeCameraData,
 			static_cast<const void*>(cameraState),
-			cameraProjection.cameraFOV);
+			cameraProjection.cameraFOV,
+			cameraProjection.cameraAspectRatio,
+			resetHistory);
 		return false;
 	}
 
 	constantsFrameIndex = currentFrameIndex;
-	constantsIncludeCameraData = a_includeCameraData;
+	lastConstantsFrameIndex = currentFrameIndex;
+	constantsReferenceCamera = cameraState->referenceCamera;
+	if (resetHistory) {
+		temporalResetPending = false;
+		lastTemporalResetFrameIndex = currentFrameIndex;
+	}
 	return true;
 }
 
@@ -1306,6 +1363,7 @@ void Streamline::DisableDLSS()
 
 void Streamline::DestroyDLSSResources()
 {
+	RequestTemporalReset();
 	DisableDLSS();
 
 	if (!initialized || !featureDLSS || !slFreeResources) {
