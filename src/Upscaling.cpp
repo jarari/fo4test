@@ -100,6 +100,7 @@ namespace
 	winrt::com_ptr<ID3D11Texture2D> g_enbNativeDepth;
 	winrt::com_ptr<ID3D11ShaderResourceView> g_enbNativeDepthSRV;
 	winrt::com_ptr<ID3D11RenderTargetView> g_enbNativeDepthRTV;
+	std::uint64_t g_enbNativeDepthFrame = std::numeric_limits<std::uint64_t>::max();
 	std::uintptr_t g_enbTextureOriginalSRVAddress = 0;
 	std::array<std::uintptr_t, 2> g_enbPrepassDepthSRVAddresses{};
 	std::uint32_t* g_enbFullWidth = nullptr;
@@ -3139,6 +3140,47 @@ PSOut8 PSMainMRT8(VSOut input)
 		bool active_ = false;
 	};
 
+	class ScopedFalloutMainDepthBinding
+	{
+	public:
+		explicit ScopedFalloutMainDepthBinding(bool a_nativeDepthReady)
+		{
+			auto* replacement = g_enbNativeDepthSRV.get();
+			static auto* rendererData = RE::BSGraphics::GetRendererData();
+			if (!a_nativeDepthReady || !replacement || !rendererData) {
+				return;
+			}
+
+			slot_ = &rendererData->depthStencilTargets[
+				static_cast<std::uint32_t>(Util::DepthStencilTarget::kMain)].srViewDepth;
+			original_ = *slot_;
+			replacement_ = reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(replacement);
+			if (original_ == replacement_) {
+				return;
+			}
+
+			*slot_ = replacement_;
+			active_ = true;
+		}
+
+		~ScopedFalloutMainDepthBinding()
+		{
+			// Preserve a replacement made by the engine while Bokeh was active.
+			if (active_ && *slot_ == replacement_) {
+				*slot_ = original_;
+			}
+		}
+
+		ScopedFalloutMainDepthBinding(const ScopedFalloutMainDepthBinding&) = delete;
+		ScopedFalloutMainDepthBinding& operator=(const ScopedFalloutMainDepthBinding&) = delete;
+
+	private:
+		REX::W32::ID3D11ShaderResourceView** slot_ = nullptr;
+		REX::W32::ID3D11ShaderResourceView* original_ = nullptr;
+		REX::W32::ID3D11ShaderResourceView* replacement_ = nullptr;
+		bool active_ = false;
+	};
+
 	constexpr std::uint32_t kENBSSSProjectionShaderHash = 0xB0CA0F9C;
 	constexpr std::size_t kENBSSSProjectionShaderSize = 8848;
 	// Ghidra-verified ENB 0.420, 0.496, and 0.501 wrapper layout.
@@ -4393,6 +4435,259 @@ PSOut8 PSMainMRT8(VSOut input)
 		a_context->CSSetShader(shader, nullptr, 0);
 	}
 
+	constexpr std::array<std::uint32_t, 2> kBokehTransientTargets{ 84, 85 };
+	constexpr std::uint32_t kInvalidRenderTarget = std::numeric_limits<std::uint32_t>::max();
+
+	thread_local std::uint32_t g_proxyImageSpaceDimensionsDepth = 0;
+	thread_local std::uint32_t g_bokehProxyScopeDepth = 0;
+
+	struct BokehProxyRenderTarget
+	{
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		winrt::com_ptr<ID3D11Texture2D> copyTexture;
+		winrt::com_ptr<ID3D11RenderTargetView> rtView;
+		winrt::com_ptr<ID3D11ShaderResourceView> srView;
+		winrt::com_ptr<ID3D11ShaderResourceView> copySRView;
+		winrt::com_ptr<ID3D11UnorderedAccessView> uaView;
+
+		[[nodiscard]] RE::BSGraphics::RenderTarget GetGameTarget() const
+		{
+			return {
+				reinterpret_cast<REX::W32::ID3D11Texture2D*>(texture.get()),
+				reinterpret_cast<REX::W32::ID3D11Texture2D*>(copyTexture.get()),
+				reinterpret_cast<REX::W32::ID3D11RenderTargetView*>(rtView.get()),
+				reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(srView.get()),
+				reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(copySRView.get()),
+				reinterpret_cast<REX::W32::ID3D11UnorderedAccessView*>(uaView.get())
+			};
+		}
+	};
+
+	struct BokehPhysicalTargetOverride
+	{
+		std::uint32_t physicalIndex{ kInvalidRenderTarget };
+		RE::BSGraphics::RenderTarget original{};
+	};
+
+	std::array<BokehProxyRenderTarget, kBokehTransientTargets.size()> g_bokehProxyTargets;
+	thread_local std::array<BokehPhysicalTargetOverride, kBokehTransientTargets.size()> g_bokehTargetOverrides;
+
+	[[nodiscard]] std::uint32_t GetPhysicalRenderTargetIndex(
+		RE::BSGraphics::RenderTargetManager* a_manager,
+		std::uint32_t a_logicalIndex)
+	{
+		// AE added three RenderTargetProperties entries before the ID table.
+		// The CommonLib structure currently describes the OG 0xDC4 layout.
+		const auto idTableOffset = REX::FModule::IsRuntimeOG() ? 0xDC4u : 0xDF4u;
+		const auto* idTable = reinterpret_cast<const std::uint32_t*>(
+			reinterpret_cast<const std::byte*>(a_manager) + idTableOffset);
+		return idTable[a_logicalIndex];
+	}
+
+	[[nodiscard]] bool HasMatchingBokehProxy(
+		const BokehProxyRenderTarget& a_proxy,
+		const RE::BSGraphics::RenderTarget& a_source,
+		const D3D11_TEXTURE2D_DESC& a_desiredDesc)
+	{
+		if (!a_proxy.texture ||
+			static_cast<bool>(a_proxy.copyTexture) != (a_source.copyTexture != nullptr) ||
+			static_cast<bool>(a_proxy.rtView) != (a_source.rtView != nullptr) ||
+			static_cast<bool>(a_proxy.srView) != (a_source.srView != nullptr) ||
+			static_cast<bool>(a_proxy.copySRView) != (a_source.copySRView != nullptr) ||
+			static_cast<bool>(a_proxy.uaView) != (a_source.uaView != nullptr)) {
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC proxyDesc{};
+		a_proxy.texture->GetDesc(&proxyDesc);
+		return std::memcmp(&proxyDesc, &a_desiredDesc, sizeof(proxyDesc)) == 0;
+	}
+
+	[[nodiscard]] bool CreateBokehProxyRenderTarget(
+		std::size_t a_slot,
+		const RE::BSGraphics::RenderTarget& a_source,
+		std::uint32_t a_width,
+		std::uint32_t a_height)
+	{
+		if (a_slot >= g_bokehProxyTargets.size() || !a_source.texture || a_width == 0 || a_height == 0) {
+			return false;
+		}
+
+		auto* sourceTexture = reinterpret_cast<ID3D11Texture2D*>(a_source.texture);
+		D3D11_TEXTURE2D_DESC textureDesc{};
+		sourceTexture->GetDesc(&textureDesc);
+		textureDesc.Width = a_width;
+		textureDesc.Height = a_height;
+
+		if (HasMatchingBokehProxy(g_bokehProxyTargets[a_slot], a_source, textureDesc)) {
+			return true;
+		}
+
+		static auto* rendererData = RE::BSGraphics::GetRendererData();
+		auto* device = reinterpret_cast<ID3D11Device*>(rendererData->device);
+		if (!device) {
+			return false;
+		}
+
+		BokehProxyRenderTarget proxy;
+		auto result = device->CreateTexture2D(&textureDesc, nullptr, proxy.texture.put());
+		if (FAILED(result)) {
+			logger::warn(
+				"[Upscaling] Failed to create Bokeh RT{} proxy texture {}x{}: 0x{:08X}",
+				kBokehTransientTargets[a_slot],
+				a_width,
+				a_height,
+				static_cast<std::uint32_t>(result));
+			return false;
+		}
+
+		if (a_source.rtView) {
+			D3D11_RENDER_TARGET_VIEW_DESC viewDesc{};
+			reinterpret_cast<ID3D11RenderTargetView*>(a_source.rtView)->GetDesc(&viewDesc);
+			result = device->CreateRenderTargetView(proxy.texture.get(), &viewDesc, proxy.rtView.put());
+			if (FAILED(result)) {
+				return false;
+			}
+		}
+
+		if (a_source.srView) {
+			D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+			reinterpret_cast<ID3D11ShaderResourceView*>(a_source.srView)->GetDesc(&viewDesc);
+			result = device->CreateShaderResourceView(proxy.texture.get(), &viewDesc, proxy.srView.put());
+			if (FAILED(result)) {
+				return false;
+			}
+		}
+
+		if (a_source.uaView) {
+			D3D11_UNORDERED_ACCESS_VIEW_DESC viewDesc{};
+			reinterpret_cast<ID3D11UnorderedAccessView*>(a_source.uaView)->GetDesc(&viewDesc);
+			result = device->CreateUnorderedAccessView(proxy.texture.get(), &viewDesc, proxy.uaView.put());
+			if (FAILED(result)) {
+				return false;
+			}
+		}
+
+		if (a_source.copyTexture) {
+			D3D11_TEXTURE2D_DESC copyDesc{};
+			reinterpret_cast<ID3D11Texture2D*>(a_source.copyTexture)->GetDesc(&copyDesc);
+			copyDesc.Width = a_width;
+			copyDesc.Height = a_height;
+			result = device->CreateTexture2D(&copyDesc, nullptr, proxy.copyTexture.put());
+			if (FAILED(result)) {
+				return false;
+			}
+
+			if (a_source.copySRView) {
+				D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+				reinterpret_cast<ID3D11ShaderResourceView*>(a_source.copySRView)->GetDesc(&viewDesc);
+				result = device->CreateShaderResourceView(proxy.copyTexture.get(), &viewDesc, proxy.copySRView.put());
+				if (FAILED(result)) {
+					return false;
+				}
+			}
+		}
+
+#ifndef NDEBUG
+		const auto debugName = std::format("Bokeh RT{} proxy", kBokehTransientTargets[a_slot]);
+		proxy.texture->SetPrivateData(
+			WKPDID_D3DDebugObjectName,
+			static_cast<UINT>(debugName.size()),
+			debugName.data());
+#endif
+
+		g_bokehProxyTargets[a_slot] = std::move(proxy);
+		return true;
+	}
+
+	void OverrideBokehTransientTarget(
+		RE::BSGraphics::RenderTargetManager* a_manager,
+		std::uint32_t a_logicalIndex)
+	{
+		if (g_bokehProxyScopeDepth == 0 || !a_manager) {
+			return;
+		}
+
+		const auto target = std::find(
+			kBokehTransientTargets.begin(),
+			kBokehTransientTargets.end(),
+			a_logicalIndex);
+		if (target == kBokehTransientTargets.end()) {
+			return;
+		}
+
+		const auto slot = static_cast<std::size_t>(target - kBokehTransientTargets.begin());
+		if (g_bokehTargetOverrides[slot].physicalIndex != kInvalidRenderTarget) {
+			return;
+		}
+
+		static auto* rendererData = RE::BSGraphics::GetRendererData();
+		const auto physicalIndex = GetPhysicalRenderTargetIndex(a_manager, a_logicalIndex);
+		if (physicalIndex == kInvalidRenderTarget || physicalIndex >= std::size(rendererData->renderTargets)) {
+			return;
+		}
+
+		auto& physicalTarget = rendererData->renderTargets[physicalIndex];
+		const auto& properties = a_manager->renderTargetData[a_logicalIndex];
+		if (!CreateBokehProxyRenderTarget(slot, physicalTarget, properties.width, properties.height)) {
+			return;
+		}
+
+		D3D11_TEXTURE2D_DESC physicalDesc{};
+		reinterpret_cast<ID3D11Texture2D*>(physicalTarget.texture)->GetDesc(&physicalDesc);
+		if (physicalDesc.Width == properties.width && physicalDesc.Height == properties.height) {
+			return;
+		}
+
+		g_bokehTargetOverrides[slot].physicalIndex = physicalIndex;
+		g_bokehTargetOverrides[slot].original = physicalTarget;
+		physicalTarget = g_bokehProxyTargets[slot].GetGameTarget();
+	}
+
+	void ResetBokehTransientTargets()
+	{
+		static auto* rendererData = RE::BSGraphics::GetRendererData();
+		for (std::size_t slot = g_bokehTargetOverrides.size(); slot-- > 0;) {
+			auto& targetOverride = g_bokehTargetOverrides[slot];
+			if (targetOverride.physicalIndex == kInvalidRenderTarget ||
+				targetOverride.physicalIndex >= std::size(rendererData->renderTargets)) {
+				targetOverride = {};
+				continue;
+			}
+
+			auto& physicalTarget = rendererData->renderTargets[targetOverride.physicalIndex];
+			if (physicalTarget.texture == g_bokehProxyTargets[slot].GetGameTarget().texture) {
+				physicalTarget = targetOverride.original;
+			}
+			targetOverride = {};
+		}
+	}
+
+	class ScopedBokehProxyTargets
+	{
+	public:
+		ScopedBokehProxyTargets() : active_(g_proxyImageSpaceDimensionsDepth != 0)
+		{
+			if (active_) {
+				++g_bokehProxyScopeDepth;
+			}
+		}
+
+		~ScopedBokehProxyTargets()
+		{
+			if (!active_ || g_bokehProxyScopeDepth == 0) {
+				return;
+			}
+
+			if (--g_bokehProxyScopeDepth == 0) {
+				ResetBokehTransientTargets();
+			}
+		}
+
+	private:
+		bool active_{ false };
+	};
+
 	ID3DBlob* CompileInlineShader(const char* a_source, const char* a_entry, const char* a_target)
 	{
 		constexpr uint32_t flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
@@ -4420,6 +4715,98 @@ PSOut8 PSMainMRT8(VSOut input)
 }
 
 void RestoreDynamicResolutionViewportDefaultFlag(RE::BSGraphics::RenderTargetManager* a_renderTargetManager);
+
+class ScopedProxyImageSpaceDimensions
+{
+public:
+	ScopedProxyImageSpaceDimensions(
+		RE::BSGraphics::State* a_state,
+		float a_widthRatio,
+		float a_heightRatio) :
+		state_(a_state)
+	{
+		if (!state_ || !(a_widthRatio > 0.0f && a_widthRatio <= 1.0f) ||
+			!(a_heightRatio > 0.0f && a_heightRatio <= 1.0f) ||
+			(a_widthRatio == 1.0f && a_heightRatio == 1.0f)) {
+			state_ = nullptr;
+			return;
+		}
+
+		backBufferWidth_ = state_->backBufferWidth;
+		backBufferHeight_ = state_->backBufferHeight;
+		screenWidth_ = state_->screenWidth;
+		screenHeight_ = state_->screenHeight;
+
+		state_->backBufferWidth = ScaleDimension(backBufferWidth_, a_widthRatio);
+		state_->backBufferHeight = ScaleDimension(backBufferHeight_, a_heightRatio);
+		state_->screenWidth = ScaleDimension(screenWidth_, a_widthRatio);
+		state_->screenHeight = ScaleDimension(screenHeight_, a_heightRatio);
+		++g_proxyImageSpaceDimensionsDepth;
+	}
+
+	~ScopedProxyImageSpaceDimensions()
+	{
+		if (!state_) {
+			return;
+		}
+
+		state_->backBufferWidth = backBufferWidth_;
+		state_->backBufferHeight = backBufferHeight_;
+		state_->screenWidth = screenWidth_;
+		state_->screenHeight = screenHeight_;
+		if (g_proxyImageSpaceDimensionsDepth != 0) {
+			--g_proxyImageSpaceDimensionsDepth;
+		}
+	}
+
+	ScopedProxyImageSpaceDimensions(const ScopedProxyImageSpaceDimensions&) = delete;
+	ScopedProxyImageSpaceDimensions& operator=(const ScopedProxyImageSpaceDimensions&) = delete;
+
+private:
+	static std::uint32_t ScaleDimension(std::uint32_t a_dimension, float a_ratio)
+	{
+		return std::max(1u, static_cast<std::uint32_t>(static_cast<float>(a_dimension) * a_ratio));
+	}
+
+	RE::BSGraphics::State* state_{ nullptr };
+	std::uint32_t backBufferWidth_{ 0 };
+	std::uint32_t backBufferHeight_{ 0 };
+	std::uint32_t screenWidth_{ 0 };
+	std::uint32_t screenHeight_{ 0 };
+};
+
+/** @brief Replace Bokeh's transient pooled targets after the engine resolves their physical slots. */
+struct BSGraphics_RenderTargetManager_AcquireRenderTarget_BokehProxy
+{
+	static void thunk(RE::BSGraphics::RenderTargetManager* This, int a_target)
+	{
+		func(This, a_target);
+		if (a_target >= 0) {
+			OverrideBokehTransientTarget(This, static_cast<std::uint32_t>(a_target));
+		}
+	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
+
+/** @brief Limit transient target replacement to the Bokeh effect's four passes. */
+struct ImageSpaceEffectBokehDepthOfField_Render_BokehProxy
+{
+	static void thunk(void* This, RE::BSTriShape* a_geometry, void* a_param)
+	{
+		// The ENB path promotes Bokeh to native geometry/constants. Its engine
+		// implementation then resolves DepthBuffer 1 through RendererData, after
+		// the early image-space range has restored the dynamic-resolution depth.
+		// Expose the expanded native-depth bridge only for Bokeh's four passes.
+		const bool useENBNativeDepth =
+			g_enbNativeImageSpaceParamScopeDepth > 0 &&
+			g_enbNativeDepthSRV &&
+			g_enbNativeDepthFrame == CurrentGameFrame();
+		const ScopedFalloutMainDepthBinding nativeDepth(useENBNativeDepth);
+		const ScopedBokehProxyTargets proxyTargets;
+		func(This, a_geometry, a_param);
+	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
 
 /** @brief Hook to fix outline thickness in VATs shader*/
 struct ImageSpaceEffectVatsTarget_UpdateParams_SetPixelConstant
@@ -4483,6 +4870,9 @@ struct DrawWorld_Imagespace_RenderEffectRange
 					upscaling->depthOverrideTexture ? upscaling->depthOverrideTexture->srv.get() : nullptr,
 					static_cast<uint32_t>(gameViewport->screenWidth),
 					static_cast<uint32_t>(gameViewport->screenHeight));
+				g_enbNativeDepthFrame = nativeDepthReady ?
+					CurrentGameFrame() :
+					std::numeric_limits<std::uint64_t>::max();
 
 				// Promote only after the deferred/ENB composites are complete. Copy the
 				// current render rectangles directly: the former override/reset pair did
@@ -4533,7 +4923,17 @@ struct DrawWorld_Imagespace_RenderEffectRange
 			upscaling->OverrideDepth(true);
 			SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
 
-			func(This, 4, 13, 1, 1);
+			{
+				// The proxy targets and their RenderTargetProperties are render-sized, but
+				// several effects read State's allocation dimensions directly. Bokeh DOF,
+				// for example, derives its vertex constants from backBufferWidth/Height.
+				// Keep those constants in the same domain while the proxy range executes.
+				const ScopedProxyImageSpaceDimensions proxyDimensions(
+					gameViewport,
+					frameDynamicWidthRatio,
+					frameDynamicHeightRatio);
+				func(This, 4, 13, 1, 1);
+			}
 			upscaling->ResetDepth();
 			upscaling->ResetRenderTargets({ 1, 2, 4 });
 			SetDynamicResolutionRatio(renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio);
@@ -4598,7 +4998,13 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 			upscaling->OverrideRenderTargets({ static_cast<int>(a4) });
 			upscaling->OverrideDepth(true);
 			SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
-			func(This, a2, a3, a4, a5);
+			{
+				const ScopedProxyImageSpaceDimensions proxyDimensions(
+					gameViewport,
+					frameDynamicWidthRatio,
+					frameDynamicHeightRatio);
+				func(This, a2, a3, a4, a5);
+			}
 			upscaling->ResetDepth();
 			upscaling->ResetRenderTargets({ static_cast<int>(a5) });
 			SetDynamicResolutionRatio(renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio);
@@ -5059,6 +5465,15 @@ void Upscaling::InstallHooks()
 	// Fix dynamic resolution for post processing
 	stl::write_thunk_call<DrawWorld_Imagespace_RenderEffectRange>(
 		REL::ID{ 587723, 2318322 }.address() + (isOG ? 0x9F : 0x83));
+
+	// Bokeh's RT84/RT85 are logical transient targets backed by native-sized
+	// pooled renderer slots. Match those physical allocations to the proxy
+	// metadata while Bokeh runs so its normalized blur passes cannot scale the
+	// active render rectangle a second time.
+	stl::detour_thunk<BSGraphics_RenderTargetManager_AcquireRenderTarget_BokehProxy>(
+		REL::ID{ 1468639, 2277219 });
+	stl::detour_thunk<ImageSpaceEffectBokehDepthOfField_Render_BokehProxy>(
+		REL::ID{ 1108909, 2318617 });
 
 	// Fix dynamic resolution for HBAO
 	stl::write_thunk_call<DrawWorld_Render_PreUI_NVHBAO>(
