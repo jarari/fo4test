@@ -826,7 +826,7 @@ void Streamline::ApplyPendingDLSSGDisable()
 
 	pendingDLSSGDisable = false;
 	if (DisableDLSSGNow()) {
-		dlssgPresentSafetyFrames = 0;
+		dlssgPresentSafetyFrames = 2;
 	}
 }
 
@@ -1392,6 +1392,11 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		parameters.options.globalToneStrength = a_dlssNROptions.globalToneStrength;
 		parameters.options.skinStructureStrength = a_dlssNROptions.skinStructureStrength;
 		parameters.options.useAutoMask = a_dlssNROptions.useAutoMask == sl::Boolean::eTrue;
+		if (directDLSSNR.NeedsFeatureRecreation(parameters)) {
+			// NGX releases the old feature during recreation. Its internal resources
+			// may still be referenced by earlier frames, so drain the owning queue first.
+			DX12SwapChain::GetSingleton()->WaitForGPUIdle();
+		}
 		return directDLSSNR.Evaluate(a_commandList, parameters);
 	};
 
@@ -1418,7 +1423,9 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 			return true;
 		}
 	} else {
-		directDLSSNR.ReleaseFeature();
+		// Retain the direct feature while NR is off. Releasing it here can race
+		// evaluations from earlier frames; normal upscaler teardown releases it
+		// after DX12SwapChain has drained the queue.
 		loggedDLSSNRFallback = false;
 	}
 

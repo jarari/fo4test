@@ -48,18 +48,22 @@ namespace
 	}
 }
 
-bool TaggedTextureDebug::EnsureResources(ID3D12Device* a_device, DXGI_FORMAT a_backBufferFormat)
+bool TaggedTextureDebug::EnsureResources(ID3D12Device* a_device, DXGI_FORMAT a_backBufferFormat, uint32_t a_descriptorSlotCount)
 {
-	if (!a_device || a_backBufferFormat == DXGI_FORMAT_UNKNOWN) {
+	if (!a_device || a_backBufferFormat == DXGI_FORMAT_UNKNOWN || a_descriptorSlotCount == 0) {
 		return false;
 	}
 
-	if (device.get() == a_device && pipelineState && currentBackBufferFormat == a_backBufferFormat) {
+	if (device.get() == a_device &&
+		pipelineState &&
+		currentBackBufferFormat == a_backBufferFormat &&
+		currentDescriptorSlotCount >= a_descriptorSlotCount) {
 		return true;
 	}
 
 	device.copy_from(a_device);
 	currentBackBufferFormat = a_backBufferFormat;
+	currentDescriptorSlotCount = a_descriptorSlotCount;
 
 	try {
 		D3D12_DESCRIPTOR_RANGE range{};
@@ -177,19 +181,20 @@ float4 PSMain(PSInput input) : SV_TARGET
 		ThrowIfFailed(a_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(pipelineState.put())));
 
 		D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
-		srvHeapDesc.NumDescriptors = 4;
+		srvHeapDesc.NumDescriptors = kSRVsPerSlot * currentDescriptorSlotCount;
 		srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 		srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 		ThrowIfFailed(a_device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(srvHeap.put())));
 
 		D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
-		rtvHeapDesc.NumDescriptors = 1;
+		rtvHeapDesc.NumDescriptors = currentDescriptorSlotCount;
 		rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 		ThrowIfFailed(a_device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(rtvHeap.put())));
 	} catch (const std::exception& e) {
 		logger::warn("[TaggedTextureDebug] Resource creation failed: {}", e.what());
 		rootSignature = nullptr;
 		pipelineState = nullptr;
+		currentDescriptorSlotCount = 0;
 		return false;
 	}
 
@@ -220,22 +225,27 @@ void TaggedTextureDebug::Render(
 	ID3D12Resource* a_finalImage,
 	DXGI_FORMAT a_backBufferFormat,
 	uint32_t a_width,
-	uint32_t a_height)
+	uint32_t a_height,
+	uint32_t a_descriptorSlot,
+	uint32_t a_descriptorSlotCount)
 {
 	if (!a_device || !a_commandList || !a_backBuffer || !a_color || !a_depth || !a_motionVectors || !a_finalImage || a_width == 0 || a_height == 0) {
 		return;
 	}
-	if (!EnsureResources(a_device, a_backBufferFormat)) {
+	if (!EnsureResources(a_device, a_backBufferFormat, a_descriptorSlotCount) || a_descriptorSlot >= currentDescriptorSlotCount) {
 		return;
 	}
 
-	CreateSRV(a_device, a_color, 0);
-	CreateSRV(a_device, a_depth, 1);
-	CreateSRV(a_device, a_motionVectors, 2);
-	CreateSRV(a_device, a_finalImage, 3);
+	const auto srvBaseIndex = a_descriptorSlot * kSRVsPerSlot;
+	CreateSRV(a_device, a_color, srvBaseIndex);
+	CreateSRV(a_device, a_depth, srvBaseIndex + 1);
+	CreateSRV(a_device, a_motionVectors, srvBaseIndex + 2);
+	CreateSRV(a_device, a_finalImage, srvBaseIndex + 3);
 
-	a_device->CreateRenderTargetView(a_backBuffer, nullptr, rtvHeap->GetCPUDescriptorHandleForHeapStart());
+	const auto rtvIncrement = a_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	auto rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+	rtv.ptr += static_cast<SIZE_T>(a_descriptorSlot) * rtvIncrement;
+	a_device->CreateRenderTargetView(a_backBuffer, nullptr, rtv);
 	a_commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
 
 	ID3D12DescriptorHeap* heaps[] = { srvHeap.get() };
@@ -243,7 +253,10 @@ void TaggedTextureDebug::Render(
 	a_commandList->SetGraphicsRootSignature(rootSignature.get());
 	a_commandList->SetPipelineState(pipelineState.get());
 	a_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	a_commandList->SetGraphicsRootDescriptorTable(0, srvHeap->GetGPUDescriptorHandleForHeapStart());
+	const auto srvIncrement = a_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	auto srvTable = srvHeap->GetGPUDescriptorHandleForHeapStart();
+	srvTable.ptr += static_cast<UINT64>(srvBaseIndex) * srvIncrement;
+	a_commandList->SetGraphicsRootDescriptorTable(0, srvTable);
 	const float screenSize[] = { static_cast<float>(a_width), static_cast<float>(a_height) };
 	a_commandList->SetGraphicsRoot32BitConstants(1, 2, screenSize, 0);
 	D3D12_VIEWPORT viewport{ 0.0f, 0.0f, static_cast<float>(a_width), static_cast<float>(a_height), 0.0f, 1.0f };

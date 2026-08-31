@@ -7,7 +7,7 @@
 // here so they can be replaced with the public SDK declarations later.
 
 #include <d3d12.h>
-#include <nvsdk_ngx_params.h>
+#include <nvsdk_ngx.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -113,6 +113,7 @@ namespace nvngx::dlss_nr
 
 		void SetRuntimeDirectory(const std::filesystem::path& a_runtimeDirectory);
 		bool Prepare(ID3D12Device* a_device);
+		bool NeedsFeatureRecreation(const D3D12EvaluationParameters& a_parameters) const;
 		bool Evaluate(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters);
 		void RequestReset();
 		void ReleaseFeature();

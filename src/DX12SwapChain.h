@@ -96,8 +96,11 @@ public:
 
 	DXGISwapChainProxy* GetSwapChainProxy() const { return swapChainProxy; }
 	bool IsReady() const { return swapChainProxy && swapChain; }
+	bool IsWindowMinimized() const { return hwnd && IsIconic(hwnd); }
 	UINT GetFrameIndex() const { return frameIndex; }
 	ID3D12Device* GetD3D12Device() const { return d3d12Device.get(); }
+	void WaitForFrameSlot(UINT a_frameIndex);
+	void WaitForGPUIdle();
 
 	HRESULT Present(UINT SyncInterval, UINT Flags);
 	struct D3D12EvaluationResult
@@ -130,6 +133,7 @@ private:
 		winrt::com_ptr<ID3D12CommandAllocator> allocator;
 		winrt::com_ptr<ID3D12GraphicsCommandList4> list;
 		std::unique_ptr<D3D11D3D12SharedTexture> presentStaging;
+		winrt::com_ptr<ID3D12Resource> retainedPresentOverride;
 		UINT index = 0;
 		UINT64 fenceValue = 0;
 	};
@@ -159,6 +163,7 @@ private:
 	UINT nextCommandContext = 0;
 	UINT64 fenceValue = 1;
 	UINT64 commandFenceValue = 1;
+	std::array<UINT64, kDX12FrameCount> frameSlotFenceValues{};
 	bool fidelityFXFrameGenerationSwapChainAllowed = false;
 	double desktopRefreshHz = 0.0;
 	HWND hwnd = nullptr;

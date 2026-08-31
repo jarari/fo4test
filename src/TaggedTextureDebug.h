@@ -25,11 +25,14 @@ public:
 		ID3D12Resource* a_finalImage,
 		DXGI_FORMAT a_backBufferFormat,
 		uint32_t a_width,
-		uint32_t a_height);
+		uint32_t a_height,
+		uint32_t a_descriptorSlot,
+		uint32_t a_descriptorSlotCount);
 
 private:
-	bool EnsureResources(ID3D12Device* a_device, DXGI_FORMAT a_backBufferFormat);
+	bool EnsureResources(ID3D12Device* a_device, DXGI_FORMAT a_backBufferFormat, uint32_t a_descriptorSlotCount);
 	void CreateSRV(ID3D12Device* a_device, ID3D12Resource* a_resource, uint32_t a_index);
+	static constexpr uint32_t kSRVsPerSlot = 4;
 
 	winrt::com_ptr<ID3D12Device> device;
 	winrt::com_ptr<ID3D12RootSignature> rootSignature;
@@ -37,4 +40,5 @@ private:
 	winrt::com_ptr<ID3D12DescriptorHeap> srvHeap;
 	winrt::com_ptr<ID3D12DescriptorHeap> rtvHeap;
 	DXGI_FORMAT currentBackBufferFormat = DXGI_FORMAT_UNKNOWN;
+	uint32_t currentDescriptorSlotCount = 0;
 };

@@ -441,15 +441,7 @@ namespace nvngx::dlss_nr
 			return false;
 		}
 
-		const auto configurationChanged =
-			feature_ &&
-			(featureInputWidth_ != a_parameters.inputWidth ||
-				featureInputHeight_ != a_parameters.inputHeight ||
-				featureOutputWidth_ != a_parameters.outputWidth ||
-				featureOutputHeight_ != a_parameters.outputHeight ||
-				featurePerformanceMode_ != a_parameters.options.performanceMode ||
-				featurePreset_ != a_parameters.options.preset);
-		if (configurationChanged) {
+		if (NeedsFeatureRecreation(a_parameters)) {
 			ReleaseFeature();
 		}
 		if (feature_) {
@@ -584,6 +576,17 @@ namespace nvngx::dlss_nr
 		parameters_->Set("DLSS.Indicator.Invert.Y.Axis", 0);
 	}
 
+	bool D3D12Backend::NeedsFeatureRecreation(const D3D12EvaluationParameters& a_parameters) const
+	{
+		return feature_ &&
+			(featureInputWidth_ != a_parameters.inputWidth ||
+				featureInputHeight_ != a_parameters.inputHeight ||
+				featureOutputWidth_ != a_parameters.outputWidth ||
+				featureOutputHeight_ != a_parameters.outputHeight ||
+				featurePerformanceMode_ != a_parameters.options.performanceMode ||
+				featurePreset_ != a_parameters.options.preset);
+	}
+
 	bool D3D12Backend::Evaluate(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters)
 	{
 		if (!a_commandList || !a_parameters.color || !a_parameters.output ||
@@ -670,7 +673,8 @@ namespace nvngx::dlss_nr
 				outputDesc.Height,
 				a_parameters.options.performanceMode,
 				reset);
-			ReleaseFeature();
+			// The failed call may still have recorded commands referencing the NGX
+			// feature. Keep it alive until a queue-drained recreation or shutdown.
 			failureLatched_ = true;
 			failedInputWidth_ = a_parameters.inputWidth;
 			failedInputHeight_ = a_parameters.inputHeight;

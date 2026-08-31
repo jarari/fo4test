@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <dx12/ffx_api_dx12.hpp>
 
+#include "DX12SwapChain.h"
 #include "Util.h"
 
 namespace
@@ -376,6 +377,17 @@ bool FidelityFX::ConfigureFrameGeneration(
 		return true;
 	}
 
+	const auto displayWidth = static_cast<uint32_t>(std::ceil(a_displaySize.x));
+	const auto displayHeight = static_cast<uint32_t>(std::ceil(a_displaySize.y));
+	const bool recreateFrameGenerationContext =
+		frameGenContext &&
+		(frameGenDevice != a_device ||
+			static_cast<uint32_t>(frameGenDisplaySize.x) != displayWidth ||
+			static_cast<uint32_t>(frameGenDisplaySize.y) != displayHeight ||
+			frameGenBackBufferFormat != a_backBufferFormat);
+	if (recreateFrameGenerationContext) {
+		DX12SwapChain::GetSingleton()->WaitForGPUIdle();
+	}
 	if (!EnsureFrameGenerationContext(a_device, a_displaySize, a_backBufferFormat)) {
 		return false;
 	}
@@ -519,6 +531,20 @@ bool FidelityFX::UpscaleD3D12(
 		return false;
 	}
 
+	const auto renderWidth = static_cast<uint32_t>(std::ceil(a_renderSize.x));
+	const auto renderHeight = static_cast<uint32_t>(std::ceil(a_renderSize.y));
+	const auto displayWidth = static_cast<uint32_t>(std::ceil(a_displaySize.x));
+	const auto displayHeight = static_cast<uint32_t>(std::ceil(a_displaySize.y));
+	const bool recreateUpscaleContext =
+		context &&
+		(contextDevice != a_device ||
+			static_cast<uint32_t>(contextRenderSize.x) != renderWidth ||
+			static_cast<uint32_t>(contextRenderSize.y) != renderHeight ||
+			static_cast<uint32_t>(contextDisplaySize.x) != displayWidth ||
+			static_cast<uint32_t>(contextDisplaySize.y) != displayHeight);
+	if (recreateUpscaleContext) {
+		DX12SwapChain::GetSingleton()->WaitForGPUIdle();
+	}
 	if (!EnsureContext(a_device, a_renderSize, a_displaySize)) {
 		return false;
 	}
