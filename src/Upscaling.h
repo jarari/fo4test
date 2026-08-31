@@ -97,11 +97,14 @@ public:
 	Settings settings;
 
 	/**
-	 * @brief Load settings from MCM configuration file
+	 * @brief Load settings from the persistent configuration file
 	 *
-	 * Reads Data/MCM/Settings/Upscaling.ini and updates the settings struct
+	 * Reads the legacy-compatible Data/MCM/Settings/Upscaling.ini location and
+	 * updates the settings struct.
 	 */
 	void LoadSettings();
+	bool SaveSettings(const Settings& a_settings);
+	void ReloadSettingsIfChanged();
 
 	/**
 	 * @brief Determine which upscaling method should be used
@@ -131,7 +134,7 @@ public:
 	 * @param a_source Event source (unused)
 	 * @return Event control flag
 	 *
-	 * Reloads settings when pause menu is closed
+	 * Reloads settings when the existing Fallout pause-menu path closes
 	 */
 	RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*);
 

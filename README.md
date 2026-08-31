@@ -25,6 +25,7 @@ The `package/` directory contains the loose files that are meant to be installed
 ## Requirements
 
 - Windows x64.
+- [F4SE Menu Framework 3](https://www.nexusmods.com/fallout4/mods/105090) for the native in-game settings page.
 - Visual Studio 2022 with **Desktop development with C++**.
 - Git.
 - [xmake](https://xmake.io/).
@@ -100,6 +101,8 @@ Data/F4SE/Plugins/Upscaling.dll
 ```
 
 The package includes shader files under `Data/F4SE/Plugins/Upscaling/` and `Data/F4SE/Plugins/FrameGeneration/`. These are compiled at runtime by the plugin, so keep them with the installed mod.
+
+The native settings page is registered under the **Upscaling** section of F4SE Menu Framework. Changes are staged while the menu is open and applied when it closes. Existing installations continue to use `Data/MCM/Settings/Upscaling.ini` as the settings store so user configuration migrates without conversion; the existing Fallout pause-menu close reload path is also retained.
 
 ## License
 

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <d3dcompiler.h>
+#include <filesystem>
 #include <intrin.h>
 #include <limits>
 #include <memory>
@@ -5603,6 +5604,50 @@ void Upscaling::LoadSettings()
 	}
 }
 
+bool Upscaling::SaveSettings(const Settings& a_settings)
+{
+	const std::filesystem::path settingsPath(kSettingsPath);
+	std::error_code directoryError;
+	std::filesystem::create_directories(settingsPath.parent_path(), directoryError);
+	if (directoryError) {
+		logger::error("[Settings] Could not create settings directory: {}", directoryError.message());
+		return false;
+	}
+
+	CSimpleIniA ini;
+	ini.SetUnicode();
+	ini.LoadFile(kSettingsPath);
+
+	ini.SetLongValue("Settings", "iUpscaleMethodPreference", static_cast<long>(a_settings.upscaleMethodPreference));
+	ini.SetLongValue("Settings", "iQualityMode", static_cast<long>(a_settings.qualityMode));
+	ini.SetDoubleValue("Settings", "fSharpness", a_settings.sharpness);
+	ini.SetLongValue("Settings", "iFrameGenerationMode", static_cast<long>(a_settings.frameGenerationMode));
+	ini.SetLongValue("Settings", "iDLSSGGeneratedFrames", static_cast<long>(a_settings.dlssgGeneratedFrames));
+	ini.SetLongValue("Settings", "bDynamicMFGEnabled", static_cast<long>(a_settings.dynamicMFGEnabled));
+	ini.SetLongValue("Settings", "iDynamicMFGTargetFPS", static_cast<long>(a_settings.dynamicMFGTargetFPS));
+	ini.SetLongValue("Settings", "iReflexMode", static_cast<long>(a_settings.reflexMode));
+	ini.SetLongValue("Settings", "iDLSSModelPreset", static_cast<long>(a_settings.dlssModelPreset));
+	ini.SetLongValue("Settings", "iOnScreenDisplay", static_cast<long>(a_settings.osdMode));
+	ini.SetLongValue("Settings", "bTaggedTextureDebug", static_cast<long>(a_settings.taggedTextureDebug));
+	ini.SetLongValue("Settings", "bImageSpaceEffectLog", static_cast<long>(a_settings.imageSpaceEffectLog));
+
+	const auto result = ini.SaveFile(kSettingsPath);
+	if (result < 0) {
+		logger::error("[Settings] Could not write {} (SimpleIni result {})", kSettingsPath, result);
+		return false;
+	}
+
+	logger::info("[Settings] Saved settings from F4SE Menu Framework");
+	return true;
+}
+
+void Upscaling::ReloadSettingsIfChanged()
+{
+	if (SettingsFileChangedSinceLastLoad()) {
+		LoadSettings();
+	}
+}
+
 void Upscaling::OnDataLoaded()
 {
 	RE::UI::GetSingleton()->RegisterSink<RE::MenuOpenCloseEvent>(this);
@@ -5615,11 +5660,11 @@ RE::BSEventNotifyControl Upscaling::ProcessEvent(const RE::MenuOpenCloseEvent& a
 {
 	auto singleton = GetSingleton();
 
-	// Reload settings after MCM writes, without doing file parse work on
-	// every normal ESC close.
+	// Preserve the existing pause-menu close path for settings written by
+	// external tools or older MCM installations.
 	if (a_event.menuName == "PauseMenu") {
-		if (!a_event.opening && SettingsFileChangedSinceLastLoad()) {
-			singleton->LoadSettings();
+		if (!a_event.opening) {
+			singleton->ReloadSettingsIfChanged();
 		}
 	}
 	if (a_event.menuName == "ScopeMenu") {
