@@ -6855,6 +6855,11 @@ void Upscaling::CopyFrameGenerationBuffers()
 
 bool Upscaling::ShouldBlockTemporalFeatures() const
 {
+	const auto* dx12SwapChain = DX12SwapChain::GetSingleton();
+	if (dx12SwapChain->IsReady() && dx12SwapChain->IsWindowMinimized()) {
+		return true;
+	}
+
 	if (const auto ui = RE::UI::GetSingleton()) {
 		if (ui->menuMode > 0 || ui->freezeFramePause > 0) {
 			return true;
@@ -7070,6 +7075,11 @@ void Upscaling::CheckResources()
 	// kSpatialFallback is a temporary retry-blocked runtime mode and must not
 	// tear down the SDK resources it is standing in for.
 	if (previousResourceUpscaleMethodNoMenu != resourceUpscaleMethodNoMenu) {
+		if (dx12Ready) {
+			// SDK feature destruction and shared-resource release are only safe
+			// after all queued evaluations and intercepted Presents have drained.
+			DX12SwapChain::GetSingleton()->WaitForGPUIdle();
+		}
 		for (std::size_t i = 0; i < dlssD3D12InputsReady.size(); ++i) {
 			dlssgInputsReady[i] = false;
 			fsrFrameGenerationInputsReady[i] = false;
@@ -7293,11 +7303,16 @@ void Upscaling::UpdateUpscaling()
 	const bool frameGenerationSettingEnabled = settings.frameGenerationMode != 0 || settings.dynamicMFGEnabled != 0;
 	const bool upscalerSelected = upscaleMethodNoMenu != UpscaleMethod::kDisabled;
 	const bool menuBlocksTemporal = temporalFeaturesBlocked;
+	const bool windowMinimized = dx12Ready && DX12SwapChain::GetSingleton()->IsWindowMinimized();
 
 	upscaleMethod = menuBlocksTemporal ? UpscaleMethod::kDisabled : upscaleMethodNoMenu;
 
 	const bool menuBlocksUpscaling = upscalerSelected && menuBlocksTemporal;
-	const bool dlssgHeldThroughMenu = menuBlocksUpscaling && frameGenerationSettingEnabled && streamline->featureDLSSG;
+	const bool dlssgHeldThroughMenu =
+		menuBlocksUpscaling &&
+		!windowMinimized &&
+		frameGenerationSettingEnabled &&
+		streamline->featureDLSSG;
 	const bool menuSuspendsD3D12DLSS =
 		menuBlocksUpscaling &&
 		!dlssgHeldThroughMenu &&
@@ -7796,6 +7811,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		}
 		const auto debugFrameIndex = dx12SwapChain->GetFrameIndex();
 		if (settings.taggedTextureDebug != 0 && debugFrameIndex < debugMotionVectorSharedTextures.size() && motionVectorTexture) {
+			dx12SwapChain->WaitForFrameSlot(debugFrameIndex);
 			D3D11_TEXTURE2D_DESC debugMotionVectorDesc{};
 			motionVectorTexture->GetDesc(&debugMotionVectorDesc);
 			debugMotionVectorDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -7865,10 +7881,12 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 
 	static auto rendererData = RE::BSGraphics::GetRendererData();
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
-	const auto frameIndex = DX12SwapChain::GetSingleton()->GetFrameIndex();
+	auto* dx12SwapChain = DX12SwapChain::GetSingleton();
+	const auto frameIndex = dx12SwapChain->GetFrameIndex();
 	if (frameIndex >= fsrD3D12InputsReady.size()) {
 		return false;
 	}
+	dx12SwapChain->WaitForFrameSlot(frameIndex);
 	static auto gameViewport = Util::State_GetSingleton();
 	const bool usePatchedFrameGenerationBuffers =
 		upscaleMethod == UpscaleMethod::kDisabled &&
@@ -8075,6 +8093,11 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		}
 
 		const auto frameIndex = dx12SwapChain->GetFrameIndex();
+		if (frameIndex >= dlssgInputsReady.size()) {
+			frameBufferResource->Release();
+			return;
+		}
+		dx12SwapChain->WaitForFrameSlot(frameIndex);
 		dlssgInputsReady[frameIndex] = false;
 		fsrFrameGenerationInputsReady[frameIndex] = false;
 		dlssD3D12InputsReady[frameIndex] = false;
@@ -8612,7 +8635,6 @@ void Upscaling::TagDLSSGInputs(ID3D12GraphicsCommandList* a_commandList, uint32_
 		if (streamline->NeedsDLSSGPresentSafety()) {
 			if (!frameGenerationActive && streamline->dlssgActive) {
 				streamline->RequestDLSSGDisable();
-				streamline->ApplyPendingDLSSGDisable();
 			}
 			streamline->ClearDLSSGResourceTags(a_commandList);
 		}
@@ -8726,6 +8748,8 @@ void Upscaling::DestroyUpscalingResources()
 		debugMotionVectorSharedTextures[i] = nullptr;
 		fsrInputSharedTextures[i] = nullptr;
 		fsrOutputSharedTextures[i] = nullptr;
+		fsrOpaqueOnlySharedTextures[i] = nullptr;
+		fsrReactiveMaskSharedTextures[i] = nullptr;
 		fsrMotionVectorSharedTextures[i] = nullptr;
 		fsrDepthSharedTextures[i] = nullptr;
 		dlssInputD3D12[i] = nullptr;
@@ -8738,9 +8762,12 @@ void Upscaling::DestroyUpscalingResources()
 		debugMotionVectorD3D12[i] = nullptr;
 		fsrInputD3D12[i] = nullptr;
 		fsrOutputD3D12[i] = nullptr;
+		fsrOpaqueOnlyD3D12[i] = nullptr;
+		fsrReactiveMaskD3D12[i] = nullptr;
 		fsrMotionVectorD3D12[i] = nullptr;
 		fsrDepthD3D12[i] = nullptr;
 		dlssgInputsReady[i] = false;
+		fsrFrameGenerationInputsReady[i] = false;
 		fsrD3D12InputsReady[i] = false;
 		dlssD3D12InputsReady[i] = false;
 		dlssD3D12Sharpened[i] = false;
