@@ -144,6 +144,12 @@ namespace
 	constexpr std::ptrdiff_t kImageSpaceEffectListOffset = 0x18;
 	constexpr std::ptrdiff_t kImageSpaceEffectCountOffset = 0x22;
 	constexpr std::ptrdiff_t kImageSpaceManagerNativeGeometryOffset = 0x28;
+	constexpr std::ptrdiff_t kDynamicWidthRatioOffsetOG = 0xF88;
+	constexpr std::ptrdiff_t kDynamicWidthRatioOffsetAE = 0xFB8;
+	constexpr std::ptrdiff_t kDynamicHeightRatioOffsetOG = 0xF8C;
+	constexpr std::ptrdiff_t kDynamicHeightRatioOffsetAE = 0xFBC;
+	constexpr std::ptrdiff_t kDynamicResolutionActiveOffsetOG = 0xFA8;
+	constexpr std::ptrdiff_t kDynamicResolutionActiveOffsetAE = 0xFE5;
 	constexpr std::ptrdiff_t kServingThreadStateOffset = 0x68;
 	constexpr std::ptrdiff_t kHFPFDisableLoadingAnimationPatchOffsetOG = 0x19D;
 	constexpr std::ptrdiff_t kHFPFDisableLoadingAnimationPatchOffsetAE = 0x223;
@@ -833,11 +839,38 @@ namespace
 		return ratio.get();
 	}
 
+	struct DynamicResolutionRatios
+	{
+		float width{ 1.0f };
+		float height{ 1.0f };
+	};
+
+	DynamicResolutionRatios GetDynamicResolutionRatios()
+	{
+		return {
+			*GetGlobalDynamicWidthRatio(),
+			*GetGlobalDynamicHeightRatio()
+		};
+	}
+
+	bool IsDynamicResolutionScaled()
+	{
+		const auto ratios = GetDynamicResolutionRatios();
+		return ratios.width != 1.0f || ratios.height != 1.0f;
+	}
+
 	void SetDynamicResolutionRatio(RE::BSGraphics::RenderTargetManager* a_renderTargetManager, float a_widthRatio, float a_heightRatio)
 	{
-		a_renderTargetManager->dynamicWidthRatio = a_widthRatio;
-		a_renderTargetManager->dynamicHeightRatio = a_heightRatio;
-		a_renderTargetManager->isDynamicResolutionCurrentlyActivated = a_widthRatio != 1.0f || a_heightRatio != 1.0f;
+		if (a_renderTargetManager) {
+			// RenderTargetManager's tail layout is not ABI-stable: AE moves the
+			// ratio fields and active flag independently of the logical RT table.
+			auto* const managerBytes = reinterpret_cast<std::byte*>(a_renderTargetManager);
+			const bool isOG = REX::FModule::IsRuntimeOG();
+			*reinterpret_cast<float*>(managerBytes + (isOG ? kDynamicWidthRatioOffsetOG : kDynamicWidthRatioOffsetAE)) = a_widthRatio;
+			*reinterpret_cast<float*>(managerBytes + (isOG ? kDynamicHeightRatioOffsetOG : kDynamicHeightRatioOffsetAE)) = a_heightRatio;
+			*reinterpret_cast<bool*>(managerBytes + (isOG ? kDynamicResolutionActiveOffsetOG : kDynamicResolutionActiveOffsetAE)) =
+				a_widthRatio != 1.0f || a_heightRatio != 1.0f;
+		}
 
 		*GetGlobalDynamicWidthRatio() = a_widthRatio;
 		*GetGlobalDynamicHeightRatio() = a_heightRatio;
@@ -1642,8 +1675,9 @@ PSOut8 PSMainMRT8(VSOut input)
 			return false;
 		}
 
-		const auto widthRatio = renderTargetManager->dynamicWidthRatio;
-		const auto heightRatio = renderTargetManager->dynamicHeightRatio;
+		const auto ratios = GetDynamicResolutionRatios();
+		const auto widthRatio = ratios.width;
+		const auto heightRatio = ratios.height;
 		if (!(widthRatio > 0.0f && widthRatio < 1.0f) ||
 			!(heightRatio > 0.0f && heightRatio < 1.0f)) {
 			return false;
@@ -2566,8 +2600,7 @@ PSOut8 PSMainMRT8(VSOut input)
 	{
 		auto upscaling = Upscaling::GetSingleton();
 		auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
-		return upscaling && renderTargetManager &&
-			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f) &&
+		return upscaling && renderTargetManager && IsDynamicResolutionScaled() &&
 			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
 	}
 
@@ -3589,14 +3622,15 @@ PSOut8 PSMainMRT8(VSOut input)
 		if (!renderTargetManager || !gameViewport) {
 			return false;
 		}
+		const auto ratios = GetDynamicResolutionRatios();
 		const auto expectedViewportWidth = std::max(
 			1u,
 			static_cast<UINT>(
-				static_cast<float>(gameViewport->screenWidth) * renderTargetManager->dynamicWidthRatio));
+				static_cast<float>(gameViewport->screenWidth) * ratios.width));
 		const auto expectedViewportHeight = std::max(
 			1u,
 			static_cast<UINT>(
-				static_cast<float>(gameViewport->screenHeight) * renderTargetManager->dynamicHeightRatio));
+				static_cast<float>(gameViewport->screenHeight) * ratios.height));
 		return g_enbSSSProjectionShaderCache.outputWidth == gameViewport->screenWidth &&
 			g_enbSSSProjectionShaderCache.outputHeight == gameViewport->screenHeight &&
 			std::abs(g_enbSSSProjectionShaderCache.viewportWidth -
@@ -4829,7 +4863,7 @@ struct DrawWorld_Imagespace_RenderEffectRange
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 		static auto gameViewport = Util::State_GetSingleton();
 
-		bool requiresOverride = renderTargetManager->dynamicHeightRatio != 1.0 || renderTargetManager->dynamicWidthRatio != 1.0;
+		const bool requiresOverride = IsDynamicResolutionScaled();
 
 		auto originalOffsetX = gameViewport->offsetX;
 		auto originalOffsetY = gameViewport->offsetY;
@@ -4841,8 +4875,9 @@ struct DrawWorld_Imagespace_RenderEffectRange
 			gameViewport->offsetY = originalOffsetY;
 		}
 
-		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
-		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
+		const auto ratios = GetDynamicResolutionRatios();
+		originalDynamicHeightRatio = ratios.height;
+		originalDynamicWidthRatio = ratios.width;
 		const auto frameDynamicHeightRatio = originalDynamicHeightRatio;
 		const auto frameDynamicWidthRatio = originalDynamicWidthRatio;
 		const bool enbCompatibilityActive =
@@ -4959,8 +4994,9 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 		static auto gameViewport = Util::State_GetSingleton();
 		const auto originalFrameBufferViewport = gameViewport->frameBufferViewport;
 
-		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
-		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
+		const auto ratios = GetDynamicResolutionRatios();
+		originalDynamicHeightRatio = ratios.height;
+		originalDynamicWidthRatio = ratios.width;
 		const auto frameDynamicHeightRatio = originalDynamicHeightRatio;
 		const auto frameDynamicWidthRatio = originalDynamicWidthRatio;
 
@@ -4975,7 +5011,7 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 		}
 
 		if (upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDisabled &&
-			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f)) {
+			IsDynamicResolutionScaled()) {
 			if (IsENBSRCompatibilityActive(upscaling->upscaleMethod)) {
 				SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
 				ApplyFullFrameViewport();
@@ -5034,8 +5070,9 @@ struct DrawWorld_Imagespace_SetUseDynamicResolutionViewportAsDefaultViewport
 
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 
-		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
-		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
+		const auto ratios = GetDynamicResolutionRatios();
+		originalDynamicHeightRatio = ratios.height;
+		originalDynamicWidthRatio = ratios.width;
 
 		SetDynamicResolutionRatio(renderTargetManager, 1.0f, 1.0f);
 
@@ -5184,10 +5221,11 @@ struct DrawWorld_Render_PreUI_NVHBAO
 		auto upscaling = Upscaling::GetSingleton();
 
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
-		bool requiresOverride = renderTargetManager->dynamicHeightRatio != 1.0 || renderTargetManager->dynamicWidthRatio != 1.0;
+		const bool requiresOverride = IsDynamicResolutionScaled();
 
-		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
-		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
+		const auto ratios = GetDynamicResolutionRatios();
+		originalDynamicHeightRatio = ratios.height;
+		originalDynamicWidthRatio = ratios.width;
 
 		if (requiresOverride) {
 			upscaling->OverrideDepth(true);
@@ -5213,10 +5251,11 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately
 	{
 		auto upscaling = Upscaling::GetSingleton();
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
-		bool requiresOverride = renderTargetManager->dynamicHeightRatio != 1.0 || renderTargetManager->dynamicWidthRatio != 1.0;
+		const bool requiresOverride = IsDynamicResolutionScaled();
 
-		originalDynamicHeightRatio = renderTargetManager->dynamicHeightRatio;
-		originalDynamicWidthRatio = renderTargetManager->dynamicWidthRatio;
+		const auto ratios = GetDynamicResolutionRatios();
+		originalDynamicHeightRatio = ratios.height;
+		originalDynamicWidthRatio = ratios.width;
 		const bool enbCompatibilityActive = IsENBSRCompatibilityActive(upscaling->upscaleMethod);
 		const bool useENBSSSProjection = requiresOverride && enbCompatibilityActive &&
 			IsENBSubSurfaceScatteringActive();
@@ -5268,9 +5307,8 @@ struct DrawWorld_DeferredComposite_RenderPassImmediately_First
 	static void thunk(RE::BSRenderPass* This, uint a2, bool a3)
 	{
 		auto upscaling = Upscaling::GetSingleton();
-		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 		const bool enbCompatibilityActive =
-			(renderTargetManager->dynamicHeightRatio != 1.0f || renderTargetManager->dynamicWidthRatio != 1.0f) &&
+			IsDynamicResolutionScaled() &&
 			IsENBSRCompatibilityActive(upscaling->upscaleMethod);
 
 		if (!enbCompatibilityActive) {
@@ -5330,6 +5368,37 @@ struct ImageSpaceManager_RenderEffect
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
+// AE's RenderEffectRange calls the index-based worker directly. It does not
+// pass through the pointer-based overload above (ID 2316597).
+struct ImageSpaceManager_RenderEffectByIndexAE
+{
+	static void thunk(void* This, uint32_t a_effectIndex, int a_targetA, int a_targetB, void* a_params)
+	{
+		if (g_enbNativeImageSpaceParamScopeDepth <= 0) {
+			func(This, a_effectIndex, a_targetA, a_targetB, a_params);
+			return;
+		}
+
+		void* effect = nullptr;
+		if (This) {
+			const auto effectArray = *reinterpret_cast<void***>(reinterpret_cast<std::byte*>(This) + kImageSpaceEffectListOffset);
+			const auto effectCount = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const std::byte*>(This) + kImageSpaceEffectCountOffset);
+			if (effectArray && a_effectIndex < effectCount) {
+				effect = effectArray[a_effectIndex];
+			}
+		}
+
+		LogENBNativeImageSpaceEffect(effect, static_cast<int32_t>(a_effectIndex), a_targetA, a_targetB);
+		const ScopedImageSpaceEffectNativeParams forceNativeParams(effect, static_cast<int32_t>(a_effectIndex));
+		const ScopedENBHDRFinalCompositeEffects hdrFinalCompositeEffects(effect, static_cast<int32_t>(a_effectIndex));
+		const ScopedENBRefractionCompositeEffect refractionCompositeEffect(effect, static_cast<int32_t>(a_effectIndex));
+		const ScopedENBNativeImageSpaceShaders nativeImageSpaceShaders(effect, static_cast<int32_t>(a_effectIndex));
+		func(This, a_effectIndex, a_targetA, a_targetB, a_params);
+	}
+
+	static inline REL::Relocation<decltype(thunk)> func;
+};
+
 /** @brief Hook for BSImagespaceShaderLensFlare with depth override */
 struct BSImagespaceShaderLensFlare_RenderLensFlare
 {
@@ -5337,8 +5406,7 @@ struct BSImagespaceShaderLensFlare_RenderLensFlare
 	{
 		auto upscaling = Upscaling::GetSingleton();
 
-		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
-		bool requiresOverride = renderTargetManager->dynamicHeightRatio != 1.0 || renderTargetManager->dynamicWidthRatio != 1.0;
+		const bool requiresOverride = IsDynamicResolutionScaled();
 
 		if (requiresOverride)
 			upscaling->OverrideDepth(true);
@@ -5453,7 +5521,14 @@ void Upscaling::InstallHooks()
 		// handoff on both runtimes; AE gained one byte before the call site.
 		stl::write_thunk_call<DrawWorld_DeferredComposite_RenderPassImmediately_First>(
 			REL::ID{ 728427, 2318313 }.address() + (isOG ? 0x1F4 : 0x1F5));
-		stl::detour_thunk<ImageSpaceManager_RenderEffect>(REL::ID{ 325252, 2316597 });
+		// AE's range loop and Addictol's bDofFix use the index-based worker
+		// (2316595). OG uses the pointer-based overload (325252). Chain either
+		// entry so an already-installed Addictol detour remains the next call.
+		if (isOG) {
+			stl::detour_thunk_chain<ImageSpaceManager_RenderEffect>(REL::ID{ 325252 });
+		} else {
+			stl::detour_thunk_chain<ImageSpaceManager_RenderEffectByIndexAE>(REL::ID{ 2316595 });
+		}
 		stl::detour_thunk<BSImagespaceShader_Render_ENBFinalComposite>(REL::ID{ 1388477, 2319297 });
 	}
 	// Fix dynamic resolution for Lens Flare visibility
@@ -5971,11 +6046,12 @@ void Upscaling::OverrideRenderTargets(std::initializer_list<int> a_indicesToCopy
 	}
 
 	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+	const auto ratios = GetDynamicResolutionRatios();
 
 	for (int i = 0; i < 100; i++) {
 		originalRenderTargetData[i] = renderTargetManager->renderTargetData[i];
-		renderTargetManager->renderTargetData[i].width = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[i].width) * renderTargetManager->dynamicWidthRatio);
-		renderTargetManager->renderTargetData[i].height = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[i].height) * renderTargetManager->dynamicHeightRatio);
+		renderTargetManager->renderTargetData[i].width = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[i].width) * ratios.width);
+		renderTargetManager->renderTargetData[i].height = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[i].height) * ratios.height);
 	}
 
 	// Check and override pixel shader SRVs that reference original render targets
@@ -6022,10 +6098,11 @@ void Upscaling::OverrideRenderTargetsSelective(std::initializer_list<int> a_targ
 	}
 
 	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
+	const auto ratios = GetDynamicResolutionRatios();
 	for (const auto targetIndex : a_targetIndices) {
 		originalRenderTargetData[targetIndex] = renderTargetManager->renderTargetData[targetIndex];
-		renderTargetManager->renderTargetData[targetIndex].width = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[targetIndex].width) * renderTargetManager->dynamicWidthRatio);
-		renderTargetManager->renderTargetData[targetIndex].height = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[targetIndex].height) * renderTargetManager->dynamicHeightRatio);
+		renderTargetManager->renderTargetData[targetIndex].width = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[targetIndex].width) * ratios.width);
+		renderTargetManager->renderTargetData[targetIndex].height = static_cast<uint>(static_cast<float>(renderTargetManager->renderTargetData[targetIndex].height) * ratios.height);
 	}
 
 	static auto rendererData = RE::BSGraphics::GetRendererData();
@@ -6397,11 +6474,11 @@ void Upscaling::CopyDepth()
 	context->OMSetRenderTargets(0, nullptr, nullptr);
 
 	static auto gameViewport = Util::State_GetSingleton();
-	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 
 	// Calculate both display (screen) and render (scaled) resolutions
 	auto screenSize = float2(float(gameViewport->screenWidth), float(gameViewport->screenHeight));
-	auto renderSize = float2(screenSize.x * renderTargetManager->dynamicWidthRatio, screenSize.y * renderTargetManager->dynamicHeightRatio);
+	const auto ratios = GetDynamicResolutionRatios();
+	auto renderSize = float2(screenSize.x * ratios.width, screenSize.y * ratios.height);
 
 	// Get the scaled depth buffer as input
 	auto depthSRV = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[(uint)Util::DepthStencilTarget::kMain].srViewDepth);
@@ -8824,19 +8901,19 @@ namespace
 void Upscaling::PatchSSRShader()
 {
 	static auto rendererData = RE::BSGraphics::GetRendererData();
-	static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+	const auto ratios = GetDynamicResolutionRatios();
 	LogSSLRBindings(
 		context,
-		renderTargetManager->dynamicWidthRatio,
-		renderTargetManager->dynamicHeightRatio);
+		ratios.width,
+		ratios.height);
 
 	// The ray equation and depth-mip DDA stay in allocation UV. The scale
 	// supplies the active allocation bounds and converts confidence distances
 	// back to logical UV without perturbing integer mip-cell traversal.
 	auto buffer = GetSSLRCoordinateBuffer(
-		renderTargetManager->dynamicWidthRatio,
-		renderTargetManager->dynamicHeightRatio);
+		ratios.width,
+		ratios.height);
 	context->PSSetConstantBuffers(13, 1, &buffer);
 
 	// Replace the game's SSR pixel shader with our custom one that fixes scaled render targets

@@ -13,6 +13,7 @@
 
 #include "Windows.h"
 
+#include <cstring>
 #include <string>
 using namespace std::literals;
 
@@ -143,6 +144,38 @@ namespace stl
 	void detour_thunk(REL::ID a_relId)
 	{
 		*(uintptr_t*)&T::func = Detours::X64::DetourFunction(a_relId.address(), (uintptr_t)&T::thunk);
+	}
+
+	inline std::uintptr_t get_jump_destination(std::uintptr_t a_target)
+	{
+		const auto* code = reinterpret_cast<const std::uint8_t*>(a_target);
+		if (code[0] == 0xE9) {
+			std::int32_t displacement{};
+			std::memcpy(&displacement, code + 1, sizeof(displacement));
+			return a_target + 5 + displacement;
+		}
+		if (code[0] == 0xFF && code[1] == 0x25) {
+			std::int32_t displacement{};
+			std::memcpy(&displacement, code + 2, sizeof(displacement));
+			std::uintptr_t destination{};
+			std::memcpy(&destination, reinterpret_cast<const void*>(a_target + 6 + displacement), sizeof(destination));
+			return destination;
+		}
+		return 0;
+	}
+
+	// Preserve a pre-existing entry detour as the next function in the chain.
+	// This is required for entry points shared with other F4SE plugins.
+	template <class T>
+	void detour_thunk_chain(REL::ID a_relId)
+	{
+		const auto target = a_relId.address();
+		const auto previousDetour = get_jump_destination(target);
+		const auto trampoline = Detours::X64::DetourFunction(
+			target,
+			(uintptr_t)&T::thunk,
+			Detours::X64Option::USE_REL32_JUMP);
+		*(uintptr_t*)&T::func = previousDetour ? previousDetour : trampoline;
 	}
 
 	template <class T>
