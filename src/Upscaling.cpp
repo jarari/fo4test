@@ -5544,6 +5544,16 @@ void Upscaling::LoadSettings()
 	const auto previousDLSSGGeneratedFrames = settings.dlssgGeneratedFrames;
 	const auto previousDynamicMFGEnabled = settings.dynamicMFGEnabled;
 	const auto previousDLSSModelPreset = settings.dlssModelPreset;
+	const auto previousDLSSNREnabled = settings.dlssNREnabled;
+	const auto previousDLSSNRPerformanceMode = settings.dlssNRPerformanceMode;
+	const auto previousDLSSNRPreset = settings.dlssNRPreset;
+	const auto previousDLSSNRStyle = settings.dlssNRStyle;
+	const auto previousDLSSNRUseAutoMask = settings.dlssNRUseAutoMask;
+	const auto previousDLSSNRIntensity = settings.dlssNRIntensity;
+	const auto previousDLSSNRLocalToneStrength = settings.dlssNRLocalToneStrength;
+	const auto previousDLSSNRLocalStructureStrength = settings.dlssNRLocalStructureStrength;
+	const auto previousDLSSNRGlobalToneStrength = settings.dlssNRGlobalToneStrength;
+	const auto previousDLSSNRSkinStructureStrength = settings.dlssNRSkinStructureStrength;
 	const bool previousImageSpaceEffectLog = settings.imageSpaceEffectLog != 0;
 
 	CSimpleIniA ini;
@@ -5559,6 +5569,16 @@ void Upscaling::LoadSettings()
 	settings.dynamicMFGTargetFPS = static_cast<uint>(ini.GetLongValue("Settings", "iDynamicMFGTargetFPS", 300));
 	settings.reflexMode = static_cast<uint>(ini.GetLongValue("Settings", "iReflexMode", 1));
 	settings.dlssModelPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iDLSSModelPreset", 0), 0, 4));
+	settings.dlssNREnabled = static_cast<uint>(ini.GetLongValue("DLSSNR", "bEnabled", 1) == 1);
+	settings.dlssNRPerformanceMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPerformanceMode", 0), 0, 5));
+	settings.dlssNRPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPreset", 0), 0, 3));
+	settings.dlssNRStyle = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iStyle", 0), 0, 1));
+	settings.dlssNRUseAutoMask = static_cast<uint>(ini.GetLongValue("DLSSNR", "bUseAutoMask", 0) == 1);
+	settings.dlssNRIntensity = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fIntensity", 1.0)), 0.0f, 2.0f);
+	settings.dlssNRLocalToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalToneStrength", 1.0)), 0.0f, 2.0f);
+	settings.dlssNRLocalStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalStructureStrength", 1.0)), 0.0f, 2.0f);
+	settings.dlssNRGlobalToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fGlobalToneStrength", 1.0)), 0.0f, 2.0f);
+	settings.dlssNRSkinStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fSkinStructureStrength", 1.0)), -1.0f, 2.0f);
 	settings.osdMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iOnScreenDisplay", 0), 0, 2));
 	settings.taggedTextureDebug = static_cast<uint>(ini.GetLongValue("Settings", "bTaggedTextureDebug", 0) == 1);
 	settings.imageSpaceEffectLog = static_cast<uint>(ini.GetLongValue("Settings", "bImageSpaceEffectLog", 0) == 1);
@@ -5576,7 +5596,17 @@ void Upscaling::LoadSettings()
 		previousFrameGenerationMode != settings.frameGenerationMode ||
 		previousDLSSGGeneratedFrames != settings.dlssgGeneratedFrames ||
 		previousDynamicMFGEnabled != settings.dynamicMFGEnabled ||
-		previousDLSSModelPreset != settings.dlssModelPreset) {
+		previousDLSSModelPreset != settings.dlssModelPreset ||
+		previousDLSSNREnabled != settings.dlssNREnabled ||
+		previousDLSSNRPerformanceMode != settings.dlssNRPerformanceMode ||
+		previousDLSSNRPreset != settings.dlssNRPreset ||
+		previousDLSSNRStyle != settings.dlssNRStyle ||
+		previousDLSSNRUseAutoMask != settings.dlssNRUseAutoMask ||
+		previousDLSSNRIntensity != settings.dlssNRIntensity ||
+		previousDLSSNRLocalToneStrength != settings.dlssNRLocalToneStrength ||
+		previousDLSSNRLocalStructureStrength != settings.dlssNRLocalStructureStrength ||
+		previousDLSSNRGlobalToneStrength != settings.dlssNRGlobalToneStrength ||
+		previousDLSSNRSkinStructureStrength != settings.dlssNRSkinStructureStrength) {
 		streamline->RequestTemporalReset();
 	}
 	const auto switchedBetweenD3D12Upscalers =
@@ -5630,6 +5660,17 @@ bool Upscaling::SaveSettings(const Settings& a_settings)
 	ini.SetLongValue("Settings", "iOnScreenDisplay", static_cast<long>(a_settings.osdMode));
 	ini.SetLongValue("Settings", "bTaggedTextureDebug", static_cast<long>(a_settings.taggedTextureDebug));
 	ini.SetLongValue("Settings", "bImageSpaceEffectLog", static_cast<long>(a_settings.imageSpaceEffectLog));
+
+	ini.SetLongValue("DLSSNR", "bEnabled", static_cast<long>(a_settings.dlssNREnabled));
+	ini.SetLongValue("DLSSNR", "iPerformanceMode", static_cast<long>(a_settings.dlssNRPerformanceMode));
+	ini.SetLongValue("DLSSNR", "iPreset", static_cast<long>(a_settings.dlssNRPreset));
+	ini.SetLongValue("DLSSNR", "iStyle", static_cast<long>(a_settings.dlssNRStyle));
+	ini.SetDoubleValue("DLSSNR", "fIntensity", a_settings.dlssNRIntensity);
+	ini.SetDoubleValue("DLSSNR", "fLocalToneStrength", a_settings.dlssNRLocalToneStrength);
+	ini.SetDoubleValue("DLSSNR", "fLocalStructureStrength", a_settings.dlssNRLocalStructureStrength);
+	ini.SetDoubleValue("DLSSNR", "fGlobalToneStrength", a_settings.dlssNRGlobalToneStrength);
+	ini.SetLongValue("DLSSNR", "bUseAutoMask", static_cast<long>(a_settings.dlssNRUseAutoMask));
+	ini.SetDoubleValue("DLSSNR", "fSkinStructureStrength", a_settings.dlssNRSkinStructureStrength);
 
 	const auto result = ini.SaveFile(kSettingsPath);
 	if (result < 0) {
@@ -7518,7 +7559,9 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	};
 	auto getD3D12DLSSOutput = [&]() -> ID3D12Resource* {
 		const auto frameIndex = dx12SwapChain->GetFrameIndex();
-		if (settings.sharpness > 0.0f && frameIndex < dlssSharpenedD3D12.size() && dlssSharpenedD3D12[frameIndex]) {
+		if (frameIndex < dlssSharpenedD3D12.size() &&
+			dlssD3D12Sharpened[frameIndex] &&
+			dlssSharpenedD3D12[frameIndex]) {
 			return dlssSharpenedD3D12[frameIndex].get();
 		}
 		if (frameIndex < dlssgHUDLessD3D12.size()) {
@@ -7997,7 +8040,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 				0,
 				&colorSourceBox);
 
-			if (settings.sharpness > 0.0f) {
+			if (settings.sharpness > 0.0f || settings.dlssNREnabled != 0) {
 				auto sharpenedDesc = frameBufferDesc;
 				sharpenedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 				sharpenedDesc.MiscFlags = 0;
@@ -8291,10 +8334,22 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 	}
 
 	const bool useSharpenedOutput = settings.sharpness > 0.0f && dlssSharpenedOutput;
+	const bool useNeuralOutput = settings.dlssNREnabled != 0 && dlssSharpenedOutput;
+	sl::DLSSNROptions dlssNROptions{};
+	dlssNROptions.mode = settings.dlssNREnabled != 0 ? sl::DLSSNRMode::eOn : sl::DLSSNRMode::eOff;
+	dlssNROptions.performanceMode = settings.dlssNRPerformanceMode == 5 ? 6 : settings.dlssNRPerformanceMode;
+	dlssNROptions.preset = settings.dlssNRPreset;
+	dlssNROptions.style = settings.dlssNRStyle;
+	dlssNROptions.intensity = settings.dlssNRIntensity;
+	dlssNROptions.localToneStrength = settings.dlssNRLocalToneStrength;
+	dlssNROptions.localStructureStrength = settings.dlssNRLocalStructureStrength;
+	dlssNROptions.globalToneStrength = settings.dlssNRGlobalToneStrength;
+	dlssNROptions.useAutoMask = settings.dlssNRUseAutoMask != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	dlssNROptions.skinStructureStrength = settings.dlssNRSkinStructureStrength;
 	const auto succeeded = Streamline::GetSingleton()->UpscaleD3D12(
 		dlssInput,
 		dlssOutput,
-		useSharpenedOutput ? dlssSharpenedOutput : nullptr,
+		useSharpenedOutput || useNeuralOutput ? dlssSharpenedOutput : nullptr,
 		motionVectors,
 		depth,
 		transparencyMask,
@@ -8308,6 +8363,7 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 		GetEffectiveQualityMode(UpscaleMethod::kDLSS, settings.qualityMode),
 		settings.sharpness,
 		settings.dlssModelPreset,
+		dlssNROptions,
 		&dlssD3D12Sharpened[a_frameIndex]);
 	if (succeeded && useSharpenedOutput && !dlssD3D12Sharpened[a_frameIndex]) {
 		D3D12_RESOURCE_BARRIER beforeCopy[] = {

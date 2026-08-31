@@ -141,8 +141,9 @@ namespace
 		const auto streamline = Streamline::GetSingleton();
 		if (streamline->initialized) {
 			ImGuiMCP::TextDisabled(
-				"Runtime: DLSS %s | Frame Generation %s | Reflex %s",
+				"Runtime: DLSS %s | DLSS-NR %s | Frame Generation %s | Reflex %s",
 				streamline->featureDLSS ? "available" : "unavailable",
+				streamline->featureDLSSNR ? "available" : "direct path",
 				streamline->featureDLSSG ? "available" : "unavailable",
 				streamline->featureReflex ? "available" : "unavailable");
 		}
@@ -220,6 +221,41 @@ namespace
 			dlssPresets,
 			"Recommended uses K for DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.");
 
+		changed |= CheckboxSetting(
+			"DLSS Neural Rendering",
+			settings.dlssNREnabled,
+			"Runs the experimental DLSS-NR pass after DLSS SR. If NR fails, the prepared SR result is retained.");
+		ImGuiMCP::BeginDisabled(settings.dlssNREnabled == 0);
+		static constexpr std::array nrPresets{ "Default", "Preset 1", "Preset 2", "Preset 3" };
+		changed |= ComboSetting(
+			"NR Preset",
+			settings.dlssNRPreset,
+			nrPresets,
+			"Selects a model preset exposed by the private DLSS-NR preview runtime.");
+		static constexpr std::array nrStyles{ "Natural", "Cinematic" };
+		changed |= ComboSetting(
+			"NR Style",
+			settings.dlssNRStyle,
+			nrStyles,
+			"Selects the Neural Rendering appearance style.");
+		changed |= SliderFloatSetting("NR Intensity", settings.dlssNRIntensity, 0.0f, 2.0f, "%.2f", "Controls overall Neural Rendering strength.");
+		changed |= SliderFloatSetting("Local Tone Strength", settings.dlssNRLocalToneStrength, 0.0f, 2.0f, "%.2f", "Controls local tone enhancement.");
+		changed |= SliderFloatSetting("Local Structure Strength", settings.dlssNRLocalStructureStrength, 0.0f, 2.0f, "%.2f", "Controls local structure enhancement.");
+		changed |= SliderFloatSetting("Global Tone Strength", settings.dlssNRGlobalToneStrength, 0.0f, 2.0f, "%.2f", "Controls global tone enhancement.");
+		changed |= CheckboxSetting(
+			"Automatic Mask",
+			settings.dlssNRUseAutoMask,
+			"Lets DLSS-NR infer its own screen-space control mask when no application mask is supplied.");
+		ImGuiMCP::BeginDisabled(settings.dlssNRUseAutoMask == 0);
+		changed |= SliderFloatSetting(
+			"Skin Structure Strength",
+			settings.dlssNRSkinStructureStrength,
+			-1.0f,
+			2.0f,
+			"%.2f",
+			"Controls structure enhancement in inferred skin regions. -1 inherits Local Structure Strength.");
+		ImGuiMCP::EndDisabled();
+		ImGuiMCP::EndDisabled();
 		ImGuiMCP::EndDisabled();
 
 		ImGuiMCP::SeparatorText("Diagnostics");

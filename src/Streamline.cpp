@@ -4,6 +4,7 @@
 #include <cmath>
 #include <magic_enum/magic_enum.hpp>
 
+#include "DX12SwapChain.h"
 #include "Util.h"
 
 namespace
@@ -86,6 +87,41 @@ namespace
 			a_options.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
 			break;
 		}
+	}
+
+	uint32_t DLSSNRPerformanceMode(sl::DLSSMode a_mode)
+	{
+		// The private runtime accepts the NGX performance-quality values plus one
+		// so zero can remain invalid: Performance=1, Balanced=2, Quality=3,
+		// Ultra Performance=4 and DLAA=6.
+		switch (a_mode) {
+		case sl::DLSSMode::eMaxPerformance:
+			return 1;
+		case sl::DLSSMode::eBalanced:
+			return 2;
+		case sl::DLSSMode::eUltraPerformance:
+			return 4;
+		case sl::DLSSMode::eDLAA:
+			return 6;
+		case sl::DLSSMode::eMaxQuality:
+		case sl::DLSSMode::eUltraQuality:
+		default:
+			return 3;
+		}
+	}
+
+	bool SameDLSSNROptions(const sl::DLSSNROptions& a_lhs, const sl::DLSSNROptions& a_rhs)
+	{
+		return a_lhs.mode == a_rhs.mode &&
+			a_lhs.intensity == a_rhs.intensity &&
+			a_lhs.localToneStrength == a_rhs.localToneStrength &&
+			a_lhs.localStructureStrength == a_rhs.localStructureStrength &&
+			a_lhs.globalToneStrength == a_rhs.globalToneStrength &&
+			a_lhs.style == a_rhs.style &&
+			a_lhs.preset == a_rhs.preset &&
+			a_lhs.useAutoMask == a_rhs.useAutoMask &&
+			a_lhs.skinStructureStrength == a_rhs.skinStructureStrength &&
+			a_lhs.performanceMode == a_rhs.performanceMode;
 	}
 
 	std::string DLSSGStatusFlags(sl::DLSSGStatus a_status)
@@ -178,6 +214,7 @@ void Streamline::LoadInterposer()
 		}
 		logger::info("[Streamline] Interposer loaded at address: {0:p}", static_cast<void*>(interposer));
 		logger::info("[Streamline] Runtime path: {}", std::filesystem::path(interposerDirectory).string());
+		directDLSSNR.SetRuntimeDirectory(interposerDirectory);
 	}
 }
 
@@ -195,7 +232,7 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 	sl::Preferences pref;
 
 	sl::Feature d3d11FeaturesToLoad[] = { sl::kFeatureDLSS, sl::kFeatureNIS, sl::kFeatureReflex, sl::kFeaturePCL };
-	sl::Feature d3d12FeaturesToLoad[] = { sl::kFeatureImGUI, sl::kFeatureDLSS, sl::kFeatureNIS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
+	sl::Feature d3d12FeaturesToLoad[] = { sl::kFeatureImGUI, sl::kFeatureDLSS, sl::kFeatureDLSS_NR, sl::kFeatureNIS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
 	if (a_renderAPI == sl::RenderAPI::eD3D12) {
 		pref.featuresToLoad = d3d12FeaturesToLoad;
 		pref.numFeaturesToLoad = _countof(d3d12FeaturesToLoad);
@@ -216,7 +253,7 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 		pref.pathsToPlugins = pluginPaths;
 		pref.numPathsToPlugins = _countof(pluginPaths);
 
-		for (const auto& runtimeDependency : { L"sl.imgui.dll", L"sl.dlss_g.dll", L"nvngx_dlssg.dll", L"sl.nis.dll", L"sl.reflex.dll", L"sl.pcl.dll" }) {
+		for (const auto& runtimeDependency : { L"sl.imgui.dll", L"sl.dlss_nr.dll", L"nvngx_dlssnr.dll", L"sl.dlss_g.dll", L"nvngx_dlssg.dll", L"sl.nis.dll", L"sl.reflex.dll", L"sl.pcl.dll" }) {
 			const auto dependencyPath = std::filesystem::path(interposerDirectory) / runtimeDependency;
 			logger::info("[Streamline] Runtime dependency {} {}", dependencyPath.string(), std::filesystem::exists(dependencyPath) ? "found" : "missing");
 		}
@@ -250,17 +287,22 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 	slGetNewFrameToken = (PFun_slGetNewFrameToken*)GetProcAddress(interposer, "slGetNewFrameToken");
 	slSetD3DDevice = (PFun_slSetD3DDevice*)GetProcAddress(interposer, "slSetD3DDevice");
 
-	if (SL_FAILED(res, slInit(pref, sl::kSDKVersion))) {
+	const auto dlssNRRuntimePresent =
+		a_renderAPI == sl::RenderAPI::eD3D12 &&
+		std::filesystem::exists(std::filesystem::path(interposerDirectory) / L"sl.dlss_nr.dll");
+	const auto sdkVersion = dlssNRRuntimePresent ? sl::kSDKVersionDLSSNRPreview : sl::kSDKVersion;
+	if (SL_FAILED(res, slInit(pref, sdkVersion))) {
 		logger::critical("[Streamline] Failed to initialize Streamline: {}", magic_enum::enum_name(res));
 	} else {
 		initialized = true;
 		initializedRenderAPI = a_renderAPI;
-		logger::info("[Streamline] Successfully initialized Streamline");
+		logger::info("[Streamline] Successfully initialized Streamline sdkVersion=0x{:016X}", sdkVersion);
 	}
 }
 
 void Streamline::Shutdown()
 {
+	directDLSSNR.Shutdown();
 	if (initialized && slShutdown) {
 		if (SL_FAILED(result, slShutdown())) {
 			logger::warn("[Streamline] Shutdown failed: {}", magic_enum::enum_name(result));
@@ -270,6 +312,7 @@ void Streamline::Shutdown()
 	initialized = false;
 	initializedRenderAPI = sl::RenderAPI::eD3D11;
 	featureDLSS = false;
+	featureDLSSNR = false;
 	featureDLSSG = false;
 	featureNIS = false;
 	featureReflex = false;
@@ -304,6 +347,7 @@ void Streamline::Shutdown()
 	currentDLSSGDynamicTargetFPS = 0;
 	currentDLSSQualityMode = 1;
 	currentDLSSModelPreset = 0;
+	loggedDLSSNRFallback = false;
 	ResetOptionCaches();
 }
 
@@ -323,7 +367,7 @@ void Streamline::CheckFeature(sl::Feature a_feature, IDXGIAdapter* a_adapter, bo
 {
 	a_available = false;
 
-	if (!slIsFeatureLoaded || !slIsFeatureSupported || !slGetFeatureRequirements || !a_adapter) {
+	if (!slIsFeatureLoaded || !slIsFeatureSupported || !a_adapter) {
 		logger::warn("[Streamline] Cannot check {} feature: Streamline is not fully initialized", a_name);
 		return;
 	}
@@ -335,27 +379,24 @@ void Streamline::CheckFeature(sl::Feature a_feature, IDXGIAdapter* a_adapter, bo
 	adapterInfo.deviceLUID = reinterpret_cast<uint8_t*>(&adapterDesc.AdapterLuid);
 	adapterInfo.deviceLUIDSizeInBytes = sizeof(LUID);
 
+	// Check support before loaded state. slIsFeatureLoaded validates that the
+	// plugin context exists and emits a misleading "context is missing" SDK
+	// error when a requested optional plugin was rejected during discovery.
+	// slIsFeatureSupported is the quiet query and preserves the actual reason.
+	const auto support = slIsFeatureSupported(a_feature, adapterInfo);
+	if (support != sl::Result::eOk) {
+		logger::info("[Streamline] {} feature is not available ({})", a_name, magic_enum::enum_name(support));
+		return;
+	}
+
 	bool loaded = false;
 	if (SL_FAILED(result, slIsFeatureLoaded(a_feature, loaded))) {
 		logger::info("[Streamline] {} feature loaded check failed: {}", a_name, magic_enum::enum_name(result));
 		return;
 	}
 
-	if (loaded) {
-		const auto support = slIsFeatureSupported(a_feature, adapterInfo);
-		a_available = support == sl::Result::eOk;
-		logger::info("[Streamline] {} feature {} available ({})", a_name, a_available ? "is" : "is not", magic_enum::enum_name(support));
-		return;
-	}
-
-	sl::FeatureRequirements featureRequirements{};
-	sl::Result result = slGetFeatureRequirements(a_feature, featureRequirements);
-	if (result != sl::Result::eOk) {
-		logger::info("[Streamline] {} feature failed to load due to: {}", a_name, magic_enum::enum_name(result));
-		return;
-	}
-
-	logger::info("[Streamline] {} feature is not loaded", a_name);
+	a_available = loaded;
+	logger::info("[Streamline] {} feature {} available ({})", a_name, loaded ? "is" : "is not", magic_enum::enum_name(support));
 }
 
 void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
@@ -363,8 +404,13 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 	logger::info("[Streamline] Checking features");
 	if (UsesD3D12()) {
 		CheckFeature(sl::kFeatureDLSS, a_adapter, featureDLSS, "DLSS");
+		CheckFeature(sl::kFeatureDLSS_NR, a_adapter, featureDLSSNR, "DLSS-NR");
+		if (!featureDLSSNR) {
+			PrepareDirectDLSSNR();
+		}
 	} else {
 		featureDLSS = false;
+		featureDLSSNR = false;
 		logger::info("[Streamline] DLSS skipped: D3D11 DLSS SR is deprecated; use the D3D12 proxy path");
 	}
 	if (UsesD3D12()) {
@@ -383,12 +429,41 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 	}
 }
 
+void Streamline::PrepareDirectDLSSNR()
+{
+	if (!UsesD3D12() || featureDLSSNR) {
+		return;
+	}
+
+	auto* device = DX12SwapChain::GetSingleton()->GetD3D12Device();
+	if (!device) {
+		logger::info("[DLSS-NR Direct] D3D12 device is not ready; initialization remains deferred until evaluation");
+		return;
+	}
+
+	logger::info("[DLSS-NR Direct] Streamline DLSS-NR is unavailable; initializing the direct path now");
+	directDLSSNR.Prepare(device);
+}
+
 void Streamline::PostDevice()
 {
 	if (featureDLSS) {
 		slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", (void*&)slDLSSGetOptimalSettings);
 		slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSGetState", (void*&)slDLSSGetState);
 		slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", (void*&)slDLSSSetOptions);
+	}
+
+	if (featureDLSSNR) {
+		if (SL_FAILED(result, slGetFeatureFunction(sl::kFeatureDLSS_NR, "slDLSSNRSetOptions", (void*&)slDLSSNRSetOptions)) || !slDLSSNRSetOptions) {
+			logger::warn("[Streamline] Could not resolve slDLSSNRSetOptions: {}", magic_enum::enum_name(result));
+			featureDLSSNR = false;
+		}
+	}
+	if (!featureDLSSNR) {
+		// The first feature query runs before the proxy creates its D3D12 device.
+		// PostDevice is the earliest guaranteed point where direct NGX Init_Ext
+		// can run after Streamline rejects the DLSS-NR plugin.
+		PrepareDirectDLSSNR();
 	}
 
 	if (featureNIS) {
@@ -483,6 +558,7 @@ void Streamline::RequestTemporalReset()
 {
 	temporalResetPending = true;
 	constantsFrameIndex = std::numeric_limits<uint32_t>::max();
+	directDLSSNR.RequestReset();
 }
 
 sl::FrameToken* Streamline::GetFrameTokenForFrame(uint32_t a_frameIndex)
@@ -979,6 +1055,8 @@ void Streamline::ResetOptionCaches()
 	currentD3D12DLSSOutputWidth = 0;
 	currentD3D12DLSSOutputHeight = 0;
 	currentD3D12DLSSModelPreset = std::numeric_limits<uint>::max();
+	currentD3D12DLSSNROptionsValid = false;
+	currentD3D12DLSSNROptions = {};
 	currentNISOptionsValid = false;
 	currentNISSharpness = -1.0f;
 }
@@ -1011,6 +1089,38 @@ bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWi
 	currentD3D12DLSSOutputWidth = a_outputWidth;
 	currentD3D12DLSSOutputHeight = a_outputHeight;
 	currentD3D12DLSSModelPreset = a_dlssModelPreset;
+	if (hadValidOptions && lastTemporalResetFrameIndex != constantsFrameIndex) {
+		RequestTemporalReset();
+	}
+	return true;
+}
+
+bool Streamline::EnsureD3D12DLSSNROptions(sl::DLSSMode a_mode, const sl::DLSSNROptions& a_options)
+{
+	auto options = a_options;
+	options.mode = sl::DLSSNRMode::eOn;
+	if (options.performanceMode == 0) {
+		options.performanceMode = DLSSNRPerformanceMode(a_mode);
+	}
+	if (currentD3D12DLSSNROptionsValid && SameDLSSNROptions(currentD3D12DLSSNROptions, options)) {
+		return true;
+	}
+
+	const auto hadValidOptions = currentD3D12DLSSNROptionsValid;
+	if (SL_FAILED(result, slDLSSNRSetOptions(viewport, options))) {
+		if (!loggedDLSSNRFallback) {
+			logger::warn(
+				"[Streamline] Could not set D3D12 DLSS-NR options: {} performanceMode={} preset={} style={}",
+				magic_enum::enum_name(result),
+				options.performanceMode,
+				options.preset,
+				options.style);
+		}
+		return false;
+	}
+
+	currentD3D12DLSSNROptionsValid = true;
+	currentD3D12DLSSNROptions = options;
 	if (hadValidOptions && lastTemporalResetFrameIndex != constantsFrameIndex) {
 		RequestTemporalReset();
 	}
@@ -1103,20 +1213,15 @@ bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resour
 	return true;
 }
 
-bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, bool* a_sharpened)
+bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened)
 {
-	std::ignore = a_colorFormat;
-	std::ignore = a_motionVectorFormat;
-	std::ignore = a_depthFormat;
 	if (a_sharpened) {
 		*a_sharpened = false;
 	}
 
-	if (!featureDLSS || !slDLSSSetOptions || !slEvaluateFeature || !slSetTagForFrame || !a_color || !a_outputColor || !a_motionVectors || !a_depth || !a_commandList || !a_frameToken) {
+	if (!slEvaluateFeature || !slSetTagForFrame || !a_color || !a_outputColor || !a_motionVectors || !a_depth || !a_commandList || !a_frameToken) {
 		logger::warn(
-			"[Streamline] D3D12 DLSS unavailable before tagging feature={} setOptions={} evaluate={} setTag={} color={} output={} mvec={} depth={} commandList={} frameToken={}",
-			featureDLSS,
-			static_cast<bool>(slDLSSSetOptions),
+			"[Streamline] D3D12 upscaling unavailable before tagging evaluate={} setTag={} color={} output={} mvec={} depth={} commandList={} frameToken={}",
 			static_cast<bool>(slEvaluateFeature),
 			static_cast<bool>(slSetTagForFrame),
 			static_cast<void*>(a_color),
@@ -1147,77 +1252,178 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		break;
 	}
 
-	const auto outputWidth = static_cast<uint32_t>(a_displaySize.x);
-	const auto outputHeight = static_cast<uint32_t>(a_displaySize.y);
-	if (!EnsureD3D12DLSSOptions(dlssMode, outputWidth, outputHeight, a_dlssModelPreset)) {
-		return false;
-	}
 	currentDLSSQualityMode = a_qualityMode;
 	currentDLSSModelPreset = a_dlssModelPreset;
 
 	sl::Extent lowResExtent{ 0, 0, static_cast<uint32_t>(a_renderSize.x), static_cast<uint32_t>(a_renderSize.y) };
 	sl::Extent fullExtent{ 0, 0, static_cast<uint32_t>(a_displaySize.x), static_cast<uint32_t>(a_displaySize.y) };
 
-	sl::Resource colorIn = { sl::ResourceType::eTex2d, a_color, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
-	sl::Resource colorOut = { sl::ResourceType::eTex2d, a_outputColor, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 	sl::Resource depth = { sl::ResourceType::eTex2d, a_depth, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 	sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectors, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 	sl::Resource biasCurrentColor = { sl::ResourceType::eTex2d, a_transparencyMask, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 	sl::Resource transparency = { sl::ResourceType::eTex2d, a_transparencyMask, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 
-	sl::ResourceTag colorInTag = { &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
-	sl::ResourceTag colorOutTag = { &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent };
-	sl::ResourceTag depthTag = { &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
-	sl::ResourceTag mvecTag = { &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent };
-	sl::ResourceTag biasCurrentColorTag = { &biasCurrentColor, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
-	sl::ResourceTag transparencyTag = { &transparency, sl::kBufferTypeTransparencyHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent };
+	const auto evaluate = [&](bool a_useDLSSNR) {
+		const auto featureName = a_useDLSSNR ? "DLSS-NR" : "DLSS";
+		const auto feature = a_useDLSSNR ? sl::kFeatureDLSS_NR : sl::kFeatureDLSS;
+		auto* featureColor = a_useDLSSNR ? a_outputColor : a_color;
+		auto* featureOutput = a_useDLSSNR ? a_sharpenedOutput : a_outputColor;
+		const bool featureAvailable = a_useDLSSNR ? featureDLSSNR : featureDLSS;
+		const bool setOptionsAvailable = a_useDLSSNR ? static_cast<bool>(slDLSSNRSetOptions) : static_cast<bool>(slDLSSSetOptions);
+		if (!featureAvailable || !setOptionsAvailable || !featureColor || !featureOutput) {
+			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
+				logger::warn(
+					"[Streamline] D3D12 {} unavailable feature={} setOptions={} color={} output={}",
+					featureName,
+					featureAvailable,
+					setOptionsAvailable,
+					static_cast<void*>(featureColor),
+					static_cast<void*>(featureOutput));
+			}
+			return false;
+		}
 
-	sl::ResourceTag resourceTags[] = { colorInTag, colorOutTag, depthTag, mvecTag, biasCurrentColorTag, transparencyTag };
-	const auto numResourceTags = static_cast<uint32_t>(a_transparencyMask ? _countof(resourceTags) : _countof(resourceTags) - 2);
-	if (SL_FAILED(result, slSetTagForFrame(*a_frameToken, viewport, resourceTags, numResourceTags, a_commandList))) {
-		logger::warn(
-			"[Streamline] Could not tag D3D12 DLSS resources: {} token={} tags={} render={}x{} display={}x{} color={} output={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
-			magic_enum::enum_name(result),
-			static_cast<uint32_t>(*a_frameToken),
-			numResourceTags,
-			lowResExtent.width,
-			lowResExtent.height,
-			fullExtent.width,
-			fullExtent.height,
-			static_cast<void*>(a_color),
-			static_cast<void*>(a_outputColor),
-			static_cast<void*>(a_motionVectors),
-			static_cast<void*>(a_depth),
-			static_cast<void*>(a_transparencyMask),
-			magic_enum::enum_name(a_colorFormat),
-			magic_enum::enum_name(a_motionVectorFormat),
-			magic_enum::enum_name(a_depthFormat));
+		if (a_useDLSSNR) {
+			if (!EnsureD3D12DLSSNROptions(dlssMode, a_dlssNROptions)) {
+				return false;
+			}
+		} else {
+			if (!EnsureD3D12DLSSOptions(dlssMode, fullExtent.width, fullExtent.height, a_dlssModelPreset)) {
+				return false;
+			}
+		}
+
+		const auto inputColorType = a_useDLSSNR ? sl::kBufferTypeUpliftInputColor : sl::kBufferTypeScalingInputColor;
+		const auto outputColorType = a_useDLSSNR ? sl::kBufferTypeUpliftOutputColor : sl::kBufferTypeScalingOutputColor;
+		sl::Resource colorIn = { sl::ResourceType::eTex2d, featureColor, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
+		sl::Resource colorOut = { sl::ResourceType::eTex2d, featureOutput, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
+		const auto& colorExtent = a_useDLSSNR ? fullExtent : lowResExtent;
+		sl::ResourceTag resourceTags[] = {
+			{ &colorIn, inputColorType, sl::ResourceLifecycle::eOnlyValidNow, &colorExtent },
+			{ &colorOut, outputColorType, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent },
+			{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent },
+			{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent },
+			{ &biasCurrentColor, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent },
+			{ &transparency, sl::kBufferTypeTransparencyHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent }
+		};
+		const auto numResourceTags = static_cast<uint32_t>(a_useDLSSNR || !a_transparencyMask ? _countof(resourceTags) - 2 : _countof(resourceTags));
+		if (SL_FAILED(result, slSetTagForFrame(*a_frameToken, viewport, resourceTags, numResourceTags, a_commandList))) {
+			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
+				logger::warn(
+					"[Streamline] Could not tag D3D12 {} resources: {} token={} tags={} render={}x{} display={}x{} color={} output={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
+					featureName,
+					magic_enum::enum_name(result),
+					static_cast<uint32_t>(*a_frameToken),
+					numResourceTags,
+					lowResExtent.width,
+					lowResExtent.height,
+					fullExtent.width,
+					fullExtent.height,
+					static_cast<void*>(featureColor),
+					static_cast<void*>(featureOutput),
+					static_cast<void*>(a_motionVectors),
+					static_cast<void*>(a_depth),
+					static_cast<void*>(a_transparencyMask),
+					magic_enum::enum_name(a_colorFormat),
+					magic_enum::enum_name(a_motionVectorFormat),
+					magic_enum::enum_name(a_depthFormat));
+			}
+			return false;
+		}
+
+		sl::ViewportHandle view(viewport);
+		const sl::BaseStructure* inputs[] = { &view };
+		if (SL_FAILED(result, slEvaluateFeature(feature, *a_frameToken, inputs, _countof(inputs), a_commandList))) {
+			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
+				logger::warn(
+					"[Streamline] D3D12 {} evaluate failed: {} token={} render={}x{} display={}x{} color={} output={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
+					featureName,
+					magic_enum::enum_name(result),
+					static_cast<uint32_t>(*a_frameToken),
+					lowResExtent.width,
+					lowResExtent.height,
+					fullExtent.width,
+					fullExtent.height,
+					static_cast<void*>(featureColor),
+					static_cast<void*>(featureOutput),
+					static_cast<void*>(a_motionVectors),
+					static_cast<void*>(a_depth),
+					static_cast<void*>(a_transparencyMask),
+					magic_enum::enum_name(a_colorFormat),
+					magic_enum::enum_name(a_motionVectorFormat),
+					magic_enum::enum_name(a_depthFormat));
+			}
+			return false;
+		}
+
+		return true;
+	};
+
+	const auto evaluateDLSSNR = [&]() {
+		// Prefer NVIDIA's Streamline plugin when it survived discovery. When
+		// discovery rejected the private runtime, use the feature DLL directly;
+		// do not retry a failed evaluation through the other NR backend.
+		if (featureDLSSNR && slDLSSNRSetOptions) {
+			return evaluate(true);
+		}
+
+		nvngx::dlss_nr::D3D12EvaluationParameters parameters{};
+		parameters.color = a_outputColor;
+		parameters.output = a_sharpenedOutput;
+		parameters.motionVectors = a_motionVectors;
+		parameters.depth = a_depth;
+		parameters.inputWidth = fullExtent.width;
+		parameters.inputHeight = fullExtent.height;
+		parameters.outputWidth = fullExtent.width;
+		parameters.outputHeight = fullExtent.height;
+		parameters.guideWidth = lowResExtent.width;
+		parameters.guideHeight = lowResExtent.height;
+		parameters.motionVectorScaleX = 1.0f;
+		parameters.motionVectorScaleY = 1.0f;
+		parameters.depthInverted = false;
+		parameters.reset = lastTemporalResetFrameIndex == constantsFrameIndex;
+		parameters.options.performanceMode = a_dlssNROptions.performanceMode == 0 ?
+			DLSSNRPerformanceMode(dlssMode) : a_dlssNROptions.performanceMode;
+		parameters.options.preset = a_dlssNROptions.preset;
+		parameters.options.style = a_dlssNROptions.style;
+		parameters.options.intensity = a_dlssNROptions.intensity;
+		parameters.options.localToneStrength = a_dlssNROptions.localToneStrength;
+		parameters.options.localStructureStrength = a_dlssNROptions.localStructureStrength;
+		parameters.options.globalToneStrength = a_dlssNROptions.globalToneStrength;
+		parameters.options.skinStructureStrength = a_dlssNROptions.skinStructureStrength;
+		parameters.options.useAutoMask = a_dlssNROptions.useAutoMask == sl::Boolean::eTrue;
+		return directDLSSNR.Evaluate(a_commandList, parameters);
+	};
+
+	const bool dlssNRRequested = a_dlssNROptions.mode == sl::DLSSNRMode::eOn;
+	// DLSS-NR consumes and produces full-resolution color. DLSS SR therefore
+	// prepares the full-resolution input first; its output remains the fallback
+	// if the NR post-pass cannot run.
+	auto upscaled = evaluate(false);
+	if (!upscaled) {
 		return false;
 	}
-
-	sl::ViewportHandle view(viewport);
-	const sl::BaseStructure* inputs[] = { &view };
-	if (SL_FAILED(result, slEvaluateFeature(sl::kFeatureDLSS, *a_frameToken, inputs, _countof(inputs), a_commandList))) {
-		logger::warn(
-			"[Streamline] D3D12 DLSS evaluate failed: {} token={} render={}x{} display={}x{} color={} output={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
-			magic_enum::enum_name(result),
-			static_cast<uint32_t>(*a_frameToken),
-			lowResExtent.width,
-			lowResExtent.height,
-			fullExtent.width,
-			fullExtent.height,
-			static_cast<void*>(a_color),
-			static_cast<void*>(a_outputColor),
-			static_cast<void*>(a_motionVectors),
-			static_cast<void*>(a_depth),
-			static_cast<void*>(a_transparencyMask),
-			magic_enum::enum_name(a_colorFormat),
-			magic_enum::enum_name(a_motionVectorFormat),
-			magic_enum::enum_name(a_depthFormat));
-		return false;
+	if (dlssNRRequested) {
+		const auto neuralRendered = evaluateDLSSNR();
+		if (!neuralRendered) {
+			if (!loggedDLSSNRFallback) {
+				logger::warn("[Streamline] D3D12 DLSS-NR failed; using the prepared DLSS SR output");
+			}
+			loggedDLSSNRFallback = true;
+		} else {
+			loggedDLSSNRFallback = false;
+			if (a_sharpened) {
+				*a_sharpened = true;
+			}
+			return true;
+		}
+	} else {
+		directDLSSNR.ReleaseFeature();
+		loggedDLSSNRFallback = false;
 	}
 
-	if (a_sharpenedOutput && ApplyNISSharpenD3D12(a_outputColor, a_sharpenedOutput, a_commandList, a_frameToken, a_displaySize, a_sharpness)) {
+	if (a_sharpness > 0.0f && a_sharpenedOutput &&
+		ApplyNISSharpenD3D12(a_outputColor, a_sharpenedOutput, a_commandList, a_frameToken, a_displaySize, a_sharpness)) {
 		if (a_sharpened) {
 			*a_sharpened = true;
 		}
@@ -1350,14 +1556,25 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 void Streamline::DisableDLSS()
 {
 	currentD3D12DLSSOptionsValid = false;
-	if (!initialized || !featureDLSS || !slDLSSSetOptions) {
+	currentD3D12DLSSNROptionsValid = false;
+	if (!initialized) {
 		return;
 	}
 
-	sl::DLSSOptions dlssOptions{};
-	dlssOptions.mode = sl::DLSSMode::eOff;
-	if (SL_FAILED(result, slDLSSSetOptions(viewport, dlssOptions))) {
-		logger::warn("[Streamline] Could not disable DLSS: {}", magic_enum::enum_name(result));
+	if (featureDLSS && slDLSSSetOptions) {
+		sl::DLSSOptions dlssOptions{};
+		dlssOptions.mode = sl::DLSSMode::eOff;
+		if (SL_FAILED(result, slDLSSSetOptions(viewport, dlssOptions))) {
+			logger::warn("[Streamline] Could not disable DLSS: {}", magic_enum::enum_name(result));
+		}
+	}
+
+	if (featureDLSSNR && slDLSSNRSetOptions) {
+		sl::DLSSNROptions dlssNROptions{};
+		dlssNROptions.mode = sl::DLSSNRMode::eOff;
+		if (SL_FAILED(result, slDLSSNRSetOptions(viewport, dlssNROptions))) {
+			logger::warn("[Streamline] Could not disable DLSS-NR: {}", magic_enum::enum_name(result));
+		}
 	}
 }
 
@@ -1365,12 +1582,20 @@ void Streamline::DestroyDLSSResources()
 {
 	RequestTemporalReset();
 	DisableDLSS();
+	directDLSSNR.ReleaseFeature();
 
-	if (!initialized || !featureDLSS || !slFreeResources) {
+	if (!initialized || !slFreeResources) {
 		return;
 	}
 
-	if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS, viewport))) {
-		logger::warn("[Streamline] Could not free DLSS resources: {}", magic_enum::enum_name(result));
+	if (featureDLSS) {
+		if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS, viewport))) {
+			logger::warn("[Streamline] Could not free DLSS resources: {}", magic_enum::enum_name(result));
+		}
+	}
+	if (featureDLSSNR) {
+		if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS_NR, viewport))) {
+			logger::warn("[Streamline] Could not free DLSS-NR resources: {}", magic_enum::enum_name(result));
+		}
 	}
 }

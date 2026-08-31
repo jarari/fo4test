@@ -16,6 +16,8 @@
 #include <sl_reflex.h>
 #include <sl_version.h>
 #pragma warning(pop)
+#include "sl_dlss_nr.h"
+#include "nvngx_dlss_nr_private.h"
 #include "Buffer.h"
 
 #include <limits>
@@ -131,7 +133,7 @@ public:
 	// DLSS Operations
 	// ========================================
 
-	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, bool* a_sharpened);
+	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened);
 
 	/**
 	 * @brief Update Streamline constants for current frame
@@ -208,6 +210,7 @@ public:
 	bool initialized = false;  ///< True if Streamline SDK is initialized
 	sl::RenderAPI initializedRenderAPI = sl::RenderAPI::eD3D11; ///< Streamline RHI used at initialization
 	bool featureDLSS = false;  ///< True if DLSS is available on current GPU
+	bool featureDLSSNR = false; ///< True if DLSS Neural Rendering uplift is available
 	bool featureDLSSG = false; ///< True if DLSS Frame Generation is available
 	bool featureNIS = false; ///< True if NVIDIA Image Scaling is available
 	bool featureReflex = false; ///< True if NVIDIA Reflex is available
@@ -253,6 +256,7 @@ public:
 	PFun_slDLSSGetOptimalSettings* slDLSSGetOptimalSettings{};  ///< Get optimal DLSS settings
 	PFun_slDLSSGetState* slDLSSGetState{};                      ///< Get DLSS state
 	PFun_slDLSSSetOptions* slDLSSSetOptions{};                  ///< Set DLSS options
+	PFun_slDLSSNRSetOptions* slDLSSNRSetOptions{};              ///< Set DLSS-NR options
 
 	// NIS Specific Functions
 	PFun_slNISGetState* slNISGetState{};                        ///< Get NIS state
@@ -276,6 +280,8 @@ private:
 	bool ApplyNISSharpen(ID3D11Resource* a_inputColor, ID3D11Resource* a_outputColor, ID3D11DeviceContext* a_context, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resource* a_outputColor, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint a_dlssModelPreset);
+	bool EnsureD3D12DLSSNROptions(sl::DLSSMode a_mode, const sl::DLSSNROptions& a_options);
+	void PrepareDirectDLSSNR();
 	bool EnsureNISOptions(float a_sharpness, std::string_view a_logContext);
 	void ResetOptionCaches();
 	void SetPCLMarker(sl::PCLMarker a_marker, sl::FrameToken* a_frameToken = nullptr);
@@ -310,6 +316,8 @@ private:
 	uint32_t currentD3D12DLSSOutputWidth = 0;
 	uint32_t currentD3D12DLSSOutputHeight = 0;
 	uint currentD3D12DLSSModelPreset = std::numeric_limits<uint>::max();
+	bool currentD3D12DLSSNROptionsValid = false;
+	sl::DLSSNROptions currentD3D12DLSSNROptions{};
 	bool currentNISOptionsValid = false;
 	float currentNISSharpness = -1.0f;
 	uint32_t pclStatsWindowMessage = 0;
@@ -317,4 +325,6 @@ private:
 	bool pclLatencyReportAvailable = false;
 	bool pendingDLSSGDisable = false;
 	uint32_t dlssgPresentSafetyFrames = 0;
+	bool loggedDLSSNRFallback = false;
+	nvngx::dlss_nr::D3D12Backend directDLSSNR;
 };

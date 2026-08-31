@@ -88,10 +88,20 @@ public:
 		uint dynamicMFGTargetFPS = 300;                              ///< Dynamic MFG target FPS; 0 lets Streamline auto-detect display refresh
 		uint reflexMode = 1;                                        ///< Reflex mode: 0=Off, 1=On, 2=On + Boost
 		uint dlssModelPreset = 0;                                   ///< DLSS model preset: 0=Recommended, 1=Default, 2=K, 3=M, 4=L
+		uint dlssNREnabled = 1;                                     ///< Prefer DLSS-NR uplift over DLSS SR when available
+		uint dlssNRPerformanceMode = 0;                             ///< 0=Follow quality mode, 1..4=NGX modes, 5=DLAA
+		uint dlssNRPreset = 0;                                      ///< DLSS-NR preset: 0=Default, 1..3=preview presets
+		uint dlssNRStyle = 0;                                       ///< DLSS-NR style: 0=Natural, 1=Cinematic
+		uint dlssNRUseAutoMask = 0;                                 ///< Ask DLSS-NR to generate its control mask
 		uint osdMode = 0;                                           ///< Debug OSD: 0=Off, 1=Compact, 2=Detailed
 		uint taggedTextureDebug = 0;                                ///< Debug tagged texture view: 0=Off, 1=On
 		uint imageSpaceEffectLog = 0;                               ///< Log unique active image-space effects in the ENB native scope
 		float sharpness = 0.2f;                                       ///< Upscaler sharpness: 0.0=off, 1.0=max
+		float dlssNRIntensity = 1.0f;
+		float dlssNRLocalToneStrength = 1.0f;
+		float dlssNRLocalStructureStrength = 1.0f;
+		float dlssNRGlobalToneStrength = 1.0f;
+		float dlssNRSkinStructureStrength = 1.0f;
 	};
 
 	Settings settings;
