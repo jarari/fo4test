@@ -77,6 +77,33 @@ namespace F4SEMenuFramework
 			return function ? function(a_callback) : -1;
 		}
 	}
+
+	namespace Hotkeys
+	{
+		using Callback = void(__stdcall*)();
+
+		inline std::int64_t Register(const char* a_id, unsigned int a_defaultScanCode, Callback a_callback)
+		{
+			using Function = std::int64_t (*)(const char*, unsigned int, Callback);
+			const auto function = detail::GetFunction<Function>("RegisterHotkey");
+			return function ? function(a_id, a_defaultScanCode, a_callback) : -1;
+		}
+
+		inline unsigned int GetBinding(const char* a_id)
+		{
+			using Function = unsigned int (*)(const char*);
+			const auto function = detail::GetFunction<Function>("GetHotkeyBinding");
+			return function ? function(a_id) : 0;
+		}
+
+		inline void SetBinding(const char* a_id, unsigned int a_scanCode)
+		{
+			using Function = void (*)(const char*, unsigned int);
+			if (const auto function = detail::GetFunction<Function>("SetHotkeyBinding")) {
+				function(a_id, a_scanCode);
+			}
+		}
+	}
 }
 
 namespace ImGuiMCP
@@ -149,6 +176,21 @@ namespace ImGuiMCP
 		using Function = bool (*)(const char*, bool*);
 		const auto function = F4SEMenuFramework::detail::GetFunction<Function>("igCheckbox");
 		return function && function(a_label, a_value);
+	}
+
+	inline bool Button(const char* a_label, ImVec2 a_size = {})
+	{
+		using Function = bool (*)(const char*, ImVec2);
+		const auto function = F4SEMenuFramework::detail::GetFunction<Function>("igButton");
+		return function && function(a_label, a_size);
+	}
+
+	inline void SameLine(float a_offsetFromStartX = 0.0f, float a_spacing = -1.0f)
+	{
+		using Function = void (*)(float, float);
+		if (const auto function = F4SEMenuFramework::detail::GetFunction<Function>("igSameLine")) {
+			function(a_offsetFromStartX, a_spacing);
+		}
 	}
 
 	inline bool Combo(const char* a_label, int* a_currentItem, const char* const a_items[], int a_itemCount, int a_popupHeight = -1)

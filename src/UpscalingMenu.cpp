@@ -18,6 +18,93 @@ namespace
 	bool g_dirty = false;
 	bool g_registered = false;
 	std::int64_t g_menuEventHandle = -1;
+	std::int64_t g_dlssNRHotkeyHandle = -1;
+	bool g_dlssNRHotkeyCapturing = false;
+	std::array<bool, 256> g_dlssNRHotkeyPreviousState{};
+	constexpr auto kDLSSNRHotkeyID = "Upscaling.ToggleDLSSNR";
+
+	std::string GetHotkeyKeyName(unsigned int a_code)
+	{
+		if (a_code == 0) {
+			return "Unbound";
+		}
+
+		switch (a_code) {
+		case 256:
+			return "Left Mouse";
+		case 257:
+			return "Right Mouse";
+		case 258:
+			return "Middle Mouse";
+		case 259:
+			return "Mouse X1";
+		case 260:
+			return "Mouse X2";
+		default:
+			break;
+		}
+
+		// GetKeyNameText expects the scan code in bits 16-23 and the extended
+		// flag in bit 24. Framework DIK codes encode that flag as bit 0x80.
+		LONG keyData = static_cast<LONG>((a_code & 0x7F) << 16);
+		if ((a_code & 0x80) != 0) {
+			keyData |= 1 << 24;
+		}
+
+		char name[64]{};
+		if (::GetKeyNameTextA(keyData, name, static_cast<int>(std::size(name))) > 0) {
+			return name;
+		}
+		return std::format("Key 0x{:02X}", a_code);
+	}
+
+	unsigned int VirtualKeyToFrameworkHotkeyCode(int a_virtualKey)
+	{
+		// The framework uses the F4SE mouse-button range alongside DIK keyboard
+		// scan codes.
+		switch (a_virtualKey) {
+		case VK_LBUTTON:
+			return 256;
+		case VK_RBUTTON:
+			return 257;
+		case VK_MBUTTON:
+			return 258;
+		case VK_XBUTTON1:
+			return 259;
+		case VK_XBUTTON2:
+			return 260;
+		default:
+			break;
+		}
+
+		auto scanCode = ::MapVirtualKeyA(static_cast<UINT>(a_virtualKey), MAPVK_VK_TO_VSC);
+		if (scanCode == 0) {
+			return 0;
+		}
+
+		// DirectInput folds the E0 extended-key prefix into bit 0x80.
+		switch (a_virtualKey) {
+		case VK_LEFT:
+		case VK_UP:
+		case VK_RIGHT:
+		case VK_DOWN:
+		case VK_PRIOR:
+		case VK_NEXT:
+		case VK_END:
+		case VK_HOME:
+		case VK_INSERT:
+		case VK_DELETE:
+		case VK_DIVIDE:
+		case VK_NUMLOCK:
+		case VK_RCONTROL:
+		case VK_RMENU:
+			scanCode |= 0x80;
+			break;
+		default:
+			break;
+		}
+		return scanCode;
+	}
 
 	void ShowHelp(const char* a_help)
 	{
@@ -67,6 +154,79 @@ namespace
 		return changed;
 	}
 
+	void BeginHotkeyCapture(bool& a_capturing, std::array<bool, 256>& a_previousState)
+	{
+		// Snapshot every VK when capture begins. The Bind click, held modifiers,
+		// and persistent IME states (for example VK_HANGUL on Korean layouts)
+		// must be released before they can produce a new press edge.
+		for (int virtualKey = 0; virtualKey < static_cast<int>(a_previousState.size()); ++virtualKey) {
+			a_previousState[virtualKey] = (::GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+		}
+		a_capturing = true;
+	}
+
+	void HotkeySetting(
+		const char* a_label,
+		const char* a_id,
+		bool& a_capturing,
+		std::array<bool, 256>& a_previousState,
+		const char* a_help)
+	{
+		const auto binding = F4SEMenuFramework::Hotkeys::GetBinding(a_id);
+		const auto keyName = GetHotkeyKeyName(binding);
+		ImGuiMCP::Text("%s: %s", a_label, keyName.c_str());
+		ImGuiMCP::SameLine();
+
+		if (a_capturing) {
+			ImGuiMCP::TextDisabled("Press a key... (Esc cancels)");
+
+			// Accept only an up -> down edge observed after capture started. This
+			// prevents the Bind click or an already-active IME VK from being bound.
+			for (int virtualKey = VK_LBUTTON; virtualKey <= 0xFE; ++virtualKey) {
+				const bool isDown = (::GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+				const bool pressed = isDown && !a_previousState[virtualKey];
+				a_previousState[virtualKey] = isDown;
+				if (!pressed) {
+					continue;
+				}
+
+				if (virtualKey == VK_ESCAPE) {
+					a_capturing = false;
+					break;
+				}
+
+				// Prefer the left/right-specific modifier VKs so Right Ctrl/Alt and
+				// Right Shift do not collapse to their left-hand DIK codes.
+				if (virtualKey == VK_SHIFT || virtualKey == VK_CONTROL || virtualKey == VK_MENU) {
+					continue;
+				}
+
+				const auto frameworkCode = VirtualKeyToFrameworkHotkeyCode(virtualKey);
+				if (frameworkCode == 0) {
+					continue;
+				}
+
+				F4SEMenuFramework::Hotkeys::SetBinding(a_id, frameworkCode);
+				a_capturing = false;
+				break;
+			}
+			return;
+		}
+
+		if (ImGuiMCP::Button("Bind##dlssNRHotkey")) {
+			BeginHotkeyCapture(a_capturing, a_previousState);
+		}
+		ShowHelp(a_help);
+
+		if (binding != 0) {
+			ImGuiMCP::SameLine();
+			if (ImGuiMCP::Button("Clear##dlssNRHotkey")) {
+				F4SEMenuFramework::Hotkeys::SetBinding(a_id, 0);
+			}
+			ShowHelp("Unbind the DLSS Neural Rendering toggle hotkey.");
+		}
+	}
+
 	void InitializeEditState()
 	{
 		std::scoped_lock lock(g_stateMutex);
@@ -92,6 +252,29 @@ namespace
 		}
 	}
 
+	void ToggleDLSSNR()
+	{
+		auto* upscaling = Upscaling::GetSingleton();
+		auto updatedSettings = upscaling->settings;
+		updatedSettings.dlssNREnabled = updatedSettings.dlssNREnabled == 0 ? 1u : 0u;
+		if (!upscaling->SaveSettings(updatedSettings)) {
+			logger::error("[Menu] Could not save DLSS-NR hotkey state");
+			return;
+		}
+
+		upscaling->LoadSettings();
+		logger::info("[Menu] DLSS Neural Rendering {} by hotkey", updatedSettings.dlssNREnabled != 0 ? "enabled" : "disabled");
+	}
+
+	void __stdcall OnToggleDLSSNRHotkey()
+	{
+		if (const auto tasks = F4SE::GetTaskInterface()) {
+			tasks->AddTask([] { ToggleDLSSNR(); });
+		} else {
+			ToggleDLSSNR();
+		}
+	}
+
 	void __stdcall OnMenuEvent(F4SEMenuFramework::Events::Type a_type)
 	{
 		if (a_type == F4SEMenuFramework::Events::kOpenMenu) {
@@ -102,6 +285,7 @@ namespace
 		if (a_type != F4SEMenuFramework::Events::kCloseMenu) {
 			return;
 		}
+		g_dlssNRHotkeyCapturing = false;
 
 		std::optional<Settings> settingsToSave;
 		{
@@ -258,6 +442,19 @@ namespace
 		ImGuiMCP::EndDisabled();
 		ImGuiMCP::EndDisabled();
 
+		ImGuiMCP::SeparatorText("Hotkeys");
+		ImGuiMCP::BeginDisabled(g_dlssNRHotkeyHandle < 0);
+		HotkeySetting(
+			"DLSS NR Toggle Hotkey",
+			kDLSSNRHotkeyID,
+			g_dlssNRHotkeyCapturing,
+			g_dlssNRHotkeyPreviousState,
+			"Press Bind, then press a keyboard key or mouse button. Conflicts are confirmed by F4SE Menu Framework.");
+		ImGuiMCP::EndDisabled();
+		if (g_dlssNRHotkeyHandle < 0) {
+			ImGuiMCP::TextDisabled("Hotkey binding requires a F4SE Menu Framework version with the plugin hotkey API.");
+		}
+
 		ImGuiMCP::SeparatorText("Diagnostics");
 		static constexpr std::array osdModes{ "Disabled", "Compact", "Detailed" };
 		changed |= ComboSetting(
@@ -301,6 +498,15 @@ void UpscalingMenu::Register()
 		return;
 	}
 
+	// Scan code 0 intentionally leaves the action unbound until the player uses
+	// the capture button in Upscaling's Hotkeys section.
+	g_dlssNRHotkeyHandle = F4SEMenuFramework::Hotkeys::Register(kDLSSNRHotkeyID, 0, OnToggleDLSSNRHotkey);
+	if (g_dlssNRHotkeyHandle < 0) {
+		logger::warn("[Menu] F4SE Menu Framework did not expose the plugin hotkey API; DLSS-NR hotkey is unavailable");
+	}
+
 	g_registered = true;
-	logger::info("[Menu] Registered Upscaling settings with F4SE Menu Framework");
+	logger::info(
+		"[Menu] Registered Upscaling settings{} with F4SE Menu Framework",
+		g_dlssNRHotkeyHandle >= 0 ? " and DLSS-NR hotkey" : "");
 }
