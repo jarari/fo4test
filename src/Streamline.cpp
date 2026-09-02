@@ -1264,22 +1264,25 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	sl::Resource biasCurrentColor = { sl::ResourceType::eTex2d, a_transparencyMask, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 	sl::Resource transparency = { sl::ResourceType::eTex2d, a_transparencyMask, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 
-	const auto evaluate = [&](bool a_useDLSSNR) {
+	const auto evaluate = [&](
+		bool a_useDLSSNR,
+		ID3D12Resource* a_featureColor,
+		ID3D12Resource* a_featureOutput,
+		const sl::Extent& a_colorExtent,
+		const sl::Extent& a_outputExtent) {
 		const auto featureName = a_useDLSSNR ? "DLSS-NR" : "DLSS";
 		const auto feature = a_useDLSSNR ? sl::kFeatureDLSS_NR : sl::kFeatureDLSS;
-		auto* featureColor = a_useDLSSNR ? a_outputColor : a_color;
-		auto* featureOutput = a_useDLSSNR ? a_sharpenedOutput : a_outputColor;
 		const bool featureAvailable = a_useDLSSNR ? featureDLSSNR : featureDLSS;
 		const bool setOptionsAvailable = a_useDLSSNR ? static_cast<bool>(slDLSSNRSetOptions) : static_cast<bool>(slDLSSSetOptions);
-		if (!featureAvailable || !setOptionsAvailable || !featureColor || !featureOutput) {
+		if (!featureAvailable || !setOptionsAvailable || !a_featureColor || !a_featureOutput) {
 			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
 				logger::warn(
 					"[Streamline] D3D12 {} unavailable feature={} setOptions={} color={} output={}",
 					featureName,
 					featureAvailable,
 					setOptionsAvailable,
-					static_cast<void*>(featureColor),
-					static_cast<void*>(featureOutput));
+					static_cast<void*>(a_featureColor),
+					static_cast<void*>(a_featureOutput));
 			}
 			return false;
 		}
@@ -1296,12 +1299,11 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 
 		const auto inputColorType = a_useDLSSNR ? sl::kBufferTypeUpliftInputColor : sl::kBufferTypeScalingInputColor;
 		const auto outputColorType = a_useDLSSNR ? sl::kBufferTypeUpliftOutputColor : sl::kBufferTypeScalingOutputColor;
-		sl::Resource colorIn = { sl::ResourceType::eTex2d, featureColor, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
-		sl::Resource colorOut = { sl::ResourceType::eTex2d, featureOutput, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
-		const auto& colorExtent = a_useDLSSNR ? fullExtent : lowResExtent;
+		sl::Resource colorIn = { sl::ResourceType::eTex2d, a_featureColor, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
+		sl::Resource colorOut = { sl::ResourceType::eTex2d, a_featureOutput, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 		sl::ResourceTag resourceTags[] = {
-			{ &colorIn, inputColorType, sl::ResourceLifecycle::eOnlyValidNow, &colorExtent },
-			{ &colorOut, outputColorType, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent },
+			{ &colorIn, inputColorType, sl::ResourceLifecycle::eOnlyValidNow, &a_colorExtent },
+			{ &colorOut, outputColorType, sl::ResourceLifecycle::eOnlyValidNow, &a_outputExtent },
 			{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent },
 			{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent },
 			{ &biasCurrentColor, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent },
@@ -1311,17 +1313,17 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		if (SL_FAILED(result, slSetTagForFrame(*a_frameToken, viewport, resourceTags, numResourceTags, a_commandList))) {
 			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
 				logger::warn(
-					"[Streamline] Could not tag D3D12 {} resources: {} token={} tags={} render={}x{} display={}x{} color={} output={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
+					"[Streamline] Could not tag D3D12 {} resources: {} token={} tags={} input={}x{} output={}x{} color={} outputResource={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
 					featureName,
 					magic_enum::enum_name(result),
 					static_cast<uint32_t>(*a_frameToken),
 					numResourceTags,
-					lowResExtent.width,
-					lowResExtent.height,
-					fullExtent.width,
-					fullExtent.height,
-					static_cast<void*>(featureColor),
-					static_cast<void*>(featureOutput),
+					a_colorExtent.width,
+					a_colorExtent.height,
+					a_outputExtent.width,
+					a_outputExtent.height,
+					static_cast<void*>(a_featureColor),
+					static_cast<void*>(a_featureOutput),
 					static_cast<void*>(a_motionVectors),
 					static_cast<void*>(a_depth),
 					static_cast<void*>(a_transparencyMask),
@@ -1337,16 +1339,16 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		if (SL_FAILED(result, slEvaluateFeature(feature, *a_frameToken, inputs, _countof(inputs), a_commandList))) {
 			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
 				logger::warn(
-					"[Streamline] D3D12 {} evaluate failed: {} token={} render={}x{} display={}x{} color={} output={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
+					"[Streamline] D3D12 {} evaluate failed: {} token={} input={}x{} output={}x{} color={} outputResource={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
 					featureName,
 					magic_enum::enum_name(result),
 					static_cast<uint32_t>(*a_frameToken),
-					lowResExtent.width,
-					lowResExtent.height,
-					fullExtent.width,
-					fullExtent.height,
-					static_cast<void*>(featureColor),
-					static_cast<void*>(featureOutput),
+					a_colorExtent.width,
+					a_colorExtent.height,
+					a_outputExtent.width,
+					a_outputExtent.height,
+					static_cast<void*>(a_featureColor),
+					static_cast<void*>(a_featureOutput),
 					static_cast<void*>(a_motionVectors),
 					static_cast<void*>(a_depth),
 					static_cast<void*>(a_transparencyMask),
@@ -1365,18 +1367,18 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		// discovery rejected the private runtime, use the feature DLL directly;
 		// do not retry a failed evaluation through the other NR backend.
 		if (featureDLSSNR && slDLSSNRSetOptions) {
-			return evaluate(true);
+			return evaluate(true, a_color, a_outputColor, lowResExtent, lowResExtent);
 		}
 
 		nvngx::dlss_nr::D3D12EvaluationParameters parameters{};
-		parameters.color = a_outputColor;
-		parameters.output = a_sharpenedOutput;
+		parameters.color = a_color;
+		parameters.output = a_outputColor;
 		parameters.motionVectors = a_motionVectors;
 		parameters.depth = a_depth;
-		parameters.inputWidth = fullExtent.width;
-		parameters.inputHeight = fullExtent.height;
-		parameters.outputWidth = fullExtent.width;
-		parameters.outputHeight = fullExtent.height;
+		parameters.inputWidth = lowResExtent.width;
+		parameters.inputHeight = lowResExtent.height;
+		parameters.outputWidth = lowResExtent.width;
+		parameters.outputHeight = lowResExtent.height;
 		parameters.guideWidth = lowResExtent.width;
 		parameters.guideHeight = lowResExtent.height;
 		parameters.motionVectorScaleX = 1.0f;
@@ -1402,32 +1404,41 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	};
 
 	const bool dlssNRRequested = !dlssNRSuspended && a_dlssNROptions.mode == sl::DLSSNRMode::eOn;
-	// DLSS-NR consumes and produces full-resolution color. DLSS SR therefore
-	// prepares the full-resolution input first; its output remains the fallback
-	// if the NR post-pass cannot run.
-	auto upscaled = evaluate(false);
-	if (!upscaled) {
-		return false;
-	}
-	if (dlssNRRequested) {
-		const auto neuralRendered = evaluateDLSSNR();
-		if (!neuralRendered) {
+	bool neuralRendered = false;
+	if (dlssNRRequested && a_sharpenedOutput) {
+		neuralRendered = evaluateDLSSNR();
+		if (neuralRendered) {
+			// The signed 310.8 NR runtime is a 1:1 pass. Order its UAV writes before
+			// the same top-left subrect is consumed as the DLSS SR color input.
+			auto nrToSRBarrier = CD3DX12_RESOURCE_BARRIER::UAV(a_outputColor);
+			a_commandList->ResourceBarrier(1, &nrToSRBarrier);
+		} else {
 			if (!loggedDLSSNRFallback) {
-				logger::warn("[Streamline] D3D12 DLSS-NR failed; using the prepared DLSS SR output");
+				logger::warn("[Streamline] D3D12 DLSS-NR failed; running DLSS SR from the original color input");
 			}
 			loggedDLSSNRFallback = true;
-		} else {
-			loggedDLSSNRFallback = false;
-			if (a_sharpened) {
-				*a_sharpened = true;
-			}
-			return true;
 		}
 	} else {
 		// Retain the direct feature while NR is off. Releasing it here can race
 		// evaluations from earlier frames; normal upscaler teardown releases it
 		// after DX12SwapChain has drained the queue.
 		loggedDLSSNRFallback = false;
+	}
+
+	// NR operates at render resolution. DLSS SR consumes either its 1:1 output
+	// or, on fallback, the original render-resolution color and produces the
+	// display-resolution scene used by presentation and frame generation.
+	auto* srInput = neuralRendered ? a_outputColor : a_color;
+	auto* srOutput = neuralRendered ? a_sharpenedOutput : a_outputColor;
+	if (!evaluate(false, srInput, srOutput, lowResExtent, fullExtent)) {
+		return false;
+	}
+	if (neuralRendered) {
+		loggedDLSSNRFallback = false;
+		if (a_sharpened) {
+			*a_sharpened = true;
+		}
+		return true;
 	}
 
 	if (a_sharpness > 0.0f && a_sharpenedOutput &&

@@ -6924,6 +6924,22 @@ void Upscaling::OnD3D12TemporalSuspend()
 
 bool Upscaling::ShouldBlockUpscaling() const
 {
+	const auto* dx12SwapChain = DX12SwapChain::GetSingleton();
+	if (dx12SwapChain->IsReady() &&
+		(dx12SwapChain->IsWindowUnavailable() || dx12SwapChain->AreTemporalFeaturesSuspended())) {
+		return true;
+	}
+
+	// NR is a render-resolution pass feeding DLSS SR. Keep that pair alive in
+	// pause/overlay menus; frame generation remains gated by the broader
+	// temporal-feature check.
+	const auto configuredMethod = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
+	if (configuredMethod == UpscaleMethod::kDLSS &&
+		settings.dlssNREnabled != 0 &&
+		Streamline::GetSingleton()->featureDLSS) {
+		return false;
+	}
+
 	return ShouldBlockTemporalFeatures();
 }
 
@@ -7356,11 +7372,15 @@ void Upscaling::UpdateUpscaling()
 	const bool frameGenerationSettingEnabled = settings.frameGenerationMode != 0 || settings.dynamicMFGEnabled != 0;
 	const bool upscalerSelected = upscaleMethodNoMenu != UpscaleMethod::kDisabled;
 	const bool menuBlocksTemporal = temporalFeaturesBlocked;
+	const bool upscalingBlocked = ShouldBlockUpscaling();
 	const bool windowUnavailable = dx12Ready && DX12SwapChain::GetSingleton()->IsWindowUnavailable();
 
-	upscaleMethod = menuBlocksTemporal ? UpscaleMethod::kDisabled : upscaleMethodNoMenu;
+	// Pause and overlay menus stop frame generation, but keep SR and its preceding
+	// render-resolution NR pass active. Only an unavailable/minimized D3D12
+	// presentation surface suspends the upscaling pipeline itself.
+	upscaleMethod = upscalingBlocked ? UpscaleMethod::kDisabled : upscaleMethodNoMenu;
 
-	const bool menuBlocksUpscaling = upscalerSelected && menuBlocksTemporal;
+	const bool menuBlocksUpscaling = upscalerSelected && upscalingBlocked;
 	const bool dlssgHeldThroughMenu =
 		menuBlocksUpscaling &&
 		!windowUnavailable &&
@@ -7425,7 +7445,8 @@ void Upscaling::UpdateUpscaling()
 		dx12Ready &&
 		(frameGenerationActive || fsrFrameGenerationActive || d3d12DLSSActive);
 
-	// Freeze-frame pause needs native render targets; overlay/dialogue menu flags alone are not enough to suspend SR.
+	// SR/NR remain in their render-resolution domain through pause/overlay menus;
+	// frame generation is gated separately above until gameplay resumes stably.
 	const auto effectiveQualityMode = GetEffectiveQualityMode(upscaleMethod, settings.qualityMode);
 	float resolutionScale = upscaleMethod == UpscaleMethod::kDisabled ? 1.0f : 1.0f / GetUpscaleRatioFromQualityMode(effectiveQualityMode);
 

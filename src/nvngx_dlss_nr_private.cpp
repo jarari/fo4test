@@ -61,10 +61,10 @@ namespace
 
 	float ScalingRatio(bool a_upscaling)
 	{
-		// The signed 310.8 runtime's private NGX contract uses a binary native /
-		// upscaling switch. RenoDX supplies 0.5 for upscaling and 1.0 for native
-		// regardless of the Streamline performance-mode option.
-		return a_upscaling ? 0.5f : 1.0f;
+		// The signed 310.8 runtime reads this parameter but fixes both feature
+		// creation and evaluation to a native-resolution (1:1) network.
+		(void)a_upscaling;
+		return 1.0f;
 	}
 
 	NVSDK_NGX_Result NVSDK_CONV NVSDK_NGX_DLSSNR_ComputeScalingRatio(NVSDK_NGX_Parameter* a_parameters)
