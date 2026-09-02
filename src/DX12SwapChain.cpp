@@ -22,6 +22,7 @@ namespace
 		}
 
 		auto* swapChain = DX12SwapChain::GetSingleton();
+		swapChain->OnWindowMessage(a_msg, a_wParam, a_lParam);
 		return swapChain->CallOriginalWndProc(a_hwnd, a_msg, a_wParam, a_lParam);
 	}
 
@@ -200,7 +201,7 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetParent(REFIID riid, void** ppPa
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDevice(REFIID riid, void** ppDevice) { return DX12SwapChain::GetSingleton()->GetDevice(riid, ppDevice); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::Present(UINT SyncInterval, UINT Flags) { return DX12SwapChain::GetSingleton()->Present(SyncInterval, Flags); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) { return DX12SwapChain::GetSingleton()->GetBuffer(Buffer, riid, ppSurface); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget) { return swapChain->SetFullscreenState(Fullscreen, pTarget); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget) { return DX12SwapChain::GetSingleton()->SetFullscreenState(Fullscreen, pTarget); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(BOOL* pFullscreen, IDXGIOutput** ppTarget) { return swapChain->GetFullscreenState(pFullscreen, ppTarget); }
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc)
@@ -232,13 +233,12 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(DXGI_SWAP_CHAIN_DESC* pDes
 	return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT, UINT, UINT, DXGI_FORMAT, UINT)
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
-	logger::warn("[DX12SwapChain] ResizeBuffers requested; ignoring until swapchain recreation is implemented");
-	return S_OK;
+	return DX12SwapChain::GetSingleton()->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
 }
 
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeTarget(const DXGI_MODE_DESC*) { return S_OK; }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) { return DX12SwapChain::GetSingleton()->ResizeTarget(pNewTargetParameters); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetContainingOutput(IDXGIOutput** ppOutput) { return swapChain->GetContainingOutput(ppOutput); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats) { return swapChain->GetFrameStatistics(pStats); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetLastPresentCount(UINT* pLastPresentCount) { return swapChain->GetLastPresentCount(pLastPresentCount); }
@@ -264,10 +264,9 @@ UINT STDMETHODCALLTYPE DXGISwapChainProxy::GetCurrentBackBufferIndex() { return 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT* pColorSpaceSupport) { return swapChain->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) { return swapChain->SetColorSpace1(ColorSpace); }
 
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers1(UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*)
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT SwapChainFlags, const UINT* pCreationNodeMask, IUnknown* const* ppPresentQueue)
 {
-	logger::warn("[DX12SwapChain] ResizeBuffers1 requested; ignoring until swapchain recreation is implemented");
-	return S_OK;
+	return DX12SwapChain::GetSingleton()->ResizeBuffers1(BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask, ppPresentQueue);
 }
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void* pMetaData) { return swapChain->SetHDRMetaData(Type, Size, pMetaData); }
@@ -446,6 +445,184 @@ LRESULT DX12SwapChain::CallOriginalWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wPa
 	return DefWindowProcW(a_hwnd, a_msg, a_wParam, a_lParam);
 }
 
+void DX12SwapChain::OnWindowMessage(UINT a_msg, WPARAM a_wParam, LPARAM)
+{
+	switch (a_msg) {
+	case WM_SIZE:
+		windowMinimized.store(a_wParam == SIZE_MINIMIZED, std::memory_order_release);
+		windowStateDirty.store(true, std::memory_order_release);
+		break;
+	case WM_DISPLAYCHANGE:
+	case WM_DPICHANGED:
+		windowStateDirty.store(true, std::memory_order_release);
+		break;
+	default:
+		break;
+	}
+}
+
+void DX12SwapChain::SuspendTemporalFeatures(const char* a_reason)
+{
+	if (temporalFeaturesSuspended || deviceLost) {
+		return;
+	}
+
+	auto* streamline = Streamline::GetSingleton();
+	if (streamline->NeedsDLSSGPresentSafety()) {
+		streamline->RequestDLSSGDisable();
+	}
+	if (!WaitForGPUIdle()) {
+		return;
+	}
+	streamline->ApplyPendingDLSSGDisable();
+	streamline->SuspendDLSSNR();
+	Upscaling::GetSingleton()->OnD3D12TemporalSuspend();
+	presentOverrideFinalColor = nullptr;
+	for (auto& context : commandContexts) {
+		context.retainedPresentOverride = nullptr;
+	}
+	temporalFeaturesSuspended = true;
+	logger::info("[DX12SwapChain] Suspended temporal features reason={}", a_reason ? a_reason : "unknown");
+}
+
+void DX12SwapChain::ResumeTemporalFeatures()
+{
+	if (!temporalFeaturesSuspended || deviceLost) {
+		return;
+	}
+
+	Streamline::GetSingleton()->ResumeDLSSNR();
+	temporalFeaturesSuspended = false;
+	logger::info("[DX12SwapChain] Resumed temporal features; next evaluation will reset history");
+}
+
+void DX12SwapChain::ProcessWindowStateTransition()
+{
+	const auto stateChanged = windowStateDirty.exchange(false, std::memory_order_acq_rel);
+	const auto unavailable = IsWindowUnavailable();
+	if (unavailable) {
+		SuspendTemporalFeatures("minimized");
+		return;
+	}
+	if (temporalFeaturesSuspended && stateChanged) {
+		ResumeTemporalFeatures();
+	}
+}
+
+void DX12SwapChain::ReleaseResizeDependentResources()
+{
+	presentOverrideFinalColor = nullptr;
+	for (auto& context : commandContexts) {
+		context.presentStaging = nullptr;
+		context.retainedPresentOverride = nullptr;
+		context.fenceValue = 0;
+	}
+	for (auto& backBuffer : swapChainBuffers) {
+		backBuffer = nullptr;
+	}
+	swapChainBufferProxy = nullptr;
+	swapChainBufferProxyENB = nullptr;
+	frameSlotFenceValues.fill(0);
+}
+
+void DX12SwapChain::RestoreResizeDependentResources(const char* a_context)
+{
+	try {
+		std::ignore = swapChain->GetDesc1(&swapChainDesc);
+		RefreshBackBuffers();
+		RecreateInteropTextures();
+		frameIndex = swapChain->GetCurrentBackBufferIndex();
+	} catch (const std::exception& e) {
+		logger::error("[DX12SwapChain] {} resource restoration failed: {}", a_context, e.what());
+	}
+}
+
+HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask)
+{
+	const auto operation = a_useResizeBuffers1 ? "ResizeBuffers1" : "ResizeBuffers";
+	if (!swapChain || deviceLost) {
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
+
+	SuspendTemporalFeatures(operation);
+	if (deviceLost || !WaitForGPUIdle()) {
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
+	Streamline::GetSingleton()->DestroyDLSSResources();
+	ReleaseResizeDependentResources();
+
+	const auto format = a_format == DXGI_FORMAT_UNKNOWN ? swapChainDesc.Format : a_format;
+	const auto resizeFlags = a_flags | swapChainDesc.Flags;
+	HRESULT result = S_OK;
+	if (a_useResizeBuffers1) {
+		std::array<UINT, kDX12FrameCount> nodeMasks{};
+		std::array<IUnknown*, kDX12FrameCount> presentQueues{};
+		for (std::size_t i = 0; i < presentQueues.size(); ++i) {
+			nodeMasks[i] = a_creationNodeMask ? a_creationNodeMask[0] : 0;
+			presentQueues[i] = commandQueue.get();
+		}
+		result = swapChain->ResizeBuffers1(kDX12FrameCount, a_width, a_height, format, resizeFlags, nodeMasks.data(), presentQueues.data());
+	} else {
+		result = swapChain->ResizeBuffers(kDX12FrameCount, a_width, a_height, format, resizeFlags);
+	}
+
+	if (FAILED(result)) {
+		logger::error("[DX12SwapChain] {} failed result=0x{:08X} width={} height={} format={} flags=0x{:X}", operation, static_cast<uint32_t>(result), a_width, a_height, static_cast<uint32_t>(format), resizeFlags);
+		RestoreResizeDependentResources(operation);
+		return result;
+	}
+
+	RestoreResizeDependentResources(operation);
+	if (!swapChainBufferProxy && !swapChainBufferProxyENB) {
+		return DXGI_ERROR_DEVICE_RESET;
+	}
+	Streamline::GetSingleton()->RequestTemporalReset();
+	windowStateDirty.store(true, std::memory_order_release);
+	logger::info("[DX12SwapChain] {} completed {}x{} format={} buffers={}", operation, swapChainDesc.Width, swapChainDesc.Height, static_cast<uint32_t>(swapChainDesc.Format), swapChainDesc.BufferCount);
+	return S_OK;
+}
+
+HRESULT DX12SwapChain::ResizeBuffers(UINT, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags)
+{
+	return ResizeBuffersInternal(false, a_width, a_height, a_format, a_flags, nullptr);
+}
+
+HRESULT DX12SwapChain::ResizeBuffers1(UINT, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask, IUnknown* const*)
+{
+	return ResizeBuffersInternal(true, a_width, a_height, a_format, a_flags, a_creationNodeMask);
+}
+
+HRESULT DX12SwapChain::SetFullscreenState(BOOL a_fullscreen, IDXGIOutput* a_target)
+{
+	if (!swapChain || deviceLost) {
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
+	SuspendTemporalFeatures("SetFullscreenState");
+	if (deviceLost) {
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
+	const auto result = swapChain->SetFullscreenState(a_fullscreen, a_target);
+	windowStateDirty.store(true, std::memory_order_release);
+	return result;
+}
+
+HRESULT DX12SwapChain::ResizeTarget(const DXGI_MODE_DESC* a_newTargetParameters)
+{
+	if (!a_newTargetParameters) {
+		return E_INVALIDARG;
+	}
+	if (!swapChain || deviceLost) {
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
+	SuspendTemporalFeatures("ResizeTarget");
+	if (deviceLost) {
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
+	const auto result = swapChain->ResizeTarget(a_newTargetParameters);
+	windowStateDirty.store(true, std::memory_order_release);
+	return result;
+}
+
 void DX12SwapChain::CreateInterop()
 {
 	HANDLE sharedFenceHandle = nullptr;
@@ -454,7 +631,11 @@ void DX12SwapChain::CreateInterop()
 	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(d3d12Fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
 	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(d3d11Fence.put())));
 	CloseHandle(sharedFenceHandle);
+	RecreateInteropTextures();
+}
 
+void DX12SwapChain::RecreateInteropTextures()
+{
 	D3D11_TEXTURE2D_DESC textureDesc{};
 	textureDesc.Width = swapChainDesc.Width;
 	textureDesc.Height = swapChainDesc.Height;
@@ -475,6 +656,7 @@ void DX12SwapChain::CreateInterop()
 		swapChainBufferProxyENB = nullptr;
 	}
 	for (auto& context : commandContexts) {
+		context.retainedPresentOverride = nullptr;
 		context.presentStaging = std::make_unique<D3D11D3D12SharedTexture>(textureDesc, d3d11Device.get(), d3d12Device.get());
 	}
 }
@@ -482,6 +664,10 @@ void DX12SwapChain::CreateInterop()
 DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 {
 	const auto completedValue = commandFence ? commandFence->GetCompletedValue() : 0;
+	if (completedValue == std::numeric_limits<UINT64>::max()) {
+		deviceLost = true;
+		DX::ThrowIfFailed(DXGI_ERROR_DEVICE_REMOVED);
+	}
 	for (UINT i = 0; i < std::size(commandContexts); ++i) {
 		const auto contextIndex = (nextCommandContext + i) % std::size(commandContexts);
 		auto& context = commandContexts[contextIndex];
@@ -505,7 +691,9 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 		}
 	}
 
-	WaitForCommandFence(waitValue);
+	if (!WaitForCommandFence(waitValue)) {
+		DX::ThrowIfFailed(DXGI_ERROR_DEVICE_REMOVED);
+	}
 	nextCommandContext = static_cast<UINT>((waitContextIndex + 1) % std::size(commandContexts));
 	auto& context = commandContexts[waitContextIndex];
 	context.index = waitContextIndex;
@@ -527,10 +715,38 @@ void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
 	a_context.fenceValue = signalValue;
 }
 
-void DX12SwapChain::WaitForCommandFence(UINT64 a_value)
+bool DX12SwapChain::FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext* a_context)
 {
-	if (!commandFence || a_value == 0 || commandFence->GetCompletedValue() >= a_value) {
-		return;
+	if (a_frameIndex >= std::size(frameSlotFenceValues) || !commandQueue || !commandFence) {
+		return false;
+	}
+	const auto signalValue = commandFenceValue++;
+	const auto result = commandQueue->Signal(commandFence.get(), signalValue);
+	if (FAILED(result)) {
+		deviceLost = true;
+		logger::error("[DX12SwapChain] Post-Present signal failed result=0x{:08X}", static_cast<uint32_t>(result));
+		return false;
+	}
+	frameSlotFenceValues[a_frameIndex] = signalValue;
+	if (a_context) {
+		a_context->fenceValue = signalValue;
+	}
+	return true;
+}
+
+bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
+{
+	if (!commandFence || a_value == 0) {
+		return true;
+	}
+	const auto completedValue = commandFence->GetCompletedValue();
+	if (completedValue == std::numeric_limits<UINT64>::max()) {
+		deviceLost = true;
+		logger::error("[DX12SwapChain] Command fence reports device removal while waiting for {}", a_value);
+		return false;
+	}
+	if (completedValue >= a_value) {
+		return true;
 	}
 
 	if (!commandFenceEvent) {
@@ -540,35 +756,63 @@ void DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 		}
 	}
 
-	DX::ThrowIfFailed(commandFence->SetEventOnCompletion(a_value, commandFenceEvent.get()));
-	WaitForSingleObjectEx(commandFenceEvent.get(), INFINITE, FALSE);
+	const auto eventResult = commandFence->SetEventOnCompletion(a_value, commandFenceEvent.get());
+	if (FAILED(eventResult)) {
+		deviceLost = true;
+		logger::error("[DX12SwapChain] SetEventOnCompletion failed result=0x{:08X} value={}", static_cast<uint32_t>(eventResult), a_value);
+		return false;
+	}
+	const auto waitResult = WaitForSingleObjectEx(commandFenceEvent.get(), 5000, FALSE);
+	if (waitResult != WAIT_OBJECT_0) {
+		const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : E_FAIL;
+		deviceLost = FAILED(removedReason);
+		logger::error(
+			"[DX12SwapChain] Command fence wait failed waitResult=0x{:08X} value={} completed={} removed=0x{:08X}",
+			waitResult,
+			a_value,
+			commandFence->GetCompletedValue(),
+			static_cast<uint32_t>(removedReason));
+		return false;
+	}
+	return true;
 }
 
-void DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex)
+bool DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex)
 {
 	if (a_frameIndex >= std::size(frameSlotFenceValues)) {
-		return;
+		return false;
 	}
 
 	const auto waitValue = frameSlotFenceValues[a_frameIndex];
 	if (waitValue == 0) {
-		return;
+		return true;
 	}
 
-	WaitForCommandFence(waitValue);
+	if (!WaitForCommandFence(waitValue)) {
+		return false;
+	}
 	frameSlotFenceValues[a_frameIndex] = 0;
+	return true;
 }
 
-void DX12SwapChain::WaitForGPUIdle()
+bool DX12SwapChain::WaitForGPUIdle()
 {
-	if (!commandQueue || !commandFence) {
-		return;
+	if (!commandQueue || !commandFence || deviceLost) {
+		return false;
 	}
 
 	const auto signalValue = commandFenceValue++;
-	DX::ThrowIfFailed(commandQueue->Signal(commandFence.get(), signalValue));
-	WaitForCommandFence(signalValue);
+	const auto signalResult = commandQueue->Signal(commandFence.get(), signalValue);
+	if (FAILED(signalResult)) {
+		deviceLost = true;
+		logger::error("[DX12SwapChain] GPU-idle signal failed result=0x{:08X}", static_cast<uint32_t>(signalResult));
+		return false;
+	}
+	if (!WaitForCommandFence(signalValue)) {
+		return false;
+	}
 	frameSlotFenceValues.fill(0);
+	return true;
 }
 
 void DX12SwapChain::SetD3D11Device(ID3D11Device* a_d3d11Device)
@@ -600,6 +844,9 @@ HRESULT DX12SwapChain::GetBuffer(UINT, REFIID a_riid, void** a_surface)
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
+	if (deviceLost) {
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
 	if (!IsReady()) {
 		return DXGI_ERROR_INVALID_CALL;
 	}
@@ -607,12 +854,20 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	auto streamline = Streamline::GetSingleton();
 	auto upscaling = Upscaling::GetSingleton();
 	const auto osdEnabled = upscaling->settings.osdMode != 0;
-	if (IsWindowMinimized() && streamline->NeedsDLSSGPresentSafety()) {
-		streamline->RequestDLSSGDisable();
-		// A minimized window must not enter another generated Present. Drain the
-		// application queue before changing Streamline's frame-generation state.
-		WaitForGPUIdle();
-		streamline->ApplyPendingDLSSGDisable();
+	ProcessWindowStateTransition();
+	if (IsWindowUnavailable()) {
+		const auto presentedFrameIndex = frameIndex;
+		const auto result = swapChain->Present(0, Flags & ~DXGI_PRESENT_ALLOW_TEARING);
+		const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : S_OK;
+		if (FAILED(removedReason)) {
+			deviceLost = true;
+		} else if (!FenceFrameSlotAfterPresent(presentedFrameIndex)) {
+			return DXGI_ERROR_DEVICE_REMOVED;
+		}
+		if (SUCCEEDED(result) && !deviceLost) {
+			frameIndex = swapChain->GetCurrentBackBufferIndex();
+		}
+		return result;
 	}
 	const auto dlssgPresentSafety = streamline->NeedsDLSSGPresentSafety();
 
@@ -773,10 +1028,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (SUCCEEDED(result)) {
 		// Streamline may enqueue work while intercepting Present. Signal after it
 		// returns so per-frame shared resources stay alive until that work finishes.
-		const auto frameSlotSignalValue = commandFenceValue++;
-		DX::ThrowIfFailed(commandQueue->Signal(commandFence.get(), frameSlotSignalValue));
-		frameSlotFenceValues[presentedFrameIndex] = frameSlotSignalValue;
-		commandContext.fenceValue = frameSlotSignalValue;
+		if (!FenceFrameSlotAfterPresent(presentedFrameIndex, &commandContext)) {
+			return DXGI_ERROR_DEVICE_REMOVED;
+		}
 
 		streamline->ApplyPendingDLSSGDisable();
 		streamline->OnDLSSGPresentComplete();
@@ -805,6 +1059,17 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			static_cast<void*>(commandQueue.get()),
 			static_cast<void*>(swapChain.get()),
 			GetCurrentThreadId());
+
+		if (FAILED(d3d12RemovedReason)) {
+			deviceLost = true;
+		} else {
+			// Present interception can submit work even when DXGI reports a transient
+			// mode-change failure. Fence that work before any frame-slot reuse.
+			if (FenceFrameSlotAfterPresent(presentedFrameIndex, &commandContext)) {
+				SuspendTemporalFeatures("Present failure");
+				windowStateDirty.store(true, std::memory_order_release);
+			}
+		}
 	}
 	if (FAILED(result)) {
 		return result;
@@ -834,7 +1099,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentFrame(bool a_evaluateDLSS, bool a_evaluateFSR, bool a_evaluateFSRFrameGeneration, bool a_waitForD3D11Consumption)
 {
 	D3D12EvaluationResult result{};
-	if (!IsReady()) {
+	if (!IsReady() || deviceLost || temporalFeaturesSuspended || IsWindowUnavailable()) {
 		return result;
 	}
 
@@ -987,7 +1252,9 @@ HRESULT DX12SwapChain::GetDevice(REFIID a_riid, void** a_device)
 
 void DX12SwapChain::RefreshBackBuffers()
 {
-	WaitForGPUIdle();
+	if (commandFence && !WaitForGPUIdle()) {
+		DX::ThrowIfFailed(DXGI_ERROR_DEVICE_REMOVED);
+	}
 	for (auto& backBuffer : swapChainBuffers) {
 		backBuffer = nullptr;
 	}

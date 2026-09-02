@@ -5480,7 +5480,12 @@ void Upscaling::InstallHooks()
 {
 	// Disable TAA shader if using alternative scaling method
 	stl::write_vfunc<0x8, ImageSpaceEffectTemporalAA_IsActive>(RE::VTABLE::ImageSpaceEffectTemporalAA[0]);
-	stl::detour_thunk<Interface3D_Renderer_Create>(REL::ID{ 88488, 2222519 });
+	// Fixed Fallout 4 entry points use explicit gateway prologues. These lengths
+	// are instruction-boundary sizes verified in both OG 1.10.163 and AE 1.11.221.
+	stl::detour_thunk_gateway<Interface3D_Renderer_Create>(
+		REL::ID{ 88488, 2222519 },
+		5,
+		"Interface3D::Renderer::Create");
 
 	const auto isOG = REX::FModule::IsRuntimeOG();
 
@@ -5503,7 +5508,10 @@ void Upscaling::InstallHooks()
 		REL::ID{ 338205, 2318315 }.address() + (isOG ? 0x1DC : 0x4C6));
 
 	// Capture first-person-alpha-safe motion vectors and depth for frame generation.
-	stl::detour_thunk<DrawWorld_FrameGenerationForward>(REL::ID{ 656535, 2318315 });
+	stl::detour_thunk_gateway<DrawWorld_FrameGenerationForward>(
+		REL::ID{ 656535, 2318315 },
+		5,
+		"DrawWorld::FrameGenerationForward");
 	// ForwardAlphaImpl + 0x253 (OG) / +0x53D (AE) calls the first-person
 	// accumulator's RenderAlphaGeometry; it is not a screen-space reticle draw.
 	stl::write_thunk_call<DrawWorld_FrameGenerationFirstPersonAlpha>(
@@ -5525,14 +5533,26 @@ void Upscaling::InstallHooks()
 		// (2316595). OG uses the pointer-based overload (325252). Chain either
 		// entry so an already-installed Addictol detour remains the next call.
 		if (isOG) {
-			stl::detour_thunk_chain<ImageSpaceManager_RenderEffect>(REL::ID{ 325252 });
+			stl::detour_thunk_gateway<ImageSpaceManager_RenderEffect>(
+				REL::ID{ 325252 },
+				7,
+				"ImageSpaceManager::RenderEffect");
 		} else {
-			stl::detour_thunk_chain<ImageSpaceManager_RenderEffectByIndexAE>(REL::ID{ 2316595 });
+			stl::detour_thunk_gateway<ImageSpaceManager_RenderEffectByIndexAE>(
+				REL::ID{ 2316595 },
+				7,
+				"ImageSpaceManager::RenderEffectByIndex");
 		}
-		stl::detour_thunk<BSImagespaceShader_Render_ENBFinalComposite>(REL::ID{ 1388477, 2319297 });
+		stl::detour_thunk_gateway<BSImagespaceShader_Render_ENBFinalComposite>(
+			REL::ID{ 1388477, 2319297 },
+			5,
+			"BSImagespaceShader::RenderENBFinalComposite");
 	}
 	// Fix dynamic resolution for Lens Flare visibility
-	stl::detour_thunk<BSImagespaceShaderLensFlare_RenderLensFlare>(REL::ID{ 676108, 2317547 });
+	stl::detour_thunk_gateway<BSImagespaceShaderLensFlare_RenderLensFlare>(
+		REL::ID{ 676108, 2317547 },
+		6,
+		"BSImagespaceShaderLensFlare::RenderLensFlare");
 
 	// Fix dynamic resolution for Screenspace Reflections
 	stl::write_thunk_call<BSImagespaceShaderSSLRRaytracing_SetupTechnique_BeginTechnique>(
@@ -5546,10 +5566,14 @@ void Upscaling::InstallHooks()
 	// pooled renderer slots. Match those physical allocations to the proxy
 	// metadata while Bokeh runs so its normalized blur passes cannot scale the
 	// active render rectangle a second time.
-	stl::detour_thunk<BSGraphics_RenderTargetManager_AcquireRenderTarget_BokehProxy>(
-		REL::ID{ 1468639, 2277219 });
-	stl::detour_thunk<ImageSpaceEffectBokehDepthOfField_Render_BokehProxy>(
-		REL::ID{ 1108909, 2318617 });
+	stl::detour_thunk_gateway<BSGraphics_RenderTargetManager_AcquireRenderTarget_BokehProxy>(
+		REL::ID{ 1468639, 2277219 },
+		6,
+		"BSGraphics::RenderTargetManager::AcquireRenderTarget");
+	stl::detour_thunk_gateway<ImageSpaceEffectBokehDepthOfField_Render_BokehProxy>(
+		REL::ID{ 1108909, 2318617 },
+		6,
+		"ImageSpaceEffectBokehDepthOfField::Dispatch");
 
 	// Fix dynamic resolution for HBAO
 	stl::write_thunk_call<DrawWorld_Render_PreUI_NVHBAO>(
@@ -5564,7 +5588,10 @@ void Upscaling::InstallHooks()
 		REL::ID{ 135719, 2249225 }.address() + (isOG ? 0x2BD : 0x275));
 
 	// Fix dynamic resolution after upscaling
-	stl::detour_thunk<DrawWorld_Imagespace>(REL::ID{ 587723, 2318322 });
+	stl::detour_thunk_gateway<DrawWorld_Imagespace>(
+		REL::ID{ 587723, 2318322 },
+		5,
+		"DrawWorld::Imagespace");
 	if (enbLoaded) {
 		ResolveENBRenderResolutionGlobals();
 		InstallENBScreenEffectRenderHooks();
@@ -5588,7 +5615,10 @@ void Upscaling::InstallHighFPSPhysicsFixCompatibility()
 			return;
 		}
 
-		stl::detour_thunk<JobListManager_ServingThread_DisplayLoadingScreen>(REL::ID{ 132841 });
+		stl::detour_thunk_gateway<JobListManager_ServingThread_DisplayLoadingScreen>(
+			REL::ID{ 132841 },
+			5,
+			"JobListManager::ServingThread::DisplayLoadingScreen");
 		installed = true;
 		return;
 	}
@@ -6856,7 +6886,8 @@ void Upscaling::CopyFrameGenerationBuffers()
 bool Upscaling::ShouldBlockTemporalFeatures() const
 {
 	const auto* dx12SwapChain = DX12SwapChain::GetSingleton();
-	if (dx12SwapChain->IsReady() && dx12SwapChain->IsWindowMinimized()) {
+	if (dx12SwapChain->IsReady() &&
+		(dx12SwapChain->IsWindowUnavailable() || dx12SwapChain->AreTemporalFeaturesSuspended())) {
 		return true;
 	}
 
@@ -6867,6 +6898,28 @@ bool Upscaling::ShouldBlockTemporalFeatures() const
 	}
 
 	return false;
+}
+
+void Upscaling::OnD3D12TemporalSuspend()
+{
+	for (std::size_t i = 0; i < dlssgInputsReady.size(); ++i) {
+		dlssgInputsReady[i] = false;
+		fsrFrameGenerationInputsReady[i] = false;
+		fsrD3D12InputsReady[i] = false;
+		dlssD3D12InputsReady[i] = false;
+		dlssD3D12Sharpened[i] = false;
+		dlssD3D12TransparencyMaskReady[i] = false;
+		dlssD3D12PresentFinal[i] = nullptr;
+		dlssgInputFrameTokenIndices[i] = std::numeric_limits<uint32_t>::max();
+		dlssgInputRenderSizes[i] = { 0.0f, 0.0f };
+		dlssgInputDisplaySizes[i] = { 0.0f, 0.0f };
+	}
+	frameGenerationBuffersReady = false;
+	frameGenerationActive = false;
+	fsrFrameGenerationActive = false;
+	frameGenerationInputsWanted = false;
+	d3d12DLSSActive = false;
+	Streamline::GetSingleton()->RequestTemporalReset();
 }
 
 bool Upscaling::ShouldBlockUpscaling() const
@@ -7303,14 +7356,14 @@ void Upscaling::UpdateUpscaling()
 	const bool frameGenerationSettingEnabled = settings.frameGenerationMode != 0 || settings.dynamicMFGEnabled != 0;
 	const bool upscalerSelected = upscaleMethodNoMenu != UpscaleMethod::kDisabled;
 	const bool menuBlocksTemporal = temporalFeaturesBlocked;
-	const bool windowMinimized = dx12Ready && DX12SwapChain::GetSingleton()->IsWindowMinimized();
+	const bool windowUnavailable = dx12Ready && DX12SwapChain::GetSingleton()->IsWindowUnavailable();
 
 	upscaleMethod = menuBlocksTemporal ? UpscaleMethod::kDisabled : upscaleMethodNoMenu;
 
 	const bool menuBlocksUpscaling = upscalerSelected && menuBlocksTemporal;
 	const bool dlssgHeldThroughMenu =
 		menuBlocksUpscaling &&
-		!windowMinimized &&
+		!windowUnavailable &&
 		frameGenerationSettingEnabled &&
 		streamline->featureDLSSG;
 	const bool menuSuspendsD3D12DLSS =
@@ -7811,7 +7864,9 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		}
 		const auto debugFrameIndex = dx12SwapChain->GetFrameIndex();
 		if (settings.taggedTextureDebug != 0 && debugFrameIndex < debugMotionVectorSharedTextures.size() && motionVectorTexture) {
-			dx12SwapChain->WaitForFrameSlot(debugFrameIndex);
+			if (!dx12SwapChain->WaitForFrameSlot(debugFrameIndex)) {
+				return;
+			}
 			D3D11_TEXTURE2D_DESC debugMotionVectorDesc{};
 			motionVectorTexture->GetDesc(&debugMotionVectorDesc);
 			debugMotionVectorDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -7886,7 +7941,9 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 	if (frameIndex >= fsrD3D12InputsReady.size()) {
 		return false;
 	}
-	dx12SwapChain->WaitForFrameSlot(frameIndex);
+	if (!dx12SwapChain->WaitForFrameSlot(frameIndex)) {
+		return false;
+	}
 	static auto gameViewport = Util::State_GetSingleton();
 	const bool usePatchedFrameGenerationBuffers =
 		upscaleMethod == UpscaleMethod::kDisabled &&
@@ -8097,7 +8154,10 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			frameBufferResource->Release();
 			return;
 		}
-		dx12SwapChain->WaitForFrameSlot(frameIndex);
+		if (!dx12SwapChain->WaitForFrameSlot(frameIndex)) {
+			frameBufferResource->Release();
+			return;
+		}
 		dlssgInputsReady[frameIndex] = false;
 		fsrFrameGenerationInputsReady[frameIndex] = false;
 		dlssD3D12InputsReady[frameIndex] = false;

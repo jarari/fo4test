@@ -96,11 +96,18 @@ public:
 
 	DXGISwapChainProxy* GetSwapChainProxy() const { return swapChainProxy; }
 	bool IsReady() const { return swapChainProxy && swapChain; }
-	bool IsWindowMinimized() const { return hwnd && IsIconic(hwnd); }
+	bool IsWindowMinimized() const { return windowMinimized.load(std::memory_order_acquire) || (hwnd && IsIconic(hwnd)); }
+	bool IsWindowUnavailable() const { return IsWindowMinimized(); }
+	bool AreTemporalFeaturesSuspended() const { return temporalFeaturesSuspended; }
 	UINT GetFrameIndex() const { return frameIndex; }
 	ID3D12Device* GetD3D12Device() const { return d3d12Device.get(); }
-	void WaitForFrameSlot(UINT a_frameIndex);
-	void WaitForGPUIdle();
+	bool WaitForFrameSlot(UINT a_frameIndex);
+	bool WaitForGPUIdle();
+	HRESULT ResizeBuffers(UINT a_bufferCount, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags);
+	HRESULT ResizeBuffers1(UINT a_bufferCount, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask, IUnknown* const* a_presentQueue);
+	HRESULT SetFullscreenState(BOOL a_fullscreen, IDXGIOutput* a_target);
+	HRESULT ResizeTarget(const DXGI_MODE_DESC* a_newTargetParameters);
+	void OnWindowMessage(UINT a_msg, WPARAM a_wParam, LPARAM a_lParam);
 
 	HRESULT Present(UINT SyncInterval, UINT Flags);
 	struct D3D12EvaluationResult
@@ -142,9 +149,17 @@ private:
 
 	CommandContext& AcquireCommandContext();
 	void ExecuteCommandContext(CommandContext& a_context);
+	bool FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext* a_context = nullptr);
 	D3D12EvaluationResult EvaluateD3D12WorkOnCommandList(ID3D12GraphicsCommandList* a_commandList, UINT a_frameIndex, bool a_evaluateDLSS, bool a_evaluateFSR, bool a_evaluateFSRFrameGeneration);
-	void WaitForCommandFence(UINT64 a_value);
+	bool WaitForCommandFence(UINT64 a_value);
 	void RefreshBackBuffers();
+	void RecreateInteropTextures();
+	void ProcessWindowStateTransition();
+	void SuspendTemporalFeatures(const char* a_reason);
+	void ResumeTemporalFeatures();
+	void ReleaseResizeDependentResources();
+	HRESULT ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask);
+	void RestoreResizeDependentResources(const char* a_context);
 
 	winrt::com_ptr<ID3D12Device> proxyD3D12Device;
 	winrt::com_ptr<ID3D11Device5> d3d11Device;
@@ -168,4 +183,8 @@ private:
 	double desktopRefreshHz = 0.0;
 	HWND hwnd = nullptr;
 	WNDPROC originalWndProc = nullptr;
+	std::atomic_bool windowMinimized{ false };
+	std::atomic_bool windowStateDirty{ false };
+	bool temporalFeaturesSuspended = false;
+	bool deviceLost = false;
 };

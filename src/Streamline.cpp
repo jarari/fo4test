@@ -303,6 +303,7 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 void Streamline::Shutdown()
 {
 	directDLSSNR.Shutdown();
+	dlssNRSuspended = false;
 	if (initialized && slShutdown) {
 		if (SL_FAILED(result, slShutdown())) {
 			logger::warn("[Streamline] Shutdown failed: {}", magic_enum::enum_name(result));
@@ -1400,7 +1401,7 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		return directDLSSNR.Evaluate(a_commandList, parameters);
 	};
 
-	const bool dlssNRRequested = a_dlssNROptions.mode == sl::DLSSNRMode::eOn;
+	const bool dlssNRRequested = !dlssNRSuspended && a_dlssNROptions.mode == sl::DLSSNRMode::eOn;
 	// DLSS-NR consumes and produces full-resolution color. DLSS SR therefore
 	// prepares the full-resolution input first; its output remains the fallback
 	// if the NR post-pass cannot run.
@@ -1600,9 +1601,46 @@ void Streamline::DestroyDLSSResources()
 			logger::warn("[Streamline] Could not free DLSS resources: {}", magic_enum::enum_name(result));
 		}
 	}
-	if (featureDLSSNR) {
+	if (featureDLSSNR && !dlssNRSuspended) {
 		if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS_NR, viewport))) {
 			logger::warn("[Streamline] Could not free DLSS-NR resources: {}", magic_enum::enum_name(result));
 		}
 	}
+}
+
+void Streamline::SuspendDLSSNR()
+{
+	if (dlssNRSuspended) {
+		return;
+	}
+
+	currentD3D12DLSSNROptionsValid = false;
+	if (initialized && featureDLSSNR && slDLSSNRSetOptions) {
+		sl::DLSSNROptions options{};
+		options.mode = sl::DLSSNRMode::eOff;
+		if (SL_FAILED(result, slDLSSNRSetOptions(viewport, options))) {
+			logger::warn("[Streamline] Could not suspend DLSS-NR: {}", magic_enum::enum_name(result));
+		}
+	}
+
+	// The owner drains the D3D12 queue before entering this method. Both the
+	// Streamline and direct NGX backends may otherwise retain GPU references.
+	directDLSSNR.ReleaseFeature();
+	if (initialized && featureDLSSNR && slFreeResources) {
+		if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS_NR, viewport))) {
+			logger::warn("[Streamline] Could not free suspended DLSS-NR resources: {}", magic_enum::enum_name(result));
+		}
+	}
+	dlssNRSuspended = true;
+	RequestTemporalReset();
+}
+
+void Streamline::ResumeDLSSNR()
+{
+	if (!dlssNRSuspended) {
+		return;
+	}
+	dlssNRSuspended = false;
+	currentD3D12DLSSNROptionsValid = false;
+	RequestTemporalReset();
 }

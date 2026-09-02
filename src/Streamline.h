@@ -202,6 +202,8 @@ public:
 	 */
 	void DisableDLSS();
 	void DestroyDLSSResources();
+	void SuspendDLSSNR();
+	void ResumeDLSSNR();
 
 	// ========================================
 	// State
@@ -326,5 +328,6 @@ private:
 	bool pendingDLSSGDisable = false;
 	uint32_t dlssgPresentSafetyFrames = 0;
 	bool loggedDLSSNRFallback = false;
+	bool dlssNRSuspended = false;
 	nvngx::dlss_nr::D3D12Backend directDLSSNR;
 };
