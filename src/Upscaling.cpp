@@ -168,6 +168,32 @@ namespace
 			a_effectIndex);
 	}
 
+	// LockpickingMenu and BookMenu own a custom final composition over a frozen
+	// background. Require both flags so unrelated custom-rendering menus (for
+	// example PipboyMenu) keep their normal path. This also covers compatible
+	// third-party menus.
+	bool IsCustomRenderingMenuOpen()
+	{
+		const auto* ui = RE::UI::GetSingleton();
+		if (!ui) {
+			return false;
+		}
+
+		for (const auto& menu : ui->menuStack) {
+			const auto* menuInstance = menu.get();
+			if (!menuInstance || !menuInstance->OnStack()) {
+				continue;
+			}
+
+			if (menuInstance->menuFlags.all(RE::UI_MENU_FLAGS::kCustomRendering) &&
+				menuInstance->menuFlags.all(RE::UI_MENU_FLAGS::kFreezeFrameBackground)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	class ScopedENBNativeImageSpaceParams
 	{
 	public:
@@ -6930,22 +6956,18 @@ bool Upscaling::ShouldBlockUpscaling() const
 		return true;
 	}
 
-	// NR is a render-resolution pass feeding DLSS SR. Keep that pair alive in
-	// pause/overlay menus; frame generation remains gated by the broader
-	// temporal-feature check.
-	const auto configuredMethod = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
-	if (configuredMethod == UpscaleMethod::kDLSS &&
-		settings.dlssNREnabled != 0 &&
-		Streamline::GetSingleton()->featureDLSS) {
-		return false;
+	// Custom-rendering menus must stay in the native game composition path. All
+	// other temporal-block conditions keep SR/NR active and only suppress FG.
+	if (IsCustomRenderingMenuOpen()) {
+		return true;
 	}
 
-	return ShouldBlockTemporalFeatures();
+	return false;
 }
 
 bool Upscaling::ShouldBlockFrameGeneration() const
 {
-	return ShouldBlockTemporalFeatures() || !dlssgMenuResumeReady;
+	return IsCustomRenderingMenuOpen() || ShouldBlockTemporalFeatures() || !dlssgMenuResumeReady;
 }
 
 Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
@@ -7372,17 +7394,18 @@ void Upscaling::UpdateUpscaling()
 	const bool frameGenerationSettingEnabled = settings.frameGenerationMode != 0 || settings.dynamicMFGEnabled != 0;
 	const bool upscalerSelected = upscaleMethodNoMenu != UpscaleMethod::kDisabled;
 	const bool menuBlocksTemporal = temporalFeaturesBlocked;
+	const bool customRenderingMenu = IsCustomRenderingMenuOpen();
 	const bool upscalingBlocked = ShouldBlockUpscaling();
 	const bool windowUnavailable = dx12Ready && DX12SwapChain::GetSingleton()->IsWindowUnavailable();
 
-	// Pause and overlay menus stop frame generation, but keep SR and its preceding
-	// render-resolution NR pass active. Only an unavailable/minimized D3D12
-	// presentation surface suspends the upscaling pipeline itself.
+	// Ordinary pause/overlay menus keep SR/NR active. Custom-rendering menus use
+	// the native game path with SR, NR, and FG all disabled.
 	upscaleMethod = upscalingBlocked ? UpscaleMethod::kDisabled : upscaleMethodNoMenu;
 
 	const bool menuBlocksUpscaling = upscalerSelected && upscalingBlocked;
 	const bool dlssgHeldThroughMenu =
 		menuBlocksUpscaling &&
+		!customRenderingMenu &&
 		!windowUnavailable &&
 		frameGenerationSettingEnabled &&
 		streamline->featureDLSSG;
@@ -7423,6 +7446,7 @@ void Upscaling::UpdateUpscaling()
 
 	const bool dlssgAllowed = frameGenerationSettingEnabled &&
 		streamline->featureDLSSG &&
+		!customRenderingMenu &&
 		!IsFeatureRequestBlocked(FeatureRequest::kDLSSG) &&
 		(!menuBlocksTemporal || dlssgHeldThroughMenu) &&
 		(dlssgHeldThroughMenu || dlssgMenuResumeReady);
@@ -7432,6 +7456,7 @@ void Upscaling::UpdateUpscaling()
 		dx12Ready &&
 		(kForceFSRFrameGenerationForTesting || !streamline->featureDLSSG) &&
 		!IsFeatureRequestBlocked(FeatureRequest::kFSRFrameGeneration) &&
+		!customRenderingMenu &&
 		!menuBlocksTemporal &&
 		dlssgMenuResumeReady;
 	frameGenerationActive =
@@ -7445,8 +7470,9 @@ void Upscaling::UpdateUpscaling()
 		dx12Ready &&
 		(frameGenerationActive || fsrFrameGenerationActive || d3d12DLSSActive);
 
-	// SR/NR remain in their render-resolution domain through pause/overlay menus;
-	// frame generation is gated separately above until gameplay resumes stably.
+	// SR/NR remain in their render-resolution domain through ordinary pause /
+	// overlay menus. Custom-rendering menus use the native game path and skip
+	// SR, NR, and FG entirely.
 	const auto effectiveQualityMode = GetEffectiveQualityMode(upscaleMethod, settings.qualityMode);
 	float resolutionScale = upscaleMethod == UpscaleMethod::kDisabled ? 1.0f : 1.0f / GetUpscaleRatioFromQualityMode(effectiveQualityMode);
 
