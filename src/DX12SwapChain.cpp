@@ -12,6 +12,7 @@
 #include "Streamline.h"
 #include "TaggedTextureDebug.h"
 #include "Upscaling.h"
+#include "third_party/RTX40MFGUnlock/integration.h"
 
 extern bool enbLoaded;
 
@@ -559,12 +560,14 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetHDRMetaData(DXGI_HDR_METADATA_T
 void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter, Streamline* a_streamline)
 {
 	DX::ThrowIfFailed(D3D12CreateDevice(a_adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(d3d12Device.put())));
+	RTX40MFGUnlock::ObserveD3D12Device(d3d12Device.get());
 
 	if (a_streamline && a_streamline->slSetD3DDevice) {
 		if (SL_FAILED(result, a_streamline->slSetD3DDevice(d3d12Device.get()))) {
 			logger::warn("[DX12SwapChain] slSetD3DDevice(D3D12) failed: {}", magic_enum::enum_name(result));
 		}
 	}
+	RTX40MFGUnlock::PatchLoadedModules();
 
 	ID3D12Device* deviceForQueue = d3d12Device.get();
 	if (a_streamline && a_streamline->slUpgradeInterface) {

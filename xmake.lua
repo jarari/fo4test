@@ -41,7 +41,7 @@ target("Upscaling")
     add_includedirs("extern/FidelityFX-SDK/Kits/FidelityFX/framegeneration/include/dx12")
     set_pcxxheader("include/PCH.h")
 
-    add_links("d3d11", "d3d12", "d3dcompiler", "gdi32")
+    add_links("d3d11", "d3d12", "d3dcompiler", "gdi32", "bcrypt", "version")
 
     add_linkdirs("include/detours/Release", { public = false })
     add_links("detours")

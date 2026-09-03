@@ -1,5 +1,7 @@
 #include "Streamline.h"
 
+#include "third_party/RTX40MFGUnlock/integration.h"
+
 #include <algorithm>
 #include <cmath>
 #include <magic_enum/magic_enum.hpp>
@@ -297,6 +299,9 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 		initialized = true;
 		initializedRenderAPI = a_renderAPI;
 		logger::info("[Streamline] Successfully initialized Streamline sdkVersion=0x{:016X}", sdkVersion);
+		if (a_renderAPI == sl::RenderAPI::eD3D12) {
+			RTX40MFGUnlock::PatchLoadedModules();
+		}
 	}
 }
 
@@ -448,6 +453,10 @@ void Streamline::PrepareDirectDLSSNR()
 
 void Streamline::PostDevice()
 {
+	if (UsesD3D12()) {
+		RTX40MFGUnlock::PatchLoadedModules();
+	}
+
 	if (featureDLSS) {
 		slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", (void*&)slDLSSGetOptimalSettings);
 		slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSGetState", (void*&)slDLSSGetState);
@@ -668,13 +677,29 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		return false;
 	}
 
+	bool mfgUnlockReady = RTX40MFGUnlock::Ready();
+	if (UsesD3D12() && RTX40MFGUnlock::AdaAdapterVerified() && !mfgUnlockReady) {
+		static std::uint64_t lastUnlockRetryTick = 0;
+		const auto now = GetTickCount64();
+		if (now - lastUnlockRetryTick >= 1000) {
+			lastUnlockRetryTick = now;
+			mfgUnlockReady = RTX40MFGUnlock::PatchLoadedModules();
+		}
+	}
+	const bool restrictAdaToNativeTwoX =
+		RTX40MFGUnlock::AdaAdapterVerified() && !mfgUnlockReady;
+
 	if (!dlssgStateKnown && slDLSSGGetState) {
 		sl::DLSSGState state{};
 		if (SL_SUCCEEDED(result, slDLSSGGetState(viewport, state, nullptr))) {
 			maxFramesToGenerate = std::max<uint32_t>(1, state.numFramesToGenerateMax);
 			dynamicMFGSupported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
 		}
-		dlssgStateKnown = true;
+		dlssgStateKnown = !restrictAdaToNativeTwoX;
+	}
+	if (restrictAdaToNativeTwoX) {
+		maxFramesToGenerate = 1;
+		dynamicMFGSupported = false;
 	}
 
 	const bool hasSizes = a_renderSize.x > 0.0f && a_renderSize.y > 0.0f && a_displaySize.x > 0.0f && a_displaySize.y > 0.0f;

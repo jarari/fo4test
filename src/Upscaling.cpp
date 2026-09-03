@@ -4826,7 +4826,7 @@ struct BSGraphics_RenderTargetManager_AcquireRenderTarget_BokehProxy
 /** @brief Limit transient target replacement to the Bokeh effect's four passes. */
 struct ImageSpaceEffectBokehDepthOfField_Render_BokehProxy
 {
-	static void thunk(void* This, RE::BSTriShape* a_geometry, void* a_param)
+	static void thunk(void* This, RE::BSTriShape* a_geometry, std::uint32_t a_param, void* a_effectDesc)
 	{
 		// The ENB path promotes Bokeh to native geometry/constants. Its engine
 		// implementation then resolves DepthBuffer 1 through RendererData, after
@@ -4838,7 +4838,7 @@ struct ImageSpaceEffectBokehDepthOfField_Render_BokehProxy
 			g_enbNativeDepthFrame == CurrentGameFrame();
 		const ScopedFalloutMainDepthBinding nativeDepth(useENBNativeDepth);
 		const ScopedBokehProxyTargets proxyTargets;
-		func(This, a_geometry, a_param);
+		func(This, a_geometry, a_param, a_effectDesc);
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
@@ -5572,7 +5572,7 @@ void Upscaling::InstallHooks()
 		"BSGraphics::RenderTargetManager::AcquireRenderTarget");
 	stl::detour_thunk_gateway<ImageSpaceEffectBokehDepthOfField_Render_BokehProxy>(
 		REL::ID{ 1108909, 2318617 },
-		6,
+		5,
 		"ImageSpaceEffectBokehDepthOfField::Dispatch");
 
 	// Fix dynamic resolution for HBAO
