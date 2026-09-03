@@ -1,7 +1,10 @@
 #include "DX12SwapChain.h"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <limits>
+#include <string_view>
 
 #include "D3D12UIComposite.h"
 #include "FidelityFX.h"
@@ -14,6 +17,288 @@ extern bool enbLoaded;
 
 namespace
 {
+	struct LoadedImage
+	{
+		std::uintptr_t base = 0;
+		std::size_t size = 0;
+		const IMAGE_NT_HEADERS64* ntHeaders = nullptr;
+	};
+
+	bool GetLoadedImage(HMODULE a_module, LoadedImage& a_image)
+	{
+		if (!a_module) {
+			return false;
+		}
+
+		const auto base = reinterpret_cast<std::uintptr_t>(a_module);
+		const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE || dosHeader->e_lfanew <= 0) {
+			return false;
+		}
+
+		const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dosHeader->e_lfanew);
+		if (ntHeaders->Signature != IMAGE_NT_SIGNATURE ||
+			ntHeaders->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+			ntHeaders->OptionalHeader.SizeOfImage == 0) {
+			return false;
+		}
+
+		a_image.base = base;
+		a_image.size = ntHeaders->OptionalHeader.SizeOfImage;
+		a_image.ntHeaders = ntHeaders;
+		return true;
+	}
+
+	template <std::size_t N, std::size_t M>
+	std::uintptr_t FindUniqueExecutablePattern(
+		const LoadedImage& a_image,
+		const std::array<std::uint8_t, N>& a_pattern,
+		const char (&a_mask)[M])
+	{
+		static_assert(N + 1 == M);
+		std::uintptr_t match = 0;
+		const auto* section = IMAGE_FIRST_SECTION(a_image.ntHeaders);
+		for (WORD sectionIndex = 0; sectionIndex < a_image.ntHeaders->FileHeader.NumberOfSections; ++sectionIndex, ++section) {
+			if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 || section->VirtualAddress >= a_image.size) {
+				continue;
+			}
+
+			const auto sectionSize = std::min<std::size_t>(
+				section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData,
+				a_image.size - section->VirtualAddress);
+			if (sectionSize < N) {
+				continue;
+			}
+
+			const auto* begin = reinterpret_cast<const std::uint8_t*>(a_image.base + section->VirtualAddress);
+			for (std::size_t offset = 0; offset <= sectionSize - N; ++offset) {
+				bool matches = true;
+				for (std::size_t byteIndex = 0; byteIndex < N; ++byteIndex) {
+					if (a_mask[byteIndex] != '?' && begin[offset + byteIndex] != a_pattern[byteIndex]) {
+						matches = false;
+						break;
+					}
+				}
+				if (!matches) {
+					continue;
+				}
+
+				const auto candidate = reinterpret_cast<std::uintptr_t>(begin + offset);
+				if (match != 0) {
+					return 0;
+				}
+				match = candidate;
+			}
+		}
+		return match;
+	}
+
+	std::uintptr_t ResolveRipRelativeAddress(
+		std::uintptr_t a_instruction,
+		std::size_t a_displacementOffset,
+		std::size_t a_instructionLength)
+	{
+		std::int32_t displacement = 0;
+		std::memcpy(
+			&displacement,
+			reinterpret_cast<const void*>(a_instruction + a_displacementOffset),
+			sizeof(displacement));
+		return a_instruction + a_instructionLength + displacement;
+	}
+
+	std::uintptr_t* FindImportSlot(const LoadedImage& a_image, std::string_view a_dllName, std::string_view a_functionName)
+	{
+		const auto& importDirectory =
+			a_image.ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+		if (!importDirectory.VirtualAddress || !importDirectory.Size || importDirectory.VirtualAddress >= a_image.size) {
+			return nullptr;
+		}
+
+		const auto isRvaInImage = [&a_image](std::uintptr_t a_rva, std::size_t a_size = 1) {
+			return a_rva < a_image.size && a_size <= a_image.size - a_rva;
+		};
+		const auto importEnd = std::min<std::uintptr_t>(
+			a_image.size,
+			static_cast<std::uintptr_t>(importDirectory.VirtualAddress) + importDirectory.Size);
+		std::uintptr_t* match = nullptr;
+		for (auto descriptorRva = static_cast<std::uintptr_t>(importDirectory.VirtualAddress);
+			descriptorRva < importEnd && isRvaInImage(descriptorRva, sizeof(IMAGE_IMPORT_DESCRIPTOR));
+			descriptorRva += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+			const auto* descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(a_image.base + descriptorRva);
+			if (!descriptor->Name) {
+				break;
+			}
+			if (!descriptor->OriginalFirstThunk ||
+				!isRvaInImage(descriptor->Name) ||
+				!isRvaInImage(descriptor->OriginalFirstThunk, sizeof(IMAGE_THUNK_DATA64)) ||
+				!isRvaInImage(descriptor->FirstThunk, sizeof(IMAGE_THUNK_DATA64))) {
+				continue;
+			}
+
+			const auto* importedDll = reinterpret_cast<const char*>(a_image.base + descriptor->Name);
+			if (_stricmp(importedDll, a_dllName.data()) != 0) {
+				continue;
+			}
+
+			const auto* nameThunk = reinterpret_cast<const IMAGE_THUNK_DATA64*>(a_image.base + descriptor->OriginalFirstThunk);
+			auto* addressThunk = reinterpret_cast<IMAGE_THUNK_DATA64*>(a_image.base + descriptor->FirstThunk);
+			for (std::size_t index = 0;; ++index) {
+				const auto nameThunkRva = static_cast<std::uintptr_t>(descriptor->OriginalFirstThunk) + index * sizeof(IMAGE_THUNK_DATA64);
+				const auto addressThunkRva = static_cast<std::uintptr_t>(descriptor->FirstThunk) + index * sizeof(IMAGE_THUNK_DATA64);
+				if (!isRvaInImage(nameThunkRva, sizeof(IMAGE_THUNK_DATA64)) ||
+					!isRvaInImage(addressThunkRva, sizeof(IMAGE_THUNK_DATA64)) ||
+					!nameThunk[index].u1.AddressOfData) {
+					break;
+				}
+				if (IMAGE_SNAP_BY_ORDINAL64(nameThunk[index].u1.Ordinal) ||
+					!isRvaInImage(nameThunk[index].u1.AddressOfData, sizeof(IMAGE_IMPORT_BY_NAME))) {
+					continue;
+				}
+
+				const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+					a_image.base + nameThunk[index].u1.AddressOfData);
+				if (std::string_view(reinterpret_cast<const char*>(importByName->Name)) != a_functionName) {
+					continue;
+				}
+
+				auto* candidate = reinterpret_cast<std::uintptr_t*>(&addressThunk[index].u1.Function);
+				if (match) {
+					return nullptr;
+				}
+				match = candidate;
+			}
+		}
+		return match;
+	}
+
+	bool PatchImportPair(
+		std::uintptr_t* a_firstSlot,
+		std::uintptr_t a_firstValue,
+		std::uintptr_t* a_secondSlot,
+		std::uintptr_t a_secondValue)
+	{
+		DWORD firstProtection = 0;
+		if (!VirtualProtect(a_firstSlot, sizeof(*a_firstSlot), PAGE_READWRITE, &firstProtection)) {
+			return false;
+		}
+
+		DWORD secondProtection = 0;
+		if (!VirtualProtect(a_secondSlot, sizeof(*a_secondSlot), PAGE_READWRITE, &secondProtection)) {
+			DWORD ignoredProtection = 0;
+			VirtualProtect(a_firstSlot, sizeof(*a_firstSlot), firstProtection, &ignoredProtection);
+			return false;
+		}
+
+		InterlockedExchangePointer(
+			reinterpret_cast<void* volatile*>(a_firstSlot),
+			reinterpret_cast<void*>(a_firstValue));
+		InterlockedExchangePointer(
+			reinterpret_cast<void* volatile*>(a_secondSlot),
+			reinterpret_cast<void*>(a_secondValue));
+
+		DWORD ignoredProtection = 0;
+		const auto secondRestored = VirtualProtect(
+			a_secondSlot, sizeof(*a_secondSlot), secondProtection, &ignoredProtection);
+		const auto firstRestored = VirtualProtect(
+			a_firstSlot, sizeof(*a_firstSlot), firstProtection, &ignoredProtection);
+		FlushInstructionCache(GetCurrentProcess(), a_firstSlot, sizeof(*a_firstSlot));
+		FlushInstructionCache(GetCurrentProcess(), a_secondSlot, sizeof(*a_secondSlot));
+		return firstRestored && secondRestored;
+	}
+
+	void InstallSideAimUnicodeWndProcCompatibility()
+	{
+		static bool attempted = false;
+		if (attempted) {
+			return;
+		}
+		attempted = true;
+
+		const auto sideAim = GetModuleHandleW(L"SideAimAni.dll");
+		if (!sideAim) {
+			return;
+		}
+
+		LoadedImage image{};
+		if (!GetLoadedImage(sideAim, image)) {
+			logger::warn("[DX12SwapChain] SideAimAni.dll has invalid PE headers; Unicode WndProc compatibility was not installed");
+			return;
+		}
+
+		constexpr std::array<std::uint8_t, 20> directWndProcCallPattern{
+			0x48, 0x8B, 0x05, 0, 0, 0, 0,
+			0x4C, 0x8B, 0xCF,
+			0x4C, 0x8B, 0xC6,
+			0x8B, 0xD5,
+			0x49, 0x8B, 0xCE,
+			0xFF, 0xD0
+		};
+		const auto directWndProcCall = FindUniqueExecutablePattern(
+			image,
+			directWndProcCallPattern,
+			"xxx????xxxxxxxxxxxxx");
+
+		constexpr std::array<std::uint8_t, 45> wndProcInstallPattern{
+			0x48, 0x8B, 0xF0,
+			0xBA, 0xFC, 0xFF, 0xFF, 0xFF,
+			0x48, 0x8B, 0xC8,
+			0xFF, 0x15, 0, 0, 0, 0,
+			0x48, 0x89, 0x05, 0, 0, 0, 0,
+			0x4C, 0x8D, 0x05, 0, 0, 0, 0,
+			0xBA, 0xFC, 0xFF, 0xFF, 0xFF,
+			0x48, 0x8B, 0xCE,
+			0xFF, 0x15, 0, 0, 0, 0
+		};
+		const auto wndProcInstall = FindUniqueExecutablePattern(
+			image,
+			wndProcInstallPattern,
+			"xxxxxxxxxxxxx????xxx????xxx????xxxxxxxxxx????");
+		if (!directWndProcCall || !wndProcInstall) {
+			logger::warn("[DX12SwapChain] SideAimAni.dll WndProc signature is unsupported; Unicode WndProc compatibility was not installed");
+			return;
+		}
+
+		auto* getWindowLongPtrSlot = FindImportSlot(image, "user32.dll", "GetWindowLongPtrA");
+		auto* setWindowLongPtrSlot = FindImportSlot(image, "user32.dll", "SetWindowLongPtrA");
+		if (!getWindowLongPtrSlot || !setWindowLongPtrSlot) {
+			logger::warn("[DX12SwapChain] SideAimAni.dll ANSI WndProc imports could not be resolved");
+			return;
+		}
+
+		const auto savedWndProcFromCall = ResolveRipRelativeAddress(directWndProcCall, 3, 7);
+		const auto getImportFromInstall = ResolveRipRelativeAddress(wndProcInstall + 11, 2, 6);
+		const auto savedWndProcFromInstall = ResolveRipRelativeAddress(wndProcInstall + 17, 3, 7);
+		const auto setImportFromInstall = ResolveRipRelativeAddress(wndProcInstall + 39, 2, 6);
+		if (savedWndProcFromCall != savedWndProcFromInstall ||
+			getImportFromInstall != reinterpret_cast<std::uintptr_t>(getWindowLongPtrSlot) ||
+			setImportFromInstall != reinterpret_cast<std::uintptr_t>(setWindowLongPtrSlot)) {
+			logger::warn("[DX12SwapChain] SideAimAni.dll WndProc signature references do not match its imports");
+			return;
+		}
+
+		const auto user32 = GetModuleHandleW(L"user32.dll");
+		const auto getWindowLongPtrA = reinterpret_cast<std::uintptr_t>(GetProcAddress(user32, "GetWindowLongPtrA"));
+		const auto setWindowLongPtrA = reinterpret_cast<std::uintptr_t>(GetProcAddress(user32, "SetWindowLongPtrA"));
+		const auto getWindowLongPtrW = reinterpret_cast<std::uintptr_t>(GetProcAddress(user32, "GetWindowLongPtrW"));
+		const auto setWindowLongPtrW = reinterpret_cast<std::uintptr_t>(GetProcAddress(user32, "SetWindowLongPtrW"));
+		if (!getWindowLongPtrA || !setWindowLongPtrA || !getWindowLongPtrW || !setWindowLongPtrW ||
+			*getWindowLongPtrSlot != getWindowLongPtrA || *setWindowLongPtrSlot != setWindowLongPtrA) {
+			logger::warn("[DX12SwapChain] SideAimAni.dll WndProc imports were already modified; Unicode compatibility was not installed");
+			return;
+		}
+
+		if (!PatchImportPair(
+				getWindowLongPtrSlot,
+				getWindowLongPtrW,
+				setWindowLongPtrSlot,
+				setWindowLongPtrW)) {
+			logger::warn("[DX12SwapChain] Could not patch SideAimAni.dll WndProc imports");
+			return;
+		}
+
+		logger::info("[DX12SwapChain] Installed SideAimAni.dll Unicode WndProc compatibility");
+	}
+
 	LRESULT CALLBACK DX12SwapChainWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wParam, LPARAM a_lParam)
 	{
 		auto* streamline = Streamline::GetSingleton();
@@ -434,6 +719,7 @@ void DX12SwapChain::InstallWndProcHook(HWND a_hwnd)
 	}
 
 	originalWndProc = reinterpret_cast<WNDPROC>(previous);
+	InstallSideAimUnicodeWndProcCompatibility();
 	logger::info("[DX12SwapChain] Installed PCL stats window proc hook");
 }
 
