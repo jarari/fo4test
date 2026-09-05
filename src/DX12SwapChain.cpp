@@ -1155,6 +1155,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		}
 		if (SUCCEEDED(result) && !deviceLost) {
 			frameIndex = swapChain->GetCurrentBackBufferIndex();
+			upscaling->AdvanceDeferredResourceReleases();
 		}
 		return result;
 	}
@@ -1323,6 +1324,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 		streamline->ApplyPendingDLSSGDisable();
 		streamline->OnDLSSGPresentComplete();
+		upscaling->AdvanceDeferredResourceReleases();
 	}
 	if (FAILED(result)) {
 		const auto d3d12RemovedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : S_OK;

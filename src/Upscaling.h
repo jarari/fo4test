@@ -7,6 +7,7 @@
 #include "Streamline.h"
 
 #include <array>
+#include <deque>
 #include <initializer_list>
 #include <memory>
 #include <winrt/base.h>
@@ -179,6 +180,15 @@ public:
 	void TagDLSSGInputs(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
 	void GetTaggedTextureDebugResources(uint32_t a_frameIndex, ID3D12Resource*& a_color, ID3D12Resource*& a_depth, ID3D12Resource*& a_motionVectors) const;
 	void OnD3D12TemporalSuspend();
+
+	// DLSS-G/Streamline can retain tagged resources past the Present that
+	// submitted them. Keep replaced shared resources alive for a fixed number
+	// of completed Presents before releasing their COM references.
+	void RetireD3D11Texture(std::unique_ptr<Texture2D>& a_texture);
+	void RetireSharedD3D12Texture(std::unique_ptr<Texture2D>& a_texture, winrt::com_ptr<ID3D12Resource>& a_d3d12Resource);
+	void RetireD3D12Resource(winrt::com_ptr<ID3D12Resource>& a_resource);
+	void AdvanceDeferredResourceReleases();
+	void FlushDeferredResourceReleases();
 
 	/**
 	 * @brief Check and manage upscaling resources
@@ -446,6 +456,16 @@ public:
 	std::array<float2, kDX12FrameCount> fsrInputJitters{};
 	std::array<float2, kDX12FrameCount> fsrInputRenderSizes{};
 	std::array<float2, kDX12FrameCount> fsrInputDisplaySizes{};
+
+	static constexpr uint64_t kDeferredResourceReleasePresents = 16;
+	struct DeferredResourceRelease
+	{
+		uint64_t releasePresent = 0;
+		std::unique_ptr<Texture2D> d3d11Texture;
+		winrt::com_ptr<ID3D12Resource> d3d12Resource;
+	};
+	std::deque<DeferredResourceRelease> deferredResourceReleases;
+	uint64_t completedPresentCount = 0;
 	bool d3d12DLSSMenuSuspended = false;
 	bool dlssgMenuResumeReady = true;
 	uint32_t dlssgStableGameplayFrames = 0;
