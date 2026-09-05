@@ -942,11 +942,12 @@ void Streamline::ClearDLSSGResourceTags(ID3D12GraphicsCommandList* a_commandList
 		return;
 	}
 
+	const auto* dx12 = DX12SwapChain::GetSingleton();
 	const sl::Extent fullExtent{
 		0,
 		0,
-		static_cast<uint32_t>(gameViewport->screenWidth),
-		static_cast<uint32_t>(gameViewport->screenHeight)
+		dx12->IsReady() ? dx12->swapChainDesc.Width : static_cast<uint32_t>(gameViewport->screenWidth),
+		dx12->IsReady() ? dx12->swapChainDesc.Height : static_cast<uint32_t>(gameViewport->screenHeight)
 	};
 
 	sl::ResourceTag backbufferTag = { nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle{}, &fullExtent };

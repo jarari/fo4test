@@ -14,7 +14,7 @@ class Streamline;
 class D3D11D3D12SharedTexture
 {
 public:
-	D3D11D3D12SharedTexture(const D3D11_TEXTURE2D_DESC& a_desc, ID3D11Device5* a_d3d11Device, ID3D12Device* a_d3d12Device);
+	D3D11D3D12SharedTexture(const D3D11_TEXTURE2D_DESC& a_desc, ID3D11Device* a_d3d11Device, ID3D12Device* a_d3d12Device);
 
 	winrt::com_ptr<ID3D11Texture2D> resource11;
 	winrt::com_ptr<ID3D12Resource> resource12;
@@ -95,7 +95,7 @@ public:
 	void SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context);
 
 	DXGISwapChainProxy* GetSwapChainProxy() const { return swapChainProxy; }
-	bool IsReady() const { return swapChainProxy && swapChain; }
+	bool IsReady() const { return swapChainProxy && swapChain && interopReady; }
 	bool IsWindowMinimized() const { return windowMinimized.load(std::memory_order_acquire) || (hwnd && IsIconic(hwnd)); }
 	bool IsWindowUnavailable() const { return IsWindowMinimized(); }
 	bool AreTemporalFeaturesSuspended() const { return temporalFeaturesSuspended; }
@@ -103,6 +103,12 @@ public:
 	ID3D12Device* GetD3D12Device() const { return d3d12Device.get(); }
 	bool WaitForFrameSlot(UINT a_frameIndex);
 	bool WaitForGPUIdle();
+	bool WaitForInteropIdle();
+	HRESULT ResizeENBScene(uint32_t a_quality);
+	bool BeginNativeUI();
+	void EndNativeUI();
+	uint64_t NativeUIGeneration() const { return nativeUIGeneration; }
+	uint64_t ENBSceneResizeGeneration() const { return enbSceneResizeGeneration; }
 	HRESULT ResizeBuffers(UINT a_bufferCount, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags);
 	HRESULT ResizeBuffers1(UINT a_bufferCount, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask, IUnknown* const* a_presentQueue);
 	HRESULT SetFullscreenState(BOOL a_fullscreen, IDXGIOutput* a_target);
@@ -170,6 +176,18 @@ private:
 	winrt::com_ptr<ID3D12Resource> swapChainBuffers[kDX12FrameCount];
 	std::unique_ptr<Texture2D> swapChainBufferProxy;
 	std::unique_ptr<D3D11D3D12SharedTexture> swapChainBufferProxyENB;
+	std::unique_ptr<D3D11D3D12SharedTexture> pendingSceneProxy;
+	bool sceneResizeActive = false;
+	bool sceneResizeObserved = false;
+	uint32_t pendingSceneQuality = 0;
+	uint64_t enbSceneResizeGeneration = 0;
+	std::unique_ptr<Texture2D> nativeUITexture;
+	winrt::com_ptr<ID3D11ShaderResourceView> sceneUISRV;
+	winrt::com_ptr<ID3D11ComputeShader> nativeUIResolve;
+	winrt::com_ptr<ID3D11SamplerState> nativeUISampler;
+	RE::BSGraphics::RenderTarget savedSceneTarget{};
+	bool nativeUIActive = false;
+	uint64_t nativeUIGeneration = 0;
 	CommandContext commandContexts[kCommandContextCount];
 	winrt::handle commandFenceEvent;
 	winrt::com_ptr<ID3D12Resource> presentOverrideFinalColor;
@@ -187,4 +205,5 @@ private:
 	std::atomic_bool windowStateDirty{ false };
 	bool temporalFeaturesSuspended = false;
 	bool deviceLost = false;
+	bool interopReady = false;
 };

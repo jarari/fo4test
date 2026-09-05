@@ -1,14 +1,19 @@
 #include "DX12SwapChain.h"
+#include "ENBRenderDomain.h"
+#include "ENBEffectDiagnostics.h"
+#include "NativeInterfaceUI.h"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <d3dcompiler.h>
 #include <limits>
 #include <string_view>
 
 #include "D3D12UIComposite.h"
 #include "FidelityFX.h"
 #include "OSD.h"
+#include "RenderProfiling.h"
 #include "Streamline.h"
 #include "TaggedTextureDebug.h"
 #include "Upscaling.h"
@@ -418,7 +423,7 @@ namespace
 
 }
 
-D3D11D3D12SharedTexture::D3D11D3D12SharedTexture(const D3D11_TEXTURE2D_DESC& a_desc, ID3D11Device5* a_d3d11Device, ID3D12Device* a_d3d12Device)
+D3D11D3D12SharedTexture::D3D11D3D12SharedTexture(const D3D11_TEXTURE2D_DESC& a_desc, ID3D11Device* a_d3d11Device, ID3D12Device* a_d3d12Device)
 {
 	auto desc = a_desc;
 	desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
@@ -528,7 +533,19 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeTarget(const DXGI_MODE_DESC*
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetContainingOutput(IDXGIOutput** ppOutput) { return swapChain->GetContainingOutput(ppOutput); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats) { return swapChain->GetFrameStatistics(pStats); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetLastPresentCount(UINT* pLastPresentCount) { return swapChain->GetLastPresentCount(pLastPresentCount); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc) { return swapChain->GetDesc1(pDesc); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc)
+{
+	const auto result = swapChain->GetDesc1(pDesc);
+	const auto& domain = ENBRenderDomain::Get();
+	if (SUCCEEDED(result) && pDesc && domain.Active()) {
+		pDesc->Width = domain.Width();
+		pDesc->Height = domain.Height();
+		// The game-facing proxy has all three views owned by RendererWindow.
+		// WindowSizeChanged releases RTV/SRV/UAV without null checks.
+		pDesc->BufferUsage |= DXGI_USAGE_SHADER_INPUT | DXGI_USAGE_UNORDERED_ACCESS;
+	}
+	return result;
+}
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pDesc) { return swapChain->GetFullscreenDesc(pDesc); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetHwnd(HWND* pHwnd) { return swapChain->GetHwnd(pHwnd); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetCoreWindow(REFIID refiid, void** ppUnk) { return swapChain->GetCoreWindow(refiid, ppUnk); }
@@ -539,8 +556,27 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetBackgroundColor(const DXGI_RGBA
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBackgroundColor(DXGI_RGBA* pColor) { return swapChain->GetBackgroundColor(pColor); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetRotation(DXGI_MODE_ROTATION Rotation) { return swapChain->SetRotation(Rotation); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetRotation(DXGI_MODE_ROTATION* pRotation) { return swapChain->GetRotation(pRotation); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetSourceSize(UINT Width, UINT Height) { return swapChain->SetSourceSize(Width, Height); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetSourceSize(UINT* pWidth, UINT* pHeight) { return swapChain->GetSourceSize(pWidth, pHeight); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetSourceSize(UINT Width, UINT Height)
+{
+	const auto& domain = ENBRenderDomain::Get();
+	if (domain.Active()) {
+		return Width == domain.Width() && Height == domain.Height() ? S_OK : E_INVALIDARG;
+	}
+	return swapChain->SetSourceSize(Width, Height);
+}
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetSourceSize(UINT* pWidth, UINT* pHeight)
+{
+	const auto& domain = ENBRenderDomain::Get();
+	if (domain.Active()) {
+		if (!pWidth || !pHeight) {
+			return E_POINTER;
+		}
+		*pWidth = domain.Width();
+		*pHeight = domain.Height();
+		return S_OK;
+	}
+	return swapChain->GetSourceSize(pWidth, pHeight);
+}
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetMaximumFrameLatency(UINT MaxLatency) { return swapChain->SetMaximumFrameLatency(MaxLatency); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetMaximumFrameLatency(UINT* pMaxLatency) { return swapChain->GetMaximumFrameLatency(pMaxLatency); }
 HANDLE STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameLatencyWaitableObject() { return swapChain->GetFrameLatencyWaitableObject(); }
@@ -800,6 +836,11 @@ void DX12SwapChain::ProcessWindowStateTransition()
 
 void DX12SwapChain::ReleaseResizeDependentResources()
 {
+	EndNativeUI();
+	NativeInterfaceUI::ReleaseResources();
+	nativeUITexture = nullptr;
+	sceneUISRV = nullptr;
+	interopReady = false;
 	presentOverrideFinalColor = nullptr;
 	for (auto& context : commandContexts) {
 		context.presentStaging = nullptr;
@@ -826,8 +867,150 @@ void DX12SwapChain::RestoreResizeDependentResources(const char* a_context)
 	}
 }
 
+HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
+{
+	auto& domain = ENBRenderDomain::Get();
+	auto* data = RE::BSGraphics::GetRendererData();
+	if (!data) { return E_UNEXPECTED; }
+	auto* device = reinterpret_cast<ID3D11Device*>(data->device);
+	auto* outerSwapChain = reinterpret_cast<IDXGISwapChain*>(data->renderWindow[0].swapChain);
+	using CreateTargets = void (*)();
+	// Verified OG/AE target-manager creation callback, not WindowSizeChanged.
+	static REL::Relocation<CreateTargets*> createTargets{ REL::ID{ 1096254, 2666763 } };
+	using DestroyTargets = void (*)(RE::BSGraphics::RenderTargetManager*);
+	static REL::Relocation<DestroyTargets> destroyTargets{ REL::ID{ 456166, 2277229 } };
+	using SetProperties = void (*)(RE::BSGraphics::RenderTargetManager*, const RE::BSGraphics::RenderTargetProperties&);
+	static REL::Relocation<SetProperties> setProperties{ REL::ID{ 1453219, 2721521 } };
+	if (!domain.Active() || !IsReady() || !swapChainBufferProxyENB || !device || !outerSwapChain || !*createTargets.get() || sceneResizeActive) {
+		return E_UNEXPECTED;
+	}
+	if (Streamline::GetSingleton()->NeedsDLSSGPresentSafety() || FidelityFX::GetSingleton()->IsFrameGenerationEnabled()) {
+		return DXGI_ERROR_WAS_STILL_DRAWING;
+	}
+	if (!WaitForInteropIdle()) { return DXGI_ERROR_DEVICE_REMOVED; }
+	EndNativeUI();
+	const auto oldQuality = domain.Quality();
+	const auto oldWidth = domain.Width();
+	const auto oldHeight = domain.Height();
+	const auto extent = ENBRenderDomain::CalculateExtent(swapChainDesc.Width, swapChainDesc.Height, a_quality);
+	try {
+		D3D11_TEXTURE2D_DESC desc{};
+		swapChainBufferProxyENB->resource11->GetDesc(&desc);
+		desc.Width = extent.width;
+		desc.Height = extent.height;
+		// Allocate before modifying the active domain. Allocation failure leaves
+		// the old scene, engine views, UI and presentation resources untouched.
+		// Use the game-facing device so ENB registers the new texture's private
+		// metadata, which its RTV/SRV creation then propagates to the views.
+		// The raw device bypasses that registration; ENB's GetBuffer only forwards.
+		pendingSceneProxy = std::make_unique<D3D11D3D12SharedTexture>(desc, device, d3d12Device.get());
+	} catch (const std::exception& e) {
+		logger::error("[ENB scene resize] Allocation failed: {}", e.what());
+		return E_OUTOFMEMORY;
+	}
+	struct EndTransaction
+	{
+		bool& active;
+		~EndTransaction() { active = false; }
+	} transaction{ sceneResizeActive };
+	sceneResizeActive = true;
+	sceneResizeObserved = false;
+	pendingSceneQuality = a_quality;
+	ENBEffectDiagnostics::BeforeResize();
+	auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
+	context->ClearState();
+	// This notifies the ENB wrapper only. The nested proxy call is handled by
+	// the sceneResizeActive branch and does not resize the real swapchain.
+	// ENB can reset AntTweakBar to the scene extent even though our native UI
+	// texture survives. Invalidate its coordinate cache independently, including
+	// failed resize / rollback attempts that may still touch ENB's GUI state.
+	++enbSceneResizeGeneration;
+	HRESULT result = outerSwapChain->ResizeBuffers(0, extent.width, extent.height, DXGI_FORMAT_UNKNOWN, swapChainDesc.Flags);
+	if (SUCCEEDED(result) && !sceneResizeObserved) { result = E_UNEXPECTED; }
+	winrt::com_ptr<ID3D11Texture2D> buffer;
+	winrt::com_ptr<ID3D11RenderTargetView> rtv;
+	winrt::com_ptr<ID3D11ShaderResourceView> srv;
+	winrt::com_ptr<ID3D11UnorderedAccessView> uav;
+	if (SUCCEEDED(result)) { result = outerSwapChain->GetBuffer(0, IID_PPV_ARGS(buffer.put())); }
+	if (SUCCEEDED(result)) {
+		D3D11_TEXTURE2D_DESC desc{};
+		buffer->GetDesc(&desc);
+		if (desc.Width != extent.width || desc.Height != extent.height) { result = E_UNEXPECTED; }
+	}
+	if (SUCCEEDED(result)) { result = device->CreateRenderTargetView(buffer.get(), nullptr, rtv.put()); }
+	if (SUCCEEDED(result)) { result = device->CreateShaderResourceView(buffer.get(), nullptr, srv.put()); }
+	if (SUCCEEDED(result)) { result = device->CreateUnorderedAccessView(buffer.get(), nullptr, uav.put()); }
+	if (FAILED(result)) {
+		// Restore ENB's descriptor/cache as well as the proxy if notification or
+		// view creation failed. Do not destroy the game's still-valid scene RTs.
+		if (sceneResizeObserved) {
+			pendingSceneQuality = oldQuality;
+			sceneResizeObserved = false;
+			const auto rollback = outerSwapChain->ResizeBuffers(0, oldWidth, oldHeight, DXGI_FORMAT_UNKNOWN, swapChainDesc.Flags);
+			if (!sceneResizeObserved) {
+				pendingSceneProxy.swap(swapChainBufferProxyENB);
+				domain.SetQuality(oldQuality, swapChainDesc.Width, swapChainDesc.Height);
+			}
+			logger::error("[ENB scene resize] Failed hr=0x{:08X}; rollback hr=0x{:08X}", static_cast<uint32_t>(result), static_cast<uint32_t>(rollback));
+		}
+		return result;
+	}
+
+	Upscaling::GetSingleton()->DestroyUpscalingResources();
+	Streamline::GetSingleton()->DestroyDLSSResources();
+	presentOverrideFinalColor = nullptr;
+	for (auto& command : commandContexts) { command.retainedPresentOverride = nullptr; }
+	NativeInterfaceUI::ReleaseResources();
+	sceneUISRV = nullptr;
+	auto& windowTarget = data->renderWindow[0].swapChainRenderTarget;
+	// RendererWindow owns the views; RT0 aliases them without another AddRef.
+	// The backing texture is owned by the proxy (as in the native UI path).
+	const auto oldTarget = windowTarget;
+	windowTarget = {};
+	windowTarget.texture = reinterpret_cast<REX::W32::ID3D11Texture2D*>(swapChainBufferProxyENB->resource11.get());
+	windowTarget.rtView = reinterpret_cast<REX::W32::ID3D11RenderTargetView*>(rtv.detach());
+	windowTarget.srView = reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(srv.detach());
+	windowTarget.uaView = reinterpret_cast<REX::W32::ID3D11UnorderedAccessView*>(uav.detach());
+	data->renderTargets[0] = windowTarget;
+	auto* manager = Util::RenderTargetManager_GetSingleton();
+	auto properties = manager->renderTargetData[0];
+	properties.width = extent.width;
+	properties.height = extent.height;
+	setProperties(manager, properties);
+	destroyTargets(manager);
+	(*createTargets.get())();
+	data->renderTargets[0] = windowTarget;
+	domain.ApplySceneDimensions();
+	if (oldTarget.rtView) { oldTarget.rtView->Release(); }
+	if (oldTarget.srView) { oldTarget.srView->Release(); }
+	if (oldTarget.uaView) { oldTarget.uaView->Release(); }
+	// Keep the former proxy alive until both APIs finish the rebuild work too.
+	if (!WaitForInteropIdle()) {
+		logger::error("[ENB scene resize] Post-rebuild GPU drain failed; retaining former proxy");
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
+	pendingSceneProxy.reset();
+	Streamline::GetSingleton()->RequestTemporalReset();
+	logger::info("[ENB scene resize] quality {} -> {} scene={}x{} display={}x{}; engine-window-resize=false real-swapchain-resize=false native-UI-preserved=true",
+		oldQuality, a_quality, domain.Width(), domain.Height(), swapChainDesc.Width, swapChainDesc.Height);
+	return S_OK;
+}
+
 HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask)
 {
+	// ENB's outer wrapper still needs its ResizeBuffers notification, but a
+	// quality-only transaction must never reach the real display swapchain.
+	if (sceneResizeActive) {
+		if (!sceneResizeObserved) {
+			if (!pendingSceneProxy) { return E_UNEXPECTED; }
+			pendingSceneProxy.swap(swapChainBufferProxyENB);
+			// Commit the virtual descriptor with the buffer, not before the
+			// outer ENB wrapper enters ResizeBuffers and inspects its old state.
+			ENBRenderDomain::Get().SetQuality(pendingSceneQuality, swapChainDesc.Width, swapChainDesc.Height);
+			sceneResizeObserved = true;
+		}
+		return S_OK;
+	}
 	const auto operation = a_useResizeBuffers1 ? "ResizeBuffers1" : "ResizeBuffers";
 	if (!swapChain || deviceLost) {
 		return DXGI_ERROR_DEVICE_REMOVED;
@@ -841,6 +1024,18 @@ HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_wi
 	ReleaseResizeDependentResources();
 
 	const auto format = a_format == DXGI_FORMAT_UNKNOWN ? swapChainDesc.Format : a_format;
+	if (ENBRenderDomain::Get().Active()) {
+		// Game / ENB resize arguments describe the virtual buffer. The real
+		// swapchain follows the HWND, never the low-resolution descriptor.
+		RECT client{};
+		if (GetClientRect(hwnd, &client) && client.right > client.left && client.bottom > client.top) {
+			a_width = static_cast<UINT>(client.right - client.left);
+			a_height = static_cast<UINT>(client.bottom - client.top);
+		} else {
+			a_width = swapChainDesc.Width;
+			a_height = swapChainDesc.Height;
+		}
+	}
 	const auto resizeFlags = a_flags | swapChainDesc.Flags;
 	HRESULT result = S_OK;
 	if (a_useResizeBuffers1) {
@@ -907,13 +1102,20 @@ HRESULT DX12SwapChain::ResizeTarget(const DXGI_MODE_DESC* a_newTargetParameters)
 	if (deviceLost) {
 		return DXGI_ERROR_DEVICE_REMOVED;
 	}
-	const auto result = swapChain->ResizeTarget(a_newTargetParameters);
+	auto targetMode = *a_newTargetParameters;
+	if (ENBRenderDomain::Get().Active()) {
+		// The virtual mode must not resize the HWND / output to scene resolution.
+		targetMode.Width = swapChainDesc.Width;
+		targetMode.Height = swapChainDesc.Height;
+	}
+	const auto result = swapChain->ResizeTarget(&targetMode);
 	windowStateDirty.store(true, std::memory_order_release);
 	return result;
 }
 
 void DX12SwapChain::CreateInterop()
 {
+	ENBRenderDomain::Get().Initialize(swapChainDesc.Width, swapChainDesc.Height);
 	HANDLE sharedFenceHandle = nullptr;
 	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(d3d12Fence.put())));
 	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(commandFence.put())));
@@ -925,6 +1127,7 @@ void DX12SwapChain::CreateInterop()
 
 void DX12SwapChain::RecreateInteropTextures()
 {
+	interopReady = false;
 	D3D11_TEXTURE2D_DESC textureDesc{};
 	textureDesc.Width = swapChainDesc.Width;
 	textureDesc.Height = swapChainDesc.Height;
@@ -933,7 +1136,12 @@ void DX12SwapChain::RecreateInteropTextures()
 	textureDesc.Format = swapChainDesc.Format;
 	textureDesc.SampleDesc.Count = 1;
 	textureDesc.Usage = D3D11_USAGE_DEFAULT;
-	textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+	const auto& domain = ENBRenderDomain::Get();
+	if (domain.Active()) {
+		textureDesc.Width = domain.Width();
+		textureDesc.Height = domain.Height();
+	}
 
 	if (enbLoaded) {
 		swapChainBufferProxyENB = std::make_unique<D3D11D3D12SharedTexture>(textureDesc, d3d11Device.get(), d3d12Device.get());
@@ -946,12 +1154,17 @@ void DX12SwapChain::RecreateInteropTextures()
 	}
 	for (auto& context : commandContexts) {
 		context.retainedPresentOverride = nullptr;
+		textureDesc.Width = swapChainDesc.Width;
+		textureDesc.Height = swapChainDesc.Height;
+		textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 		context.presentStaging = std::make_unique<D3D11D3D12SharedTexture>(textureDesc, d3d11Device.get(), d3d12Device.get());
 	}
+	interopReady = true;
 }
 
 DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 {
+	const ScopedRenderCPUProfile cpuTiming("command-context-acquire (inclusive)");
 	const auto completedValue = commandFence ? commandFence->GetCompletedValue() : 0;
 	if (completedValue == std::numeric_limits<UINT64>::max()) {
 		deviceLost = true;
@@ -1051,7 +1264,10 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 		logger::error("[DX12SwapChain] SetEventOnCompletion failed result=0x{:08X} value={}", static_cast<uint32_t>(eventResult), a_value);
 		return false;
 	}
-	const auto waitResult = WaitForSingleObjectEx(commandFenceEvent.get(), 5000, FALSE);
+	const auto waitResult = [&]() {
+		const ScopedRenderCPUProfile cpuTiming("command-fence-wait");
+		return WaitForSingleObjectEx(commandFenceEvent.get(), 5000, FALSE);
+	}();
 	if (waitResult != WAIT_OBJECT_0) {
 		const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : E_FAIL;
 		deviceLost = FAILED(removedReason);
@@ -1119,6 +1335,9 @@ HRESULT DX12SwapChain::GetBuffer(UINT, REFIID a_riid, void** a_surface)
 	if (!a_surface) {
 		return E_POINTER;
 	}
+	if (nativeUIActive && nativeUITexture) {
+		return nativeUITexture->resource->QueryInterface(a_riid, a_surface);
+	}
 
 	if (swapChainBufferProxyENB) {
 		return swapChainBufferProxyENB->resource11->QueryInterface(a_riid, a_surface);
@@ -1131,8 +1350,155 @@ HRESULT DX12SwapChain::GetBuffer(UINT, REFIID a_riid, void** a_surface)
 	return swapChainBufferProxy->resource->QueryInterface(a_riid, a_surface);
 }
 
+bool DX12SwapChain::WaitForInteropIdle()
+{
+	if (!d3d11Context || !d3d11Fence || !commandQueue || !d3d12Fence) {
+		return false;
+	}
+	const auto value = fenceValue++;
+	if (FAILED(d3d11Context->Signal(d3d11Fence.get(), value))) {
+		return false;
+	}
+	d3d11Context->Flush();
+	return SUCCEEDED(commandQueue->Wait(d3d12Fence.get(), value)) && WaitForGPUIdle();
+}
+
+void DX12SwapChain::EndNativeUI()
+{
+	if (!nativeUIActive) {
+		return;
+	}
+	d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
+	RE::BSGraphics::GetRendererData()->renderTargets[0] = savedSceneTarget;
+	nativeUIActive = false;
+	ENBRenderDomain::Get().ApplySceneDimensions();
+}
+
+bool DX12SwapChain::BeginNativeUI()
+{
+	if (!ENBRenderDomain::Get().Active() || nativeUIActive) {
+		return true;
+	}
+	if (!IsReady() || !swapChainBufferProxyENB) {
+		return false;
+	}
+	const ScopedRenderCPUProfile uiPreparationTiming("native-UI-prepare (inclusive)");
+	try {
+		if (!nativeUITexture) {
+			D3D11_TEXTURE2D_DESC desc{};
+			swapChainBufferProxyENB->resource11->GetDesc(&desc);
+			desc.Width = swapChainDesc.Width;
+			desc.Height = swapChainDesc.Height;
+			desc.MiscFlags = 0;
+			desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+			winrt::com_ptr<ID3D11Texture2D> texture;
+			DX::ThrowIfFailed(d3d11Device->CreateTexture2D(&desc, nullptr, texture.put()));
+			auto ui = std::make_unique<Texture2D>(texture.detach());
+			DX::ThrowIfFailed(d3d11Device->CreateRenderTargetView(ui->resource.get(), nullptr, ui->rtv.put()));
+			DX::ThrowIfFailed(d3d11Device->CreateShaderResourceView(ui->resource.get(), nullptr, ui->srv.put()));
+			DX::ThrowIfFailed(d3d11Device->CreateUnorderedAccessView(ui->resource.get(), nullptr, ui->uav.put()));
+			nativeUITexture = std::move(ui);
+			++nativeUIGeneration;
+			logger::info("[ENB UI] Native screen-space target {}x{}; scene {}x{}, generation={}",
+				desc.Width, desc.Height, ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height(), nativeUIGeneration);
+		}
+		if (!sceneUISRV) {
+			DX::ThrowIfFailed(d3d11Device->CreateShaderResourceView(swapChainBufferProxyENB->resource11.get(), nullptr, sceneUISRV.put()));
+		}
+		if (!nativeUIResolve) {
+			constexpr char source[] = R"(
+Texture2D<float4> Input : register(t0);
+RWTexture2D<float4> Output : register(u0);
+SamplerState LinearClamp : register(s0);
+[numthreads(8, 8, 1)]
+void main(uint3 p : SV_DispatchThreadID)
+{
+    uint width, height;
+    Output.GetDimensions(width, height);
+    if (p.x >= width || p.y >= height) return;
+    Output[p.xy] = Input.SampleLevel(LinearClamp, (float2(p.xy) + 0.5) / float2(width, height), 0);
+})";
+			winrt::com_ptr<ID3DBlob> shader, errors;
+			DX::ThrowIfFailed(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.put(), errors.put()));
+			DX::ThrowIfFailed(d3d11Device->CreateComputeShader(shader->GetBufferPointer(), shader->GetBufferSize(), nullptr, nativeUIResolve.put()));
+		}
+		if (!nativeUISampler) {
+			D3D11_SAMPLER_DESC sampler{};
+			sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+			sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+			sampler.MaxLOD = D3D11_FLOAT32_MAX;
+			DX::ThrowIfFailed(d3d11Device->CreateSamplerState(&sampler, nativeUISampler.put()));
+		}
+		// Preserve the pre-existing low-res background. Interface3D post-AA and
+		// subsequent 2D UI render here; the D3D12 SR result is never copied back.
+		winrt::com_ptr<ID3D11ComputeShader> oldShader;
+		std::array<ID3D11ClassInstance*, 256> instances{};
+		UINT instanceCount = static_cast<UINT>(instances.size());
+		d3d11Context->CSGetShader(oldShader.put(), instances.data(), &instanceCount);
+		winrt::com_ptr<ID3D11ShaderResourceView> oldSRV;
+		winrt::com_ptr<ID3D11UnorderedAccessView> oldUAV;
+		winrt::com_ptr<ID3D11SamplerState> oldSampler;
+		d3d11Context->CSGetShaderResources(0, 1, oldSRV.put());
+		d3d11Context->CSGetUnorderedAccessViews(0, 1, oldUAV.put());
+		d3d11Context->CSGetSamplers(0, 1, oldSampler.put());
+		d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
+		auto* input = sceneUISRV.get();
+		auto* output = nativeUITexture->uav.get();
+		auto* sampler = nativeUISampler.get();
+		d3d11Context->CSSetShader(nativeUIResolve.get(), nullptr, 0);
+		d3d11Context->CSSetShaderResources(0, 1, &input);
+		d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+		d3d11Context->CSSetSamplers(0, 1, &sampler);
+		d3d11Context->Dispatch((swapChainDesc.Width + 7) / 8, (swapChainDesc.Height + 7) / 8, 1);
+		input = nullptr;
+		output = nullptr;
+		d3d11Context->CSSetShaderResources(0, 1, &input);
+		d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+		input = oldSRV.get();
+		output = oldUAV.get();
+		sampler = oldSampler.get();
+		d3d11Context->CSSetShaderResources(0, 1, &input);
+		d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+		d3d11Context->CSSetSamplers(0, 1, &sampler);
+		d3d11Context->CSSetShader(oldShader.get(), instances.data(), instanceCount);
+		for (UINT i = 0; i < instanceCount; ++i) {
+			instances[i]->Release();
+		}
+		auto* renderer = RE::BSGraphics::GetRendererData();
+		savedSceneTarget = renderer->renderTargets[0];
+		auto& target = renderer->renderTargets[0];
+		target = {};
+		target.texture = reinterpret_cast<REX::W32::ID3D11Texture2D*>(nativeUITexture->resource.get());
+		target.rtView = reinterpret_cast<REX::W32::ID3D11RenderTargetView*>(nativeUITexture->rtv.get());
+		target.srView = reinterpret_cast<REX::W32::ID3D11ShaderResourceView*>(nativeUITexture->srv.get());
+		target.uaView = reinterpret_cast<REX::W32::ID3D11UnorderedAccessView*>(nativeUITexture->uav.get());
+		auto* state = Util::State_GetSingleton();
+		state->screenWidth = state->backBufferWidth = swapChainDesc.Width;
+		state->screenHeight = state->backBufferHeight = swapChainDesc.Height;
+		auto* manager = Util::RenderTargetManager_GetSingleton();
+		manager->renderTargetData[0].width = swapChainDesc.Width;
+		manager->renderTargetData[0].height = swapChainDesc.Height;
+		auto* rtv = nativeUITexture->rtv.get();
+		d3d11Context->OMSetRenderTargets(1, &rtv, nullptr);
+		using SetViewport = void (*)(RE::BSGraphics::RenderTargetManager*);
+		static REL::Relocation<SetViewport> setViewport{ REL::ID{ 158420, 2277192 } };
+		setViewport(manager);
+		D3D11_VIEWPORT viewport{ 0, 0, static_cast<float>(swapChainDesc.Width), static_cast<float>(swapChainDesc.Height), 0, 1 };
+		d3d11Context->RSSetViewports(1, &viewport);
+		nativeUIActive = true;
+		return true;
+	} catch (const std::exception& e) {
+		logger::error("[ENB UI] Native UI preparation failed: {}", e.what());
+		return false;
+	}
+}
+
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
+	// TEST does not consume the staged scene or advance resource retirement.
+	if (Flags & DXGI_PRESENT_TEST) {
+		return swapChain ? swapChain->Present(SyncInterval, Flags) : DXGI_ERROR_INVALID_CALL;
+	}
 	if (deviceLost) {
 		return DXGI_ERROR_DEVICE_REMOVED;
 	}
@@ -1145,6 +1511,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	const auto osdEnabled = upscaling->settings.osdMode != 0;
 	ProcessWindowStateTransition();
 	if (IsWindowUnavailable()) {
+		presentOverrideFinalColor = nullptr;
 		const auto presentedFrameIndex = frameIndex;
 		const auto result = swapChain->Present(0, Flags & ~DXGI_PRESENT_ALLOW_TEARING);
 		const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : S_OK;
@@ -1168,11 +1535,17 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		return DXGI_ERROR_INVALID_CALL;
 	}
 
-	if (swapChainBufferProxyENB) {
+	if (ENBRenderDomain::Get().Active()) {
+		if (!BeginNativeUI()) {
+			return E_FAIL;
+		}
+		d3d11Context->CopyResource(presentStaging->resource11.get(), nativeUITexture->resource.get());
+	} else if (swapChainBufferProxyENB) {
 		d3d11Context->CopyResource(presentStaging->resource11.get(), swapChainBufferProxyENB->resource11.get());
 	} else {
 		d3d11Context->CopyResource(presentStaging->resource11.get(), swapChainBufferProxy->resource.get());
 	}
+	const auto& enbDomain = ENBRenderDomain::Get();
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	++fenceValue;
@@ -1183,42 +1556,61 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	commandContext.retainedPresentOverride = std::move(presentOverrideFinalColor);
 	auto overrideFinalColor = commandContext.retainedPresentOverride.get();
 	const bool usePresentOverride = overrideFinalColor != nullptr;
+	const bool useComposite = usePresentOverride || enbDomain.Active();
+	if (enbDomain.Active() && upscaling->settings.enbGPUTiming) {
+		const auto* state = Util::State_GetSingleton();
+		if (state && state->frameCount % 120 == 0) {
+			const auto sourceDesc = copySource->GetDesc();
+			const auto destinationDesc = destination->GetDesc();
+			const auto baseDesc = overrideFinalColor ? overrideFinalColor->GetDesc() : sourceDesc;
+			UINT sourceWidth = 0;
+			UINT sourceHeight = 0;
+			const auto sourceSizeResult = swapChain->GetSourceSize(&sourceWidth, &sourceHeight);
+			logger::info("[ENB present] frame={} override={} staging={}x{} base={}x{} destination={}x{} viewport={}x{} real-source={}x{} source-query-ok={}",
+				state->frameCount, usePresentOverride, sourceDesc.Width, sourceDesc.Height,
+				baseDesc.Width, baseDesc.Height, destinationDesc.Width, destinationDesc.Height,
+				swapChainDesc.Width, swapChainDesc.Height, sourceWidth, sourceHeight, SUCCEEDED(sourceSizeResult));
+		}
+	}
 
 	D3D12_RESOURCE_BARRIER beforeCopy[] = {
 		CD3DX12_RESOURCE_BARRIER::Transition(
 			copySource,
 			D3D12_RESOURCE_STATE_COMMON,
-			usePresentOverride ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE),
+			useComposite ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE),
 		CD3DX12_RESOURCE_BARRIER::Transition(destination, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
 	};
 	commandList->ResourceBarrier(static_cast<UINT>(std::size(beforeCopy)), beforeCopy);
 	D3D12_RESOURCE_STATES destinationState = D3D12_RESOURCE_STATE_COPY_DEST;
-	if (usePresentOverride) {
-		D3D12_RESOURCE_BARRIER beforeComposite[] = {
-			CD3DX12_RESOURCE_BARRIER::Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
-			CD3DX12_RESOURCE_BARRIER::Transition(overrideFinalColor, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
-		};
-		commandList->ResourceBarrier(static_cast<UINT>(std::size(beforeComposite)), beforeComposite);
+	if (useComposite) {
+		auto toRenderTarget = CD3DX12_RESOURCE_BARRIER::Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		commandList->ResourceBarrier(1, &toRenderTarget);
+		if (overrideFinalColor) {
+			auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(overrideFinalColor, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			commandList->ResourceBarrier(1, &barrier);
+		}
 		D3D12UIComposite::GetSingleton()->Render(
 			d3d12Device.get(),
 			commandList,
 			destination,
-			overrideFinalColor,
-			copySource,
+			overrideFinalColor ? overrideFinalColor : copySource,
+			usePresentOverride ? copySource : nullptr,
 			swapChainDesc.Format,
 			swapChainDesc.Width,
 			swapChainDesc.Height,
 			commandContext.index,
 			static_cast<uint32_t>(std::size(commandContexts)));
-		auto afterComposite = CD3DX12_RESOURCE_BARRIER::Transition(overrideFinalColor, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-		commandList->ResourceBarrier(1, &afterComposite);
+		if (overrideFinalColor) {
+			auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(overrideFinalColor, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+			commandList->ResourceBarrier(1, &barrier);
+		}
 		destinationState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	} else {
 		commandList->CopyResource(destination, copySource);
 	}
 	auto afterSourceCopy = CD3DX12_RESOURCE_BARRIER::Transition(
 		copySource,
-		usePresentOverride ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE,
+		useComposite ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE,
 		D3D12_RESOURCE_STATE_COMMON);
 	commandList->ResourceBarrier(1, &afterSourceCopy);
 
@@ -1311,7 +1703,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (emitPresentMarkers) {
 		streamline->OnPresentStart();
 	}
-	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
+	const auto result = [&]() {
+		const ScopedRenderCPUProfile cpuTiming("real-present");
+		return swapChain->Present(presentSyncInterval, presentFlags);
+	}();
 	if (emitPresentMarkers) {
 		streamline->OnPresentEnd(result, false);
 	}
@@ -1389,6 +1784,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentFrame(bool a_evaluateDLSS, bool a_evaluateFSR, bool a_evaluateFSRFrameGeneration, bool a_waitForD3D11Consumption)
 {
+	const ScopedRenderCPUProfile cpuTiming("D3D12-evaluate-submit (inclusive)");
 	D3D12EvaluationResult result{};
 	if (!IsReady() || deviceLost || temporalFeaturesSuspended || IsWindowUnavailable()) {
 		return result;
@@ -1442,15 +1838,18 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkOnCommandLi
 
 	auto* upscaling = Upscaling::GetSingleton();
 	if (a_evaluateFSR) {
+		const ScopedRenderCPUProfile cpuTiming("FSR-record");
 		result.fsr = upscaling->EvaluateD3D12FSR(a_commandList, a_frameIndex);
 	}
 	if (a_evaluateDLSS) {
+		const ScopedRenderCPUProfile cpuTiming("DLSS-NR-SR-record");
 		result.dlss = upscaling->EvaluateD3D12DLSS(a_commandList, a_frameIndex);
 	}
 
 	const bool upscalerRequested = a_evaluateFSR || a_evaluateDLSS;
 	const bool upscalerSucceeded = (!a_evaluateFSR || result.fsr) && (!a_evaluateDLSS || result.dlss);
 	if (a_evaluateFSRFrameGeneration && (!upscalerRequested || upscalerSucceeded)) {
+		const ScopedRenderCPUProfile cpuTiming("FSR-FG-record");
 		result.fsrFrameGeneration = upscaling->EvaluateFSRFrameGeneration(a_commandList, a_frameIndex);
 	}
 

@@ -113,7 +113,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 	InitializeLog();
 
 	auto& trampoline = REL::GetTrampoline();
-	trampoline.create(512);
+	trampoline.create(1024);
 
 	if (ENB_API::RequestENBAPI()) {
 		logger::info("ENB detected");

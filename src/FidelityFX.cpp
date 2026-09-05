@@ -127,7 +127,7 @@ void FidelityFX::CopyOpaqueTexture()
 	static auto rendererData = RE::BSGraphics::GetRendererData();
 	auto d3d11Context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
 
-	auto source = reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[(uint)Util::RenderTarget::kMainTemp].texture);
+	auto source = reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMainTemp)].texture);
 	if (!source) {
 		return;
 	}

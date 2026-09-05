@@ -107,6 +107,11 @@ namespace Util
 	}
 
 	DirectX::XMMATRIX ToXMMatrix(const __m128* a_matrix);
+	// Legacy enums describe the initial platform allocation order, not logical
+	// engine IDs. Remember their identities before an engine resize reorders slots.
+	bool CaptureInitialRenderTargetBindings();
+	uint32_t ResolveRenderTarget(RenderTarget a_target);
+	uint32_t ResolveDepthStencilTarget(DepthStencilTarget a_target);
 	bool TryGetVerticalFOVFromProjection(const DirectX::XMMATRIX& a_projection, float& a_verticalFOV);
 	const RE::BSGraphics::CameraStateData* GetWorldCameraStateData();
 	CameraProjection GetCameraProjection();

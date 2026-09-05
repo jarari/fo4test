@@ -97,6 +97,7 @@ public:
 		uint osdMode = 0;                                           ///< Debug OSD: 0=Off, 1=Compact, 2=Detailed
 		uint taggedTextureDebug = 0;                                ///< Debug tagged texture view: 0=Off, 1=On
 		uint imageSpaceEffectLog = 0;                               ///< Log unique active image-space effects in the ENB native scope
+		uint enbGPUTiming = 0;                                       ///< Opt-in ENB GPU stages and CPU render-path timings
 		float sharpness = 0.2f;                                       ///< Upscaler sharpness: 0.0=off, 1.0=max
 		float dlssNRIntensity = 1.0f;
 		float dlssNRLocalToneStrength = 1.0f;
@@ -425,6 +426,8 @@ public:
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrOpaqueOnlySharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrReactiveMaskSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> debugMotionVectorSharedTextures;
+	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> enbFallbackSharedTextures;
+	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> enbFallbackD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssInputD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssSharpenedD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssD3D12PresentFinal;

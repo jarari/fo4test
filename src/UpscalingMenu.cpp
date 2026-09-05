@@ -3,6 +3,8 @@
 #include "F4SEMenuFramework.h"
 #include "Streamline.h"
 #include "Upscaling.h"
+#include "ENBRenderDomain.h"
+#include "ENBEffectDiagnostics.h"
 
 #include <array>
 #include <mutex>
@@ -17,6 +19,8 @@ namespace
 	bool g_editInitialized = false;
 	bool g_dirty = false;
 	bool g_registered = false;
+	bool g_enbCaptureRequested = false;
+	bool g_enbCaptureAttempted = false;
 	std::int64_t g_menuEventHandle = -1;
 	std::int64_t g_dlssNRHotkeyHandle = -1;
 	bool g_dlssNRHotkeyCapturing = false;
@@ -322,6 +326,11 @@ namespace
 		bool changed = false;
 
 		ImGuiMCP::TextWrapped("Changes are saved and applied when the F4SE Menu Framework closes.");
+		if (ENBRenderDomain::Get().Active()) {
+			ImGuiMCP::TextWrapped("Resolution quality changes apply live after outstanding frames drain. Only scene/game/ENB buffers are resized; the window, real display swapchain and native UI target remain unchanged.");
+			ImGuiMCP::TextDisabled("Active ENB scene: %u x %u (active quality %u)",
+				ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height(), ENBRenderDomain::Get().Quality());
+		}
 		const auto streamline = Streamline::GetSingleton();
 		if (streamline->initialized) {
 			ImGuiMCP::TextDisabled(
@@ -456,6 +465,16 @@ namespace
 		}
 
 		ImGuiMCP::SeparatorText("Diagnostics");
+		changed |= CheckboxSetting("ENB GPU / Post-Processing Capture", settings.enbGPUTiming,
+			"Enable and restart once to install ENB 0.501 diagnostic hooks. Captures raw custom/PBMask/GammaFix draw inputs and outputs after quality changes.");
+		if (ImGuiMCP::Button("Capture ENB Post-Processing (3s delay)")) {
+			g_enbCaptureRequested = ENBEffectDiagnostics::RequestCapture();
+			g_enbCaptureAttempted = true;
+		}
+		if (g_enbCaptureAttempted) {
+			ImGuiMCP::TextDisabled(g_enbCaptureRequested ? "Capture requested. Close menus within 3 seconds; see Upscaling.log for completion." :
+				"Capture unavailable. Enable ENB GPU / Post-Processing Capture and restart with ENB 0.501.");
+		}
 		static constexpr std::array osdModes{ "Disabled", "Compact", "Detailed" };
 		changed |= ComboSetting(
 			"On-Screen Display",

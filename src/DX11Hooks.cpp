@@ -4,6 +4,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "DX12SwapChain.h"
+#include "ENBRenderDomain.h"
 #include "Streamline.h"
 #include "Upscaling.h"
 
@@ -240,6 +241,7 @@ struct hkIDXGIFactoryCreateSwapChain
 			}
 			return S_OK;
 		} catch (const std::exception& e) {
+			ENBRenderDomain::Get().CancelInitialization();
 			logger::error("[DX12SwapChain] Failed to create ENB D3D12 proxy swapchain: {}", e.what());
 			logger::warn("[DX12SwapChain] Falling back to the original DXGI factory swapchain");
 			auto streamline = Streamline::GetSingleton();
@@ -317,6 +319,9 @@ struct hkD3D11CreateDeviceAndSwapChain
 			ppImmediateContext));
 
 		if (DX12SwapChain::GetSingleton()->IsReady()) {
+			// Renderer::Init has set the native State dimensions before this call.
+			// Replace them before InitD3D creates game scene/depth targets.
+			ENBRenderDomain::Get().ApplySceneDimensions();
 			logger::info("[DX12SwapChain] Factory hook created D3D12 proxy swapchain; skipping D3D11 Streamline initialization");
 			return S_OK;
 		}

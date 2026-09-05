@@ -192,9 +192,8 @@ void D3D12UIComposite::CreateSRV(ID3D12Device* a_device, ID3D12Resource* a_resou
 	auto handle = srvHeap->GetCPUDescriptorHandleForHeapStart();
 	handle.ptr += static_cast<SIZE_T>(a_index) * a_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-	const auto desc = a_resource->GetDesc();
 	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-	srvDesc.Format = SRVFormat(desc.Format);
+	srvDesc.Format = a_resource ? SRVFormat(a_resource->GetDesc().Format) : DXGI_FORMAT_R8G8B8A8_UNORM;
 	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	srvDesc.Texture2D.MipLevels = 1;
@@ -213,7 +212,7 @@ void D3D12UIComposite::Render(
 	uint32_t a_descriptorSlot,
 	uint32_t a_descriptorSlotCount)
 {
-	if (!a_device || !a_commandList || !a_backBuffer || !a_baseColor || !a_postUI || a_width == 0 || a_height == 0) {
+	if (!a_device || !a_commandList || !a_backBuffer || !a_baseColor || a_width == 0 || a_height == 0) {
 		return;
 	}
 	if (!EnsureResources(a_device, a_backBufferFormat, a_descriptorSlotCount)) {

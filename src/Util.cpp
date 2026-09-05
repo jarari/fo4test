@@ -1,6 +1,7 @@
 #include "Util.h"
 
 #include <cmath>
+#include <array>
 #include <d3dcompiler.h>
 #include <winrt/base.h>
 
@@ -8,6 +9,76 @@
 
 namespace Util
 {
+	namespace
+	{
+		constexpr uint32_t kUnmappedTarget = UINT32_MAX;
+		std::array<uint32_t, 101> initialColorIdentity;
+		std::array<uint32_t, 13> initialDepthIdentity;
+		bool identitiesCaptured = false;
+
+		const uint32_t* TargetIDTable(bool a_depth)
+		{
+			const auto offset = a_depth ? (REX::FModule::IsRuntimeOG() ? 0xF54u : 0xF84u) :
+				(REX::FModule::IsRuntimeOG() ? 0xDC4u : 0xDF4u);
+			return reinterpret_cast<const uint32_t*>(reinterpret_cast<const std::byte*>(RenderTargetManager_GetSingleton()) + offset);
+		}
+	}
+
+	bool CaptureInitialRenderTargetBindings()
+	{
+		if (identitiesCaptured) {
+			return true;
+		}
+		initialColorIdentity.fill(kUnmappedTarget);
+		initialDepthIdentity.fill(kUnmappedTarget);
+		const auto* colors = TargetIDTable(false);
+		const auto* depths = TargetIDTable(true);
+		for (uint32_t logical = 0; logical < (REX::FModule::IsRuntimeOG() ? 100u : 103u); ++logical) {
+			if (colors[logical] < initialColorIdentity.size() && initialColorIdentity[colors[logical]] == kUnmappedTarget) {
+				initialColorIdentity[colors[logical]] = logical;
+			}
+		}
+		for (uint32_t logical = 0; logical < 12; ++logical) {
+			if (depths[logical] < initialDepthIdentity.size() && initialDepthIdentity[depths[logical]] == kUnmappedTarget) {
+				initialDepthIdentity[depths[logical]] = logical;
+			}
+		}
+		for (auto target : { RenderTarget::kMain, RenderTarget::kMainTemp, RenderTarget::kMotionVectors, RenderTarget::kMainDepthMips }) {
+			if (initialColorIdentity[static_cast<uint32_t>(target)] == kUnmappedTarget) {
+				return false;
+			}
+		}
+		if (initialDepthIdentity[static_cast<uint32_t>(DepthStencilTarget::kMain)] == kUnmappedTarget) {
+			return false;
+		}
+		identitiesCaptured = true;
+		logger::info("[ENB targets] Captured initial identities: motion logical={}, depth logical={}, linear-depth logical={}",
+			initialColorIdentity[static_cast<uint32_t>(RenderTarget::kMotionVectors)],
+			initialDepthIdentity[static_cast<uint32_t>(DepthStencilTarget::kMain)],
+			initialColorIdentity[static_cast<uint32_t>(RenderTarget::kMainDepthMips)]);
+		return true;
+	}
+
+	uint32_t ResolveRenderTarget(RenderTarget a_target)
+	{
+		const auto legacy = static_cast<uint32_t>(a_target);
+		if (!identitiesCaptured || legacy == 0 || legacy >= initialColorIdentity.size() || initialColorIdentity[legacy] == kUnmappedTarget) {
+			return legacy;
+		}
+		const auto physical = TargetIDTable(false)[initialColorIdentity[legacy]];
+		return physical < std::size(RE::BSGraphics::GetRendererData()->renderTargets) ? physical : 0;
+	}
+
+	uint32_t ResolveDepthStencilTarget(DepthStencilTarget a_target)
+	{
+		const auto legacy = static_cast<uint32_t>(a_target);
+		if (!identitiesCaptured || legacy >= initialDepthIdentity.size() || initialDepthIdentity[legacy] == kUnmappedTarget) {
+			return legacy;
+		}
+		const auto physical = TargetIDTable(true)[initialDepthIdentity[legacy]];
+		return physical < std::size(RE::BSGraphics::GetRendererData()->depthStencilTargets) ? physical : 0;
+	}
+
 	namespace
 	{
 		bool Normalize(DirectX::XMFLOAT3& a_vector)
