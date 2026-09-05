@@ -1,6 +1,7 @@
 #include "DX12SwapChain.h"
 #include "ENBRenderDomain.h"
 #include "ENBEffectDiagnostics.h"
+#include "ENBTiledLighting.h"
 #include "NativeInterfaceUI.h"
 
 #include <algorithm>
@@ -893,6 +894,11 @@ HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 	const auto oldWidth = domain.Width();
 	const auto oldHeight = domain.Height();
 	const auto extent = ENBRenderDomain::CalculateExtent(swapChainDesc.Width, swapChainDesc.Height, a_quality);
+	ENBTiledLightingResize tiledLighting;
+	// Reserve the full display extent on the first live transition, so later
+	// quality changes need no further tiled-lighting allocation.
+	const auto lightingResult = tiledLighting.Prepare(device, swapChainDesc.Width, swapChainDesc.Height);
+	if (FAILED(lightingResult)) { return lightingResult; }
 	try {
 		D3D11_TEXTURE2D_DESC desc{};
 		swapChainBufferProxyENB->resource11->GetDesc(&desc);
@@ -981,6 +987,7 @@ HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 	(*createTargets.get())();
 	data->renderTargets[0] = windowTarget;
 	domain.ApplySceneDimensions();
+	tiledLighting.Commit();
 	if (oldTarget.rtView) { oldTarget.rtView->Release(); }
 	if (oldTarget.srView) { oldTarget.srView->Release(); }
 	if (oldTarget.uaView) { oldTarget.uaView->Release(); }
@@ -1369,9 +1376,35 @@ void DX12SwapChain::EndNativeUI()
 		return;
 	}
 	d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
-	RE::BSGraphics::GetRendererData()->renderTargets[0] = savedSceneTarget;
+	auto* renderer = RE::BSGraphics::GetRendererData();
+	renderer->renderTargets[0] = savedSceneTarget;
+	if (nativeUIWindowTargetActive) {
+		auto& windowTarget = renderer->renderWindow[0].swapChainRenderTarget;
+		// RendererWindow owns its view references; RT0 only borrows them.
+		if (windowTarget.rtView) { windowTarget.rtView->Release(); }
+		if (windowTarget.srView) { windowTarget.srView->Release(); }
+		if (windowTarget.uaView) { windowTarget.uaView->Release(); }
+		windowTarget = savedSceneWindowTarget;
+		nativeUIWindowTargetActive = false;
+	}
 	nativeUIActive = false;
 	ENBRenderDomain::Get().ApplySceneDimensions();
+}
+
+void DX12SwapChain::PublishNativeUIForOverlays()
+{
+	if (!nativeUIActive || nativeUIWindowTargetActive) { return; }
+	// Only after engine UI/model rendering has finished. RendererWindow is
+	// also an engine input; aliasing it during Interface3D can feed UI back
+	// into model composition. Late Present overlays still need this alias.
+	auto* renderer = RE::BSGraphics::GetRendererData();
+	auto& windowTarget = renderer->renderWindow[0].swapChainRenderTarget;
+	savedSceneWindowTarget = windowTarget;
+	windowTarget = renderer->renderTargets[0];
+	windowTarget.rtView->AddRef();
+	windowTarget.srView->AddRef();
+	windowTarget.uaView->AddRef();
+	nativeUIWindowTargetActive = true;
 }
 
 bool DX12SwapChain::BeginNativeUI()
@@ -1429,40 +1462,46 @@ void main(uint3 p : SV_DispatchThreadID)
 			sampler.MaxLOD = D3D11_FLOAT32_MAX;
 			DX::ThrowIfFailed(d3d11Device->CreateSamplerState(&sampler, nativeUISampler.put()));
 		}
-		// Preserve the pre-existing low-res background. Interface3D post-AA and
-		// subsequent 2D UI render here; the D3D12 SR result is never copied back.
-		winrt::com_ptr<ID3D11ComputeShader> oldShader;
-		std::array<ID3D11ClassInstance*, 256> instances{};
-		UINT instanceCount = static_cast<UINT>(instances.size());
-		d3d11Context->CSGetShader(oldShader.put(), instances.data(), &instanceCount);
-		winrt::com_ptr<ID3D11ShaderResourceView> oldSRV;
-		winrt::com_ptr<ID3D11UnorderedAccessView> oldUAV;
-		winrt::com_ptr<ID3D11SamplerState> oldSampler;
-		d3d11Context->CSGetShaderResources(0, 1, oldSRV.put());
-		d3d11Context->CSGetUnorderedAccessViews(0, 1, oldUAV.put());
-		d3d11Context->CSGetSamplers(0, 1, oldSampler.put());
-		d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
-		auto* input = sceneUISRV.get();
-		auto* output = nativeUITexture->uav.get();
-		auto* sampler = nativeUISampler.get();
-		d3d11Context->CSSetShader(nativeUIResolve.get(), nullptr, 0);
-		d3d11Context->CSSetShaderResources(0, 1, &input);
-		d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
-		d3d11Context->CSSetSamplers(0, 1, &sampler);
-		d3d11Context->Dispatch((swapChainDesc.Width + 7) / 8, (swapChainDesc.Height + 7) / 8, 1);
-		input = nullptr;
-		output = nullptr;
-		d3d11Context->CSSetShaderResources(0, 1, &input);
-		d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
-		input = oldSRV.get();
-		output = oldUAV.get();
-		sampler = oldSampler.get();
-		d3d11Context->CSSetShaderResources(0, 1, &input);
-		d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
-		d3d11Context->CSSetSamplers(0, 1, &sampler);
-		d3d11Context->CSSetShader(oldShader.get(), instances.data(), instanceCount);
-		for (UINT i = 0; i < instanceCount; ++i) {
-			instances[i]->Release();
+		// A separate D3D12 scene requires a transparent overlay, including when
+		// menu rendering leaves an old world image in the D3D11 backbuffer.
+		if (presentOverrideFinalColor) {
+			const float transparent[4]{};
+			d3d11Context->ClearRenderTargetView(nativeUITexture->rtv.get(), transparent);
+		} else {
+			// No separate scene exists in the fallback path: retain its background.
+			winrt::com_ptr<ID3D11ComputeShader> oldShader;
+			std::array<ID3D11ClassInstance*, 256> instances{};
+			UINT instanceCount = static_cast<UINT>(instances.size());
+			d3d11Context->CSGetShader(oldShader.put(), instances.data(), &instanceCount);
+			winrt::com_ptr<ID3D11ShaderResourceView> oldSRV;
+			winrt::com_ptr<ID3D11UnorderedAccessView> oldUAV;
+			winrt::com_ptr<ID3D11SamplerState> oldSampler;
+			d3d11Context->CSGetShaderResources(0, 1, oldSRV.put());
+			d3d11Context->CSGetUnorderedAccessViews(0, 1, oldUAV.put());
+			d3d11Context->CSGetSamplers(0, 1, oldSampler.put());
+			d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
+			auto* input = sceneUISRV.get();
+			auto* output = nativeUITexture->uav.get();
+			auto* sampler = nativeUISampler.get();
+			d3d11Context->CSSetShader(nativeUIResolve.get(), nullptr, 0);
+			d3d11Context->CSSetShaderResources(0, 1, &input);
+			d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+			d3d11Context->CSSetSamplers(0, 1, &sampler);
+			d3d11Context->Dispatch((swapChainDesc.Width + 7) / 8, (swapChainDesc.Height + 7) / 8, 1);
+			input = nullptr;
+			output = nullptr;
+			d3d11Context->CSSetShaderResources(0, 1, &input);
+			d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+			input = oldSRV.get();
+			output = oldUAV.get();
+			sampler = oldSampler.get();
+			d3d11Context->CSSetShaderResources(0, 1, &input);
+			d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+			d3d11Context->CSSetSamplers(0, 1, &sampler);
+			d3d11Context->CSSetShader(oldShader.get(), instances.data(), instanceCount);
+			for (UINT i = 0; i < instanceCount; ++i) {
+				instances[i]->Release();
+			}
 		}
 		auto* renderer = RE::BSGraphics::GetRendererData();
 		savedSceneTarget = renderer->renderTargets[0];

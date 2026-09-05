@@ -7,4 +7,6 @@ namespace ENBEffectDiagnostics
 	void Install();
 	void BeforeResize();
 	bool RequestCapture();
+	// Null when available; otherwise a user-facing reason, including install failures.
+	const char* CaptureUnavailableReason();
 }

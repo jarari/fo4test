@@ -106,6 +106,7 @@ public:
 	bool WaitForInteropIdle();
 	HRESULT ResizeENBScene(uint32_t a_quality);
 	bool BeginNativeUI();
+	void PublishNativeUIForOverlays();
 	void EndNativeUI();
 	uint64_t NativeUIGeneration() const { return nativeUIGeneration; }
 	uint64_t ENBSceneResizeGeneration() const { return enbSceneResizeGeneration; }
@@ -186,7 +187,9 @@ private:
 	winrt::com_ptr<ID3D11ComputeShader> nativeUIResolve;
 	winrt::com_ptr<ID3D11SamplerState> nativeUISampler;
 	RE::BSGraphics::RenderTarget savedSceneTarget{};
+	RE::BSGraphics::RenderTarget savedSceneWindowTarget{};
 	bool nativeUIActive = false;
+	bool nativeUIWindowTargetActive = false;
 	uint64_t nativeUIGeneration = 0;
 	CommandContext commandContexts[kCommandContextCount];
 	winrt::handle commandFenceEvent;

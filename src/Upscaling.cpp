@@ -182,6 +182,7 @@ struct UI_ScreenSpace_RenderMenus_Native
 		auto* swap = DX12SwapChain::GetSingleton();
 		g_nativeScreenSpaceUI = domain.Active() && swap->BeginNativeUI();
 		func(a_ui);
+		if (g_nativeScreenSpaceUI) { swap->PublishNativeUIForOverlays(); }
 		const auto frame = Util::State_GetSingleton()->frameCount;
 		static thread_local uint32_t lastTraceFrame = std::numeric_limits<uint32_t>::max();
 		if (domain.Active() && Upscaling::GetSingleton()->settings.enbGPUTiming && frame % 120 == 0 && frame != lastTraceFrame) {

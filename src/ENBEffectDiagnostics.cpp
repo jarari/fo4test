@@ -14,7 +14,9 @@
 
 namespace
 {
-	// Verified against ENB 0.501 in Ghidra. These are ENB offsets, not game IDs.
+	// Verified against the supplied ENB 0.501 WrapperVersion/d3d11.dll in IDA.
+	// SHA-256: D1F26F47DA0CA68BD6CF24C6E20C2DBB3953263D5CAA21142089EBBEEE433B9B.
+	// These are ENB offsets, not game IDs; other 0.501 builds may differ.
 	uintptr_t base = 0;
 	HMODULE registeredModule = nullptr;
 	bool installationAttempted = false;
@@ -32,6 +34,7 @@ namespace
 	SetArray originalArray = nullptr;
 	Apply originalApply = nullptr;
 	bool installed = false;
+	const char* installationFailure = "Capture hooks have not been installed. Restart with capture enabled.";
 
 	struct PassInfo
 	{
@@ -411,7 +414,7 @@ namespace
 		// Replace the pair with CALL [RIP+disp32]. A leaf shim restores EDX
 		// then tail-jumps to C++; the existing return address, shadow space,
 		// stack alignment and following INC EBX/EDI are unchanged.
-		constexpr std::array<uintptr_t, 3> offsets{ 0x79226, 0x793B5, 0x79525 };
+		constexpr std::array<uintptr_t, 3> offsets{ 0x79156, 0x792E5, 0x79455 };
 		constexpr std::array<uint8_t, 6> expected{ 0x41, 0x8B, 0xD6, 0xFF, 0x50, 0x60 };
 		const std::array<uintptr_t, 3> functions{
 			reinterpret_cast<uintptr_t>(&DrawAtCallSite<0>), reinterpret_cast<uintptr_t>(&DrawAtCallSite<1>), reinterpret_cast<uintptr_t>(&DrawAtCallSite<2>) };
@@ -594,7 +597,7 @@ namespace
 				}
 			}
 		} reportMissing{ scope, reported };
-		scope.effect = reinterpret_cast<void* (*)(int)>(base + 0x403E0)(6);
+		scope.effect = reinterpret_cast<void* (*)(int)>(base + 0x403F0)(6);
 		if (!scope.effect) { return originalRender(a_this, a_count, a_start, a_base); }
 		auto* bytes = static_cast<std::byte*>(scope.effect);
 		const auto total = *reinterpret_cast<uint32_t*>(bytes + 0x23E930);
@@ -614,7 +617,7 @@ namespace
 		}
 		const bool techniqueValid = technique && Method<bool (*)(void*)>(technique, 0)(technique);
 		RegisterPasses(scope, technique, "custom");
-		if (auto* internal = reinterpret_cast<void* (*)(int)>(base + 0x403E0)(0)) {
+		if (auto* internal = reinterpret_cast<void* (*)(int)>(base + 0x403F0)(0)) {
 			if (auto* internalObject = *reinterpret_cast<void**>(internal)) {
 				for (const auto* stage : { "PBMask", "GammaFix", "GammaFixD" }) {
 					RegisterPasses(scope, Method<GetTechnique>(internalObject, 0x70)(internalObject, stage), stage);
@@ -701,10 +704,18 @@ void ENBEffectDiagnostics::RegisterModule(HMODULE a_module)
 	registeredModule = a_module;
 }
 
+const char* ENBEffectDiagnostics::CaptureUnavailableReason()
+{
+	if (!installed) { return installationFailure; }
+	if (!Upscaling::GetSingleton()->settings.enbGPUTiming) { return "Enable ENB GPU / Post-Processing Capture before requesting a capture."; }
+	if (!ENBRenderDomain::Get().Active()) { return "Capture requires the active ENB render domain."; }
+	return nullptr;
+}
+
 bool ENBEffectDiagnostics::RequestCapture()
 {
-	if (!installed || !Enabled()) {
-		logger::warn("[ENBEffect capture] Unavailable: enable bENBGPUTiming before startup and use supported ENB 0.501");
+	if (const auto* reason = CaptureUnavailableReason()) {
+		logger::warn("[ENBEffect capture] Unavailable: {}", reason);
 		return false;
 	}
 	captureNotBefore.store(GetTickCount64() + 3000);
@@ -722,20 +733,28 @@ void ENBEffectDiagnostics::Install()
 	const bool enabled = Upscaling::GetSingleton()->settings.enbGPUTiming != 0;
 	logger::info("[ENBEffect] Install after settings load: bENBGPUTiming={} module={}", enabled, static_cast<void*>(a_module));
 	if (!a_module || !enabled) {
+		installationFailure = a_module ? "Capture was disabled at startup. Enable capture and restart." : "ENB module was unavailable at startup.";
 		logger::info("[ENBEffect] Diagnostic hooks NOT installed: {}", a_module ? "disabled in startup settings" : "ENB module unavailable");
 		return;
 	}
 	base = reinterpret_cast<uintptr_t>(a_module);
-	if (reinterpret_cast<uintptr_t>(GetProcAddress(a_module, "D3D11CreateDeviceAndSwapChain")) != base + 0x2D220) {
+	if (reinterpret_cast<uintptr_t>(GetProcAddress(a_module, "D3D11CreateDeviceAndSwapChain")) != base + 0x2D230) {
+		installationFailure = "This ENB binary does not match the supported capture layout. See Upscaling.log.";
 		logger::warn("[ENBEffect] Unsupported ENB layout; diagnostic hooks NOT installed (validated: 0.501)");
 		return;
 	}
+	installationFailure = "Capture hook validation or installation failed. See Upscaling.log for the failing address.";
 	struct Signature { uintptr_t offset; std::array<uint8_t, 8> bytes; };
 	constexpr Signature signatures[]{
-		{ 0x78BA0, { 0x40, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56 } },
-		{ 0x40240, { 0x48, 0x85, 0xD2, 0x74, 0x41, 0x53, 0x48, 0x83 } },
-		{ 0x40330, { 0x48, 0x85, 0xD2, 0x74, 0x3E, 0x53, 0x48, 0x83 } },
-		{ 0x40380, { 0x48, 0x85, 0xD2, 0x74, 0x51, 0x48, 0x89, 0x5C } }
+		{ 0x78AD0, { 0x40, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56 } },
+		{ 0x40250, { 0x48, 0x85, 0xD2, 0x74, 0x41, 0x53, 0x48, 0x83 } },
+		{ 0x40340, { 0x48, 0x85, 0xD2, 0x74, 0x3E, 0x53, 0x48, 0x83 } },
+		{ 0x40390, { 0x48, 0x85, 0xD2, 0x74, 0x51, 0x48, 0x89, 0x5C } },
+		{ 0x403F0, { 0x83, 0xF9, 0x40, 0x7C, 0x03, 0x33, 0xC0, 0xC3 } },
+		{ 0x101198, { 0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B } },
+		{ 0x79156, { 0x41, 0x8B, 0xD6, 0xFF, 0x50, 0x60, 0xFF, 0xC3 } },
+		{ 0x792E5, { 0x41, 0x8B, 0xD6, 0xFF, 0x50, 0x60, 0xFF, 0xC3 } },
+		{ 0x79455, { 0x41, 0x8B, 0xD6, 0xFF, 0x50, 0x60, 0xFF, 0xC7 } }
 	};
 	for (const auto& signature : signatures) {
 		if (!stl::is_readable_memory(base + signature.offset, signature.bytes.size()) ||
@@ -749,7 +768,7 @@ void ENBEffectDiagnostics::Install()
 	// is needed, and replacing effect instances during resize keeps this vtable.
 	const auto slotAddress = base + 0x13EBF8;
 	if (!stl::is_readable_memory(slotAddress, sizeof(void*)) ||
-		*reinterpret_cast<uintptr_t*>(slotAddress) != base + 0x101268) {
+		*reinterpret_cast<uintptr_t*>(slotAddress) != base + 0x101198) {
 		logger::error("[ENBEffect] Pass::Apply vtable validation failed; sampling NOT installed");
 		return;
 	}
@@ -758,22 +777,22 @@ void ENBEffectDiagnostics::Install()
 		logger::error("[ENBEffect] Pass::Apply vtable protection failed error={}; sampling NOT installed", GetLastError());
 		return;
 	}
-	originalApply = reinterpret_cast<Apply>(base + 0x101268);
+	originalApply = reinterpret_cast<Apply>(base + 0x101198);
 	InterlockedExchangePointer(reinterpret_cast<void* volatile*>(slotAddress), reinterpret_cast<void*>(&ApplyPass));
 	DWORD ignored = 0;
 	if (!VirtualProtect(reinterpret_cast<void*>(slotAddress), sizeof(void*), protection, &ignored)) {
 		logger::error("[ENBEffect] Pass::Apply vtable protection restore failed error={}", GetLastError());
 	}
 	logger::info("[ENBEffect] Pass::Apply vtable hook installed before first sample (no inline trampoline)");
-	originalTexture = reinterpret_cast<SetTexture>(Detours::X64::DetourFunction(base + 0x40240, reinterpret_cast<uintptr_t>(&Texture)));
-	originalVector = reinterpret_cast<SetVector>(Detours::X64::DetourFunction(base + 0x40330, reinterpret_cast<uintptr_t>(&Vector)));
-	originalArray = reinterpret_cast<SetArray>(Detours::X64::DetourFunction(base + 0x40380, reinterpret_cast<uintptr_t>(&Array)));
+	originalTexture = reinterpret_cast<SetTexture>(Detours::X64::DetourFunction(base + 0x40250, reinterpret_cast<uintptr_t>(&Texture)));
+	originalVector = reinterpret_cast<SetVector>(Detours::X64::DetourFunction(base + 0x40340, reinterpret_cast<uintptr_t>(&Vector)));
+	originalArray = reinterpret_cast<SetArray>(Detours::X64::DetourFunction(base + 0x40390, reinterpret_cast<uintptr_t>(&Array)));
 	if (!originalTexture || !originalVector || !originalArray) {
 		logger::error("[ENBEffect] Setter hook installation incomplete; sampling disabled");
 		return;
 	}
 	if (!InstallDrawCallSites()) { return; }
-	originalRender = reinterpret_cast<Render>(Detours::X64::DetourFunction(base + 0x78BA0, reinterpret_cast<uintptr_t>(&Effect)));
+	originalRender = reinterpret_cast<Render>(Detours::X64::DetourFunction(base + 0x78AD0, reinterpret_cast<uintptr_t>(&Effect)));
 	installed = originalRender != nullptr;
 	logger::info("[ENBEffect] 0.501 effect-6 tracking installed={}; first/120-frame samples per quality transition; binary readbacks in TEMP/Upscaling-ENBEffect/PID", installed);
 }

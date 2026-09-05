@@ -472,8 +472,9 @@ namespace
 			g_enbCaptureAttempted = true;
 		}
 		if (g_enbCaptureAttempted) {
+			const auto* reason = ENBEffectDiagnostics::CaptureUnavailableReason();
 			ImGuiMCP::TextDisabled(g_enbCaptureRequested ? "Capture requested. Close menus within 3 seconds; see Upscaling.log for completion." :
-				"Capture unavailable. Enable ENB GPU / Post-Processing Capture and restart with ENB 0.501.");
+				reason ? reason : "Capture is available. Press Capture again.");
 		}
 		static constexpr std::array osdModes{ "Disabled", "Compact", "Detailed" };
 		changed |= ComboSetting(
