@@ -830,8 +830,6 @@ void Streamline::RequestDLSSGDisable()
 bool Streamline::DisableDLSSGNow()
 {
 	if (!featureDLSSG || !slDLSSGSetOptions) {
-		dlssgActive = false;
-		currentDLSSGMode = sl::DLSSGMode::eOff;
 		return false;
 	}
 
@@ -842,8 +840,6 @@ bool Streamline::DisableDLSSGNow()
 
 	if (SL_FAILED(result, slDLSSGSetOptions(viewport, options))) {
 		logger::warn("[Streamline] Could not disable DLSS-G: {}", magic_enum::enum_name(result));
-		dlssgActive = false;
-		currentDLSSGMode = sl::DLSSGMode::eOff;
 		return false;
 	}
 
@@ -860,8 +856,9 @@ void Streamline::ApplyPendingDLSSGDisable()
 		return;
 	}
 
-	pendingDLSSGDisable = false;
+	// Keep the request and active mode on failure so the next Present retries.
 	if (DisableDLSSGNow()) {
+		pendingDLSSGDisable = false;
 		dlssgPresentSafetyFrames = 2;
 	}
 }

@@ -1376,6 +1376,8 @@ bool DX12SwapChain::WaitForInteropIdle()
 
 void DX12SwapChain::EndNativeUI()
 {
+	// Renderer::Begin resets menu composition for both ENB and non-ENB frames.
+	nativeUIIncludesScene = false;
 	if (!nativeUIActive) {
 		return;
 	}
@@ -1392,16 +1394,15 @@ void DX12SwapChain::EndNativeUI()
 		nativeUIWindowTargetActive = false;
 	}
 	nativeUIActive = false;
-	nativeUIIncludesScene = false;
 	ENBRenderDomain::Get().ApplySceneDimensions();
 }
 
 void DX12SwapChain::PublishNativeUIForOverlays()
 {
-	if (!nativeUIActive || nativeUIWindowTargetActive) { return; }
 	if (UpscalingMenu::IsOpen()) {
 		ResolveNativeUIForMenu();
 	}
+	if (!nativeUIActive || nativeUIWindowTargetActive) { return; }
 	// Only after engine UI/model rendering has finished. RendererWindow is
 	// also an engine input; aliasing it during Interface3D can feed UI back
 	// into model composition. Late Present overlays still need this alias.
@@ -1488,19 +1489,25 @@ std::shared_ptr<D3D11D3D12SharedTexture> DX12SwapChain::CaptureScreenshot()
 
 void DX12SwapChain::ResolveNativeUIForMenu()
 {
-	if (nativeUIIncludesScene || !presentOverrideFinalColor) { return; }
+	if (!IsReady() || deviceLost || IsWindowUnavailable() || sceneResizeActive ||
+		nativeUIIncludesScene || !presentOverrideFinalColor) { return; }
+	// Non-ENB already renders UI into the display-sized proxy returned by
+	// GetBuffer. Resolve into that same allocation for the framework's blur.
+	auto* uiTarget = nativeUIActive && nativeUITexture ? nativeUITexture->resource.get() :
+		swapChainBufferProxy ? swapChainBufferProxy->resource.get() : nullptr;
+	if (!uiTarget) { return; }
 	// Present-time background filters expect a complete frame. Only while the
 	// framework menu is open, resolve the D3D12 scene + engine UI before its
 	// D3D11 blur runs. Normal gameplay keeps the asynchronous split UI path.
 	if (!menuComposite) {
 		D3D11_TEXTURE2D_DESC desc{};
-		nativeUITexture->resource->GetDesc(&desc);
+		uiTarget->GetDesc(&desc);
 		desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 		menuComposite = std::make_unique<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
 	}
 	auto& command = AcquireCommandContext();
 	auto* staging = command.presentStaging.get();
-	d3d11Context->CopyResource(staging->resource11.get(), nativeUITexture->resource.get());
+	d3d11Context->CopyResource(staging->resource11.get(), uiTarget);
 	const auto inputFence = fenceValue++;
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), inputFence));
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), inputFence));
@@ -1514,7 +1521,7 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 		CD3DX12_RESOURCE_BARRIER::Transition(output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)
 	};
 	command.list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
-	D3D12UIComposite::GetSingleton()->Render(d3d12Device.get(), command.list.get(), output, scene, input,
+	const bool rendered = D3D12UIComposite::GetSingleton()->Render(d3d12Device.get(), command.list.get(), output, scene, input,
 		swapChainDesc.Format, swapChainDesc.Width, swapChainDesc.Height,
 		command.index, static_cast<uint32_t>(std::size(commandContexts)));
 	for (auto& barrier : before) {
@@ -1522,10 +1529,11 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 	}
 	command.list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
 	ExecuteCommandContext(command);
+	if (!rendered) { return; }
 	const auto outputFence = fenceValue++;
 	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), outputFence));
 	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), outputFence));
-	d3d11Context->CopyResource(nativeUITexture->resource.get(), menuComposite->resource11.get());
+	d3d11Context->CopyResource(uiTarget, menuComposite->resource11.get());
 	nativeUIIncludesScene = true;
 }
 
@@ -1670,6 +1678,13 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	auto upscaling = Upscaling::GetSingleton();
 	const auto osdEnabled = upscaling->settings.osdMode != 0;
 	ProcessWindowStateTransition();
+	// SetOptions takes effect at the next Present. Apply OFF on this thread
+	// before clearing input tags so the first menu frame is not interpolated
+	// with missing HUD-less/depth/motion resources.
+	if (!upscaling->IsFrameGenerationActive() && streamline->dlssgActive) {
+		streamline->RequestDLSSGDisable();
+	}
+	streamline->ApplyPendingDLSSGDisable();
 	if (IsWindowUnavailable()) {
 		presentOverrideFinalColor = nullptr;
 		const auto presentedFrameIndex = frameIndex;
@@ -1825,7 +1840,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			return DXGI_ERROR_DEVICE_REMOVED;
 		}
 
-		streamline->ApplyPendingDLSSGDisable();
 		streamline->OnDLSSGPresentComplete();
 		upscaling->AdvanceDeferredResourceReleases();
 	}

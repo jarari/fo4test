@@ -24,6 +24,20 @@ extern bool enbLoaded;
 
 static RE::BSGraphics::Renderer* g_nativeUIRenderer = nullptr;
 static thread_local bool g_nativeScreenSpaceUI = false;
+static uint32_t g_upscalingUpdateFrame = UINT32_MAX;
+
+namespace
+{
+	bool EngineOwnsFrozenBackground()
+	{
+		// Main::DrawWorld_And_UI saves and disables TAA before capturing RT1
+		// into RT15. This stays set while Render_PreUI is skipped, including
+		// engine-forced freezes that have no menu on the stack.
+		static REL::Relocation<const bool*> taaSaved{ REL::ID{ 1256383, 2698092 } };
+		const auto* ui = RE::UI::GetSingleton();
+		return *taaSaved || (ui && ui->freezeFramePause != 0);
+	}
+}
 
 struct Scaleform_SetNativeScreenTarget
 {
@@ -117,7 +131,7 @@ struct UI_ScreenSpace_RenderMenus_Native
 		auto* swap = DX12SwapChain::GetSingleton();
 		g_nativeScreenSpaceUI = domain.Active() && swap->BeginNativeUI();
 		func(a_ui);
-		if (g_nativeScreenSpaceUI) { swap->PublishNativeUIForOverlays(); }
+		swap->PublishNativeUIForOverlays();
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
@@ -184,6 +198,9 @@ struct ImageSpaceEffectTemporalAA_IsActive
 {
 	static bool thunk(struct ImageSpaceEffectTemporalAA* This)
 	{
+		if (EngineOwnsFrozenBackground()) {
+			return false;
+		}
 		const auto method = Upscaling::GetSingleton()->upscaleMethod;
 		return (method == Upscaling::UpscaleMethod::kDisabled ||
 			(ENBRenderDomain::Get().Active() && method == Upscaling::UpscaleMethod::kSpatialFallback)) && func(This);
@@ -1449,6 +1466,12 @@ struct DrawWorld_Imagespace
 {
 	static void thunk(struct DrawWorld* This)
 	{
+		// Frozen backgrounds restore RT15 without Render_PreUI, so its
+		// UpdateDynamicResolution hook does not run. Do not reuse gameplay's
+		// temporal requests/jitter throughout a frozen menu.
+		if (g_upscalingUpdateFrame != Util::State_GetSingleton()->frameCount) {
+			Upscaling::GetSingleton()->UpdateUpscaling();
+		}
 		func(This);
 
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
@@ -1549,11 +1572,11 @@ void Upscaling::InstallHooks()
 	stl::detour_thunk_gateway<Renderer_Begin_ENBDomains>(
 		REL::ID{ 288964, 2276833 }, isOG ? 8 : 6, "Renderer::Begin frame pacing and ENB domains");
 
+	stl::detour_thunk_gateway<UI_ScreenSpace_RenderMenus_Native>(
+		REL::ID{ 230711, 2284762 }, 5, "UI::ScreenSpace_RenderMenus overlay composition");
 	if (enbLoaded) {
 		NativeInterfaceUI::InstallHooks();
 		InstallNativeENBOverlay();
-		stl::detour_thunk_gateway<UI_ScreenSpace_RenderMenus_Native>(
-			REL::ID{ 230711, 2284762 }, 5, "UI::ScreenSpace_RenderMenus native");
 		stl::detour_thunk_gateway<Scaleform_SetNativeScreenTarget>(
 			REL::ID{ 1175949, 2284944 }, 6, "BSScaleformRenderer::SetCurrentRenderTarget native UI");
 		// OG Begin +0x1F0 / AE Begin +0x1EC, immediately before per-frame
@@ -3277,10 +3300,11 @@ void Upscaling::UpdateGameSettings()
 		imageSpaceManager->effectList[17]->isActive = false;
 	}
 
-	// Automatically enable TAA
-	static auto enableTAA = reinterpret_cast<bool*>(REL::ID{ 460417, 2704658 }.address());
-	if (!*enableTAA) {
-		*enableTAA = true;
+	// Preserve Main's temporary TAA disable for frozen backgrounds. Re-enabling
+	// it here makes native/spatial menu frames read stale gameplay TAA history.
+	static REL::Relocation<uint32_t*> enableTAA{ REL::ID{ 460417, 2704658 } };
+	if (!EngineOwnsFrozenBackground() && *enableTAA == 0) {
+		*enableTAA = 1;
 	}
 }
 
@@ -3483,6 +3507,7 @@ void Upscaling::UpdateUpscaling()
 	}
 
 	CheckResources();
+	g_upscalingUpdateFrame = gameViewport->frameCount;
 }
 
 void Upscaling::Upscale(int a_renderTargetIndex)
