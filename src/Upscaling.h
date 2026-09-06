@@ -449,12 +449,16 @@ public:
 	std::array<float2, kDX12FrameCount> fsrInputRenderSizes{};
 	std::array<float2, kDX12FrameCount> fsrInputDisplaySizes{};
 
+	// DLSS-G can retain resources beyond work visible on our command queue.
+	// Keep the proven Present grace period in addition to explicit GPU fences.
 	static constexpr uint64_t kDeferredResourceReleasePresents = 16;
 	struct DeferredResourceRelease
 	{
-		uint64_t releasePresent = 0;
+		uint64_t d3d11Fence = 0;
 		std::unique_ptr<Texture2D> d3d11Texture;
 		winrt::com_ptr<ID3D12Resource> d3d12Resource;
+		uint64_t d3d12Fence = 0;
+		uint64_t releasePresent = 0;
 	};
 	std::deque<DeferredResourceRelease> deferredResourceReleases;
 	uint64_t completedPresentCount = 0;
@@ -515,13 +519,10 @@ private:
 	std::unique_ptr<Texture2D> frameGenerationPreAlphaTexture;
 	std::unique_ptr<Texture2D> frameGenerationMotionVectorTexture;
 	std::unique_ptr<Texture2D> frameGenerationDepthTexture;
-	std::unique_ptr<Texture2D> dlssTransparencyMaskTexture;
 	bool frameGenerationPreAlphaReady = false;
 	uint32_t frameGenerationPreAlphaFrame = 0;
 	bool frameGenerationBuffersReady = false;
 	uint32_t frameGenerationBuffersFrame = 0;
-	bool dlssTransparencyMaskReady = false;
-	uint32_t dlssTransparencyMaskFrame = 0;
 
 	bool WantsFrameGenerationInputs();
 	bool IsFeatureRequestBlocked(FeatureRequest a_feature) const;

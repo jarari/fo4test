@@ -100,8 +100,12 @@ public:
 	bool IsWindowUnavailable() const { return IsWindowMinimized(); }
 	bool AreTemporalFeaturesSuspended() const { return temporalFeaturesSuspended; }
 	UINT GetFrameIndex() const { return frameIndex; }
+	void WaitForFrameStart();
 	ID3D12Device* GetD3D12Device() const { return d3d12Device.get(); }
-	bool WaitForFrameSlot(UINT a_frameIndex);
+	bool WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly = false);
+	// Retirement is stamped after this frame's recorded work is submitted.
+	bool GetRetirementFences(uint64_t& a_d3d11, uint64_t& a_d3d12);
+	bool AreRetirementFencesComplete(uint64_t a_d3d11, uint64_t a_d3d12) const;
 	bool WaitForGPUIdle();
 	bool WaitForInteropIdle();
 	HRESULT ResizeENBScene(uint32_t a_quality);
@@ -178,6 +182,7 @@ private:
 	winrt::com_ptr<ID3D11Fence> d3d11Fence;
 	winrt::com_ptr<ID3D12Fence> d3d12Fence;
 	winrt::com_ptr<ID3D12Fence> commandFence;
+	winrt::com_ptr<ID3D11Fence> d3d11CommandFence;
 	winrt::com_ptr<ID3D12Resource> swapChainBuffers[kDX12FrameCount];
 	std::unique_ptr<Texture2D> swapChainBufferProxy;
 	std::unique_ptr<D3D11D3D12SharedTexture> swapChainBufferProxyENB;
@@ -187,6 +192,8 @@ private:
 	uint32_t pendingSceneQuality = 0;
 	uint64_t enbSceneResizeGeneration = 0;
 	std::unique_ptr<Texture2D> nativeUITexture;
+	std::unique_ptr<D3D11D3D12SharedTexture> nativeUISharedTexture;
+	UINT64 nativeUIReadFenceValue = 0;
 	winrt::com_ptr<ID3D11ShaderResourceView> sceneUISRV;
 	winrt::com_ptr<ID3D11ComputeShader> nativeUIResolve;
 	winrt::com_ptr<ID3D11SamplerState> nativeUISampler;
@@ -207,6 +214,10 @@ private:
 	UINT64 fenceValue = 1;
 	UINT64 commandFenceValue = 1;
 	std::array<UINT64, kDX12FrameCount> frameSlotFenceValues{};
+	std::array<UINT64, kDX12FrameCount> inputReuseFenceValues{};
+	std::array<UINT64, kDX12FrameCount> queuedReuseFenceValues{};
+	std::array<UINT64, kDX12FrameCount> presentSlotFenceValues{};
+	std::array<bool, kDX12FrameCount> inputsUsedAtPresent{};
 	bool fidelityFXFrameGenerationSwapChainAllowed = false;
 	double desktopRefreshHz = 0.0;
 	HWND hwnd = nullptr;

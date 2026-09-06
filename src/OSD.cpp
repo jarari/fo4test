@@ -509,13 +509,18 @@ std::string OSD::BuildCompactText() const
 {
 	auto upscaling = Upscaling::GetSingleton();
 	const auto fgFPS = upscaling->ShouldUseFrameGeneration(true) || upscaling->ShouldUseFSRFrameGeneration(true) ? generatedFPS : 0.0;
-	const auto latency = reflexLatencyMs > 0.0f ? reflexLatencyMs : 0.0f;
+	char latency[32]{};
+	if (reflexLatencyMs > 0.0f) {
+		std::snprintf(latency, sizeof(latency), "%.1fms", reflexLatencyMs);
+	} else {
+		std::snprintf(latency, sizeof(latency), "N/A");
+	}
 
 	char line[192]{};
 	std::snprintf(
 		line,
 		sizeof(line),
-		"%s %.1f\t%s %.1f\tLatency %.1fms\tVRAM %.1fMB",
+		"%s %.1f\t%s %.1f\tLatency %s\tVRAM %.1fMB",
 		UpscalerMethodName(upscaling->upscaleMethod),
 		renderFPS,
 		FGMethodName(),
@@ -546,22 +551,20 @@ std::string OSD::BuildDetailedText() const
 	}
 	std::snprintf(line, sizeof(line), "VRAM: %llu MB\n", static_cast<unsigned long long>(vramUsageMB));
 	text += line;
+	if (reflexLatencyMs > 0.0f) {
+		std::snprintf(line, sizeof(line), "PC Latency: %.2f ms\n", reflexLatencyMs);
+	} else if (!streamline->IsPCLLatencyReportAvailable()) {
+		std::snprintf(line, sizeof(line), "PC Latency: no report\n");
+	} else {
+		std::snprintf(line, sizeof(line), "PC Latency: timing N/A\n");
+	}
+	text += line;
 
 	if (activeMethod == Upscaling::UpscaleMethod::kDLSS) {
 		std::snprintf(line, sizeof(line), "Res: %.0fx%.0f -> %.0fx%.0f\n", upscaling->osdRenderSize.x, upscaling->osdRenderSize.y, upscaling->osdNativeSize.x, upscaling->osdNativeSize.y);
 		text += line;
 		std::snprintf(line, sizeof(line), "Reflex: %s\n", ReflexModeName(streamline->GetCurrentReflexMode()));
 		text += line;
-		if (streamline->GetCurrentReflexMode() != sl::ReflexMode::ReflexMode_eCount) {
-			if (reflexLatencyMs > 0.0f) {
-				std::snprintf(line, sizeof(line), "PC Latency: %.2f ms\n", reflexLatencyMs);
-			} else if (!streamline->IsPCLLatencyReportAvailable()) {
-				std::snprintf(line, sizeof(line), "PC Latency: no report\n");
-			} else {
-				std::snprintf(line, sizeof(line), "PC Latency: input N/A\n");
-			}
-			text += line;
-		}
 		std::snprintf(line, sizeof(line), "DLSS Quality: %s\n", QualityName(streamline->GetCurrentDLSSQualityMode()));
 		text += line;
 		std::snprintf(line, sizeof(line), "DLSS Preset: %s\n", DLSSModelPresetName(streamline->GetCurrentDLSSModelPreset()));

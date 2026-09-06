@@ -335,9 +335,12 @@ void Streamline::Shutdown()
 	temporalResetPending = true;
 	markerFrameIndex = std::numeric_limits<uint32_t>::max();
 	reflexSleepFrame = std::numeric_limits<uint32_t>::max();
+	simulationMarkerFrame = std::numeric_limits<uint32_t>::max();
+	renderMarkerFrame = std::numeric_limits<uint32_t>::max();
 	lastDLSSGStatus = std::numeric_limits<uint32_t>::max();
 	lastDLSSGPresentedFrames = std::numeric_limits<uint32_t>::max();
 	lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();
+	lastDLSSGPresentMultiplier = 1.0;
 	maxFramesToGenerate = 1;
 	dynamicMFGSupported = false;
 	dlssgStateKnown = false;
@@ -551,17 +554,18 @@ bool Streamline::EnsureFrameToken(uint32_t a_frameIndex)
 	return true;
 }
 
-void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
+bool Streamline::PaceFrame(uint32_t a_frameIndex)
 {
-	if (!EnsureFrameToken(a_frameIndex) || reflexSleepFrame == a_frameIndex) {
-		return;
+	const auto* upscaling = Upscaling::GetSingleton();
+	const bool validToken = EnsureFrameToken(a_frameIndex);
+	if (!validToken || reflexSleepFrame == a_frameIndex) {
+		return validToken;
 	}
 	reflexSleepFrame = a_frameIndex;
-	const auto* upscaling = Upscaling::GetSingleton();
 	UpdateReflex(upscaling->settings.reflexMode, upscaling->IsFrameGenerationActive());
 
-	// Pace before the game's first rendering submission, never from
-	// UpdateConstants/CaptureDLSSGInputs after the world has already rendered.
+	// Normal gameplay calls this before Main::OnIdle starts simulation/input
+	// jobs. Renderer::Begin is only a fallback for independent loading/movie draws.
 	// The SDK requires Sleep even with Reflex Off; the selected mode controls it.
 	if (featureReflex && slReflexSleep) {
 		if (SL_FAILED(res, slReflexSleep(*frameToken))) {
@@ -569,8 +573,32 @@ void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
 		}
 	}
 
-	// Renderer::Begin is a render boundary, not simulation or input sampling.
-	// Do not manufacture zero-duration simulation/input markers around Sleep.
+	return true;
+}
+
+bool Streamline::BeginSimulationFrame(uint32_t a_frameIndex)
+{
+	if (!PaceFrame(a_frameIndex) || simulationMarkerFrame == a_frameIndex) { return false; }
+	simulationMarkerFrame = a_frameIndex;
+	SetPCLMarker(sl::PCLMarker::eSimulationStart);
+	return true;
+}
+
+void Streamline::EndSimulationFrame(uint32_t a_frameIndex)
+{
+	// A loading screen can render many frames while OnIdle is blocked on I/O.
+	// Do not attribute the old simulation's end to its newer loading-frame token.
+	if (markerFrameIndex != a_frameIndex || !frameToken) {
+		logger::debug("[Reflex] Simulation {} interrupted by render frame {}; end marker omitted", a_frameIndex, markerFrameIndex);
+		return;
+	}
+	SetPCLMarker(sl::PCLMarker::eSimulationEnd);
+}
+
+void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
+{
+	if (!PaceFrame(a_frameIndex) || renderMarkerFrame == a_frameIndex) { return; }
+	renderMarkerFrame = a_frameIndex;
 	SetPCLMarker(sl::PCLMarker::eRenderSubmitStart);
 }
 
@@ -774,7 +802,11 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	sl::DLSSGOptions options{};
 	options.mode = mode;
 	options.numFramesToGenerate = generatedFrames;
-	options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff | sl::DLSSGFlags::eEnableFullscreenMenuDetection;
+	const bool hasUIBuffer = a_uiFormat != DXGI_FORMAT_UNKNOWN;
+	options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+	if (hasUIBuffer) {
+		options.flags |= sl::DLSSGFlags::eEnableFullscreenMenuDetection;
+	}
 	options.dynamicTargetFrameRate = static_cast<float>(dynamicTargetFPS);
 	options.numBackBuffers = swapChainDesc.BufferCount ? swapChainDesc.BufferCount : 2;
 	options.mvecDepthWidth = renderWidth;
@@ -786,7 +818,9 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	options.depthBufferFormat = static_cast<uint32_t>(a_depthFormat);
 	options.hudLessBufferFormat = static_cast<uint32_t>(a_colorFormat);
 	options.uiBufferFormat = static_cast<uint32_t>(a_uiFormat);
-	options.enableUserInterfaceRecomposition = sl::Boolean::eTrue;
+	// The current compositor tags HUD-less color and the composed backbuffer,
+	// but no separate UI input. Recomposition/menu detection require that input.
+	options.enableUserInterfaceRecomposition = hasUIBuffer ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	options.onErrorCallback = DLSSGAPIErrorCallback;
 
 	if (SL_FAILED(result, slDLSSGSetOptions(viewport, options))) {
@@ -806,7 +840,14 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	currentMotionVectorFormat = a_motionVectorFormat;
 	currentDepthFormat = a_depthFormat;
 	currentUIFormat = a_uiFormat;
+	if (!dlssgActive) {
+		lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();
+		lastDLSSGPresentMultiplier = 1.0;
+	}
 	dlssgActive = mode != sl::DLSSGMode::eOff;
+	logger::info("[DLSS-G] options mode={} generated={} dynamicTarget={} render={}x{} output={}x{} uiInput={} uiRecomposition={}",
+		static_cast<uint32_t>(mode), generatedFrames, dynamicTargetFPS, renderWidth, renderHeight, displayWidth, displayHeight,
+		hasUIBuffer, options.enableUserInterfaceRecomposition == sl::Boolean::eTrue);
 	if (hadConfiguredOptions && lastTemporalResetFrameIndex != constantsFrameIndex) {
 		RequestTemporalReset();
 	}
@@ -1029,6 +1070,7 @@ void Streamline::QueryDLSSGState(std::string_view a_phase)
 		logger::warn("[Streamline] Could not query DLSS-G state: {}", magic_enum::enum_name(result));
 		return;
 	}
+	lastDLSSGPresentMultiplier = static_cast<double>(state.numFramesActuallyPresented);
 
 	maxFramesToGenerate = std::max<uint32_t>(1, state.numFramesToGenerateMax);
 	dynamicMFGSupported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
@@ -1057,24 +1099,32 @@ void Streamline::QueryDLSSGState(std::string_view a_phase)
 
 float Streamline::GetReflexLatencyMs()
 {
+	pclLatencyReportAvailable = false;
 	if (!featureReflex || !slReflexGetState) {
 		return 0.0f;
 	}
 
 	sl::ReflexState state{};
 	if (SL_FAILED(result, slReflexGetState(state)) || !state.latencyReportAvailable) {
-		pclLatencyReportAvailable = false;
 		return 0.0f;
 	}
 	pclLatencyReportAvailable = true;
 
-	for (auto i = sl::kReflexFrameReportCount - 1; i >= 0; --i) {
-		const auto& report = state.frameReport[i];
-		if (report.frameID == 0 || report.inputSampleTime == 0 || report.presentEndTime <= report.inputSampleTime) {
+	// InputSample is deprecated in PCL. CPU Present end also excludes queued
+	// GPU work. Report simulation-start to GPU-end instead, without claiming
+	// peripheral/scanout/display latency. Require a completed simulation scope.
+	const sl::ReflexReport* latest = nullptr;
+	for (const auto& report : state.frameReport) {
+		if (report.frameID == 0 || report.simStartTime == 0 ||
+			report.simEndTime < report.simStartTime || report.gpuRenderEndTime <= report.simStartTime) {
 			continue;
 		}
-
-		const auto latencyUs = report.presentEndTime - report.inputSampleTime;
+		if (!latest || report.frameID > latest->frameID) {
+			latest = &report;
+		}
+	}
+	if (latest) {
+		const auto latencyUs = latest->gpuRenderEndTime - latest->simStartTime;
 		return static_cast<float>(static_cast<double>(latencyUs) / 1000.0);
 	}
 

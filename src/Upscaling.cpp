@@ -25,6 +25,8 @@ extern bool enbLoaded;
 static RE::BSGraphics::Renderer* g_nativeUIRenderer = nullptr;
 static thread_local bool g_nativeScreenSpaceUI = false;
 static uint32_t g_upscalingUpdateFrame = UINT32_MAX;
+static thread_local uint32_t g_simulationFrame = 0;
+static thread_local bool g_simulationOpen = false;
 
 namespace
 {
@@ -38,6 +40,39 @@ namespace
 		return *taaSaved || (ui && ui->freezeFramePause != 0);
 	}
 }
+
+struct Main_Run_OnIdle
+{
+	static void thunk(RE::Main* a_main)
+	{
+		const auto nextFrame = Util::State_GetSingleton()->frameCount + 1;
+		g_simulationFrame = nextFrame;
+		DX12SwapChain::GetSingleton()->WaitForFrameStart();
+		g_simulationOpen = Streamline::GetSingleton()->BeginSimulationFrame(nextFrame);
+		func(a_main);
+		if (g_simulationOpen) {
+			// Alt-Tab can skip Swap after OnIdle has already begun.
+			Streamline::GetSingleton()->EndSimulationFrame(g_simulationFrame);
+			g_simulationOpen = false;
+		}
+	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
+
+struct Main_OnIdle_Swap
+{
+	static void thunk(RE::Main* a_main)
+	{
+		// OnIdle has waited for OkToRender (stage 0). UI jobs and
+		// post-render housekeeping can still overlap rendering.
+		if (g_simulationOpen) {
+			Streamline::GetSingleton()->EndSimulationFrame(g_simulationFrame);
+			g_simulationOpen = false;
+		}
+		func(a_main);
+	}
+	static inline REL::Relocation<decltype(thunk)> func;
+};
 
 struct Scaleform_SetNativeScreenTarget
 {
@@ -1569,6 +1604,15 @@ void Upscaling::InstallHooks()
 		"Interface3D::Renderer::Create");
 
 	const auto isOG = REX::FModule::IsRuntimeOG();
+	// Normal simulation pacing before input/jobs, then the scene handoff.
+	// The existing CALL5 helper retains each previous callee in func.
+	stl::write_thunk_call<Main_Run_OnIdle>(
+		REL::ID{ 1125396, 4484191 }.address() + (isOG ? 0xBB : 0xCB));
+	stl::write_thunk_call<Main_OnIdle_Swap>(
+		REL::ID{ 633524, 2228917 }.address() + (isOG ? 0x6EC : 0xCDC));
+	logger::info("[Reflex] Installed Main simulation hooks; previous OnIdle={:x}, Swap={:x}",
+		Main_Run_OnIdle::func.address(), Main_OnIdle_Swap::func.address());
+
 	stl::detour_thunk_gateway<Renderer_Begin_ENBDomains>(
 		REL::ID{ 288964, 2276833 }, isOG ? 8 : 6, "Renderer::Begin frame pacing and ENB domains");
 
@@ -2113,7 +2157,6 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 	// suspends. They are descriptor-checked below and in
 	// CreateUpscalingResources(), so only real resolution/format changes
 	// recreate GPU resources.
-	dlssTransparencyMaskReady = false;
 	for (std::size_t i = 0; i < dlssgInputsReady.size(); ++i) {
 		dlssgInputsReady[i] = false;
 		fsrFrameGenerationInputsReady[i] = false;
@@ -2494,7 +2537,8 @@ void Upscaling::RetireD3D11Texture(std::unique_ptr<Texture2D>& a_texture)
 		return;
 	}
 
-	deferredResourceReleases.push_back({ completedPresentCount + kDeferredResourceReleasePresents, std::move(a_texture), {} });
+	deferredResourceReleases.push_back({ 0, std::move(a_texture), {}, 0,
+		completedPresentCount + kDeferredResourceReleasePresents });
 }
 
 void Upscaling::RetireSharedD3D12Texture(
@@ -2506,9 +2550,11 @@ void Upscaling::RetireSharedD3D12Texture(
 	}
 
 	deferredResourceReleases.push_back({
-		completedPresentCount + kDeferredResourceReleasePresents,
+		0,
 		std::move(a_texture),
-		std::move(a_d3d12Resource) });
+		std::move(a_d3d12Resource),
+		0,
+		completedPresentCount + kDeferredResourceReleasePresents });
 }
 
 void Upscaling::RetireD3D12Resource(winrt::com_ptr<ID3D12Resource>& a_resource)
@@ -2517,14 +2563,29 @@ void Upscaling::RetireD3D12Resource(winrt::com_ptr<ID3D12Resource>& a_resource)
 		return;
 	}
 
-	deferredResourceReleases.push_back({ completedPresentCount + kDeferredResourceReleasePresents, {}, std::move(a_resource) });
+	deferredResourceReleases.push_back({ 0, {}, std::move(a_resource), 0,
+		completedPresentCount + kDeferredResourceReleasePresents });
 }
 
 void Upscaling::AdvanceDeferredResourceReleases()
 {
 	++completedPresentCount;
-	while (!deferredResourceReleases.empty() &&
-		deferredResourceReleases.front().releasePresent <= completedPresentCount) {
+	auto* swap = DX12SwapChain::GetSingleton();
+	// Called after Present submission: retired objects may have been referenced
+	// by commands recorded earlier in this frame, so do not stamp them at retire time.
+	if (!deferredResourceReleases.empty() && deferredResourceReleases.back().d3d11Fence == 0) {
+		uint64_t fence11 = 0, fence12 = 0;
+		if (swap->GetRetirementFences(fence11, fence12)) {
+			for (auto it = deferredResourceReleases.rbegin(); it != deferredResourceReleases.rend() && it->d3d11Fence == 0; ++it) {
+				it->d3d11Fence = fence11;
+				it->d3d12Fence = fence12;
+			}
+		}
+	}
+	while (!deferredResourceReleases.empty() && deferredResourceReleases.front().d3d11Fence != 0 &&
+		deferredResourceReleases.front().releasePresent <= completedPresentCount &&
+		swap->AreRetirementFencesComplete(deferredResourceReleases.front().d3d11Fence,
+			deferredResourceReleases.front().d3d12Fence)) {
 		deferredResourceReleases.pop_front();
 	}
 }
@@ -2625,49 +2686,14 @@ bool Upscaling::EnsureFrameGenerationPatchResources(float2 a_renderSize, DXGI_FO
 		frameGenerationDepthTexture->CreateUAV(uavDesc);
 	}
 
-	auto ensureReticleMask = [&](std::unique_ptr<Texture2D>& a_texture) {
-		if (matches(a_texture, DXGI_FORMAT_R32_FLOAT)) {
-			return;
-		}
-		RetireD3D11Texture(a_texture);
-
-		D3D11_TEXTURE2D_DESC desc{};
-		desc.Width = width;
-		desc.Height = height;
-		desc.MipLevels = 1;
-		desc.ArraySize = 1;
-		desc.Format = DXGI_FORMAT_R32_FLOAT;
-		desc.SampleDesc.Count = 1;
-		desc.Usage = D3D11_USAGE_DEFAULT;
-		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-
-		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-		srvDesc.Format = desc.Format;
-		srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		srvDesc.Texture2D.MipLevels = 1;
-
-		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-		uavDesc.Format = desc.Format;
-		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-
-		a_texture = std::make_unique<Texture2D>(desc);
-		a_texture->CreateSRV(srvDesc);
-		a_texture->CreateUAV(uavDesc);
-	};
-
-	ensureReticleMask(dlssTransparencyMaskTexture);
-
 	return frameGenerationPreAlphaTexture &&
 		frameGenerationMotionVectorTexture &&
 		frameGenerationDepthTexture &&
-		dlssTransparencyMaskTexture &&
 		frameGenerationPreAlphaTexture->srv &&
 		frameGenerationMotionVectorTexture->srv &&
 		frameGenerationMotionVectorTexture->uav &&
 		frameGenerationDepthTexture->srv &&
-		frameGenerationDepthTexture->uav &&
-		dlssTransparencyMaskTexture->srv &&
-		dlssTransparencyMaskTexture->uav;
+		frameGenerationDepthTexture->uav;
 }
 
 void Upscaling::PreFrameGenerationAlpha()
@@ -2675,7 +2701,6 @@ void Upscaling::PreFrameGenerationAlpha()
 	static auto gameViewport = Util::State_GetSingleton();
 	frameGenerationBuffersReady = false;
 	frameGenerationPreAlphaReady = false;
-	dlssTransparencyMaskReady = false;
 	if (!WantsFrameGenerationInputs()) {
 		return;
 	}
@@ -2718,7 +2743,6 @@ void Upscaling::PreFrameGenerationAlpha()
 
 bool Upscaling::PostFrameGenerationAlpha()
 {
-	dlssTransparencyMaskReady = false;
 	static auto gameViewport = Util::State_GetSingleton();
 	if (!WantsFrameGenerationInputs() ||
 		!frameGenerationPreAlphaTexture ||
@@ -2782,7 +2806,6 @@ void Upscaling::CopyFrameGenerationBuffers()
 {
 	frameGenerationBuffersReady = false;
 	frameGenerationPreAlphaReady = false;
-	dlssTransparencyMaskReady = false;
 	if (!WantsFrameGenerationInputs()) {
 		return;
 	}
@@ -3607,7 +3630,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		currentDSV->Release();
 	}
 
-	// Dilate motion vectors and strip projection jitter before temporal upscalers or DLSS-G consume them.
+	// Allocate temporal resources, then dilate only when the result is consumed.
 	if (upscaleMethod == UpscaleMethod::kDLSS || upscaleMethod == UpscaleMethod::kFSR || frameGenerationActive || fsrFrameGenerationActive) {
 		if ((upscaleMethod == UpscaleMethod::kDLSS && !dlssOutputTexture) || !dilatedMotionVectorTexture) {
 			try {
@@ -3642,28 +3665,21 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			return;
 		}
 
-		{
+		// CaptureDLSSGInputs receives the preserved/patched motion resource when
+		// it is current. FSR SR receives engine motion directly. Neither reads
+		// the dilation output in those cases; keep their existing inputs intact.
+		const bool usePreservedMotionVectors =
+			frameGenerationBuffersReady &&
+			frameGenerationBuffersFrame == gameViewport->frameCount &&
+			frameGenerationMotionVectorTexture &&
+			frameGenerationMotionVectorTexture->resource;
+		const bool needsDilatedMotionVectors =
+			(d3d12DLSSActive || frameGenerationActive || fsrFrameGenerationActive) && !usePreservedMotionVectors;
+		if (needsDilatedMotionVectors) {
 			UpdateAndBindUpscalingCB(context, displaySize, renderSize);
 
 			auto motionVectorSRV = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMotionVectors)].srView);
 			auto depthTextureSRV = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
-			const bool usePatchedMotionVectors =
-				frameGenerationBuffersReady &&
-				frameGenerationBuffersFrame == gameViewport->frameCount &&
-				frameGenerationMotionVectorTexture &&
-				frameGenerationMotionVectorTexture->srv;
-			const bool usePatchedDepth =
-				(upscaleMethod == UpscaleMethod::kDisabled ||
-					(virtualENB && upscaleMethod == UpscaleMethod::kDLSS)) &&
-				usePatchedMotionVectors &&
-				frameGenerationDepthTexture &&
-				frameGenerationDepthTexture->srv;
-			if (usePatchedMotionVectors) {
-				motionVectorSRV = frameGenerationMotionVectorTexture->srv.get();
-			}
-			if (usePatchedDepth) {
-				depthTextureSRV = frameGenerationDepthTexture->srv.get();
-			}
 
 			ID3D11ShaderResourceView* views[2] = { motionVectorSRV, depthTextureSRV };
 			context->CSSetShaderResources(0, ARRAYSIZE(views), views);
@@ -3783,7 +3799,21 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	auto runSpatialFallbackUpscale = [&]() {
 		if (virtualENB) {
 			const auto frameIndex = dx12SwapChain->GetFrameIndex();
-			if (frameIndex >= enbFallbackD3D12.size() || !dx12SwapChain->WaitForFrameSlot(frameIndex)) {
+			if (frameIndex >= enbFallbackD3D12.size()) {
+				return false;
+			}
+			dlssgInputsReady[frameIndex] = false;
+			fsrFrameGenerationInputsReady[frameIndex] = false;
+			frameGenerationActive = fsrFrameGenerationActive = false;
+			Streamline::GetSingleton()->RequestDLSSGDisable();
+			// At native size the engine can keep the world in its backbuffer.
+			// No separate scene snapshot, slot wait or transparent UI clear is needed.
+			if (upscaleMethod == UpscaleMethod::kSpatialFallback &&
+				renderSize.x == displaySize.x && renderSize.y == displaySize.y) {
+				dx12SwapChain->SetPresentOverride(nullptr);
+				return true;
+			}
+			if (!dx12SwapChain->WaitForFrameSlot(frameIndex)) {
 				return false;
 			}
 			// No temporal result this frame: snapshot R and let the present shader
@@ -3794,10 +3824,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			desc.MiscFlags = 0;
 			EnsureSharedD3D12Texture(this, desc, enbFallbackSharedTextures[frameIndex], enbFallbackD3D12[frameIndex], false);
 			context->CopyResource(enbFallbackSharedTextures[frameIndex]->resource.get(), frameBufferResource);
-			dlssgInputsReady[frameIndex] = false;
-			fsrFrameGenerationInputsReady[frameIndex] = false;
-			frameGenerationActive = fsrFrameGenerationActive = false;
-			Streamline::GetSingleton()->RequestDLSSGDisable();
 			return prepareD3D12PresentOverrideUI() && setD3D12PresentOverride(enbFallbackD3D12[frameIndex].get());
 		}
 		if (!upscalingTexture || !upscalingTexture->srv) {
@@ -4001,7 +4027,7 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 	if (frameIndex >= fsrD3D12InputsReady.size()) {
 		return false;
 	}
-	if (!dx12SwapChain->WaitForFrameSlot(frameIndex)) {
+	if (!dx12SwapChain->WaitForFrameSlot(frameIndex, true)) {
 		return false;
 	}
 	static auto gameViewport = Util::State_GetSingleton();
@@ -4236,7 +4262,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			frameBufferResource->Release();
 			return;
 		}
-		if (!dx12SwapChain->WaitForFrameSlot(frameIndex)) {
+		if (!dx12SwapChain->WaitForFrameSlot(frameIndex, useD3D12DLSS)) {
 			frameBufferResource->Release();
 			return;
 		}
@@ -4291,7 +4317,6 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 				EnsureSharedD3D12Texture(this, sharpenedDesc, dlssSharpenedSharedTextures[frameIndex], dlssSharpenedD3D12[frameIndex], true);
 			}
 
-			dlssTransparencyMaskReady = false;
 			dlssD3D12TransparencyMaskReady[frameIndex] = false;
 			auto* opaqueOnly = FidelityFX::GetSingleton()->colorOpaqueOnlyTexture.get();
 			if (opaqueOnly && opaqueOnly->srv && upscalingTexture->srv) {
@@ -4304,10 +4329,14 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 				maskDesc.SampleDesc.Count = 1;
 				maskDesc.Usage = D3D11_USAGE_DEFAULT;
 				maskDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-				EnsureTexture2D(maskDesc, dlssTransparencyMaskTexture, true, true);
+				// WaitForFrameSlot above protects this slot from its previous D3D12
+				// reader. Generate directly into the shared input; the input-ready
+				// signal below orders these UAV writes before DLSS reads them.
+				EnsureSharedD3D12Texture(this, maskDesc, dlssTransparencyMaskSharedTextures[frameIndex], dlssTransparencyMaskD3D12[frameIndex], true);
+				auto* mask = dlssTransparencyMaskSharedTextures[frameIndex].get();
 
 				auto shader = GetGenerateDLSSTransparencyMaskCS();
-				if (shader && dlssTransparencyMaskTexture && dlssTransparencyMaskTexture->uav) {
+				if (shader && mask && mask->uav) {
 					ID3D11ShaderResourceView* views[] = {
 						opaqueOnly->srv.get(),
 						ENBRenderDomain::Get().Active() ? frameBufferSRV : upscalingTexture->srv.get()
@@ -4315,32 +4344,18 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 					context->CSSetShaderResources(0, ARRAYSIZE(views), views);
 
 					ID3D11UnorderedAccessView* uavs[] = {
-						dlssTransparencyMaskTexture->uav.get()
+						mask->uav.get()
 					};
 					context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
 					context->CSSetShader(shader, nullptr, 0);
 
-					D3D11_TEXTURE2D_DESC dispatchDesc{};
-					dlssTransparencyMaskTexture->resource->GetDesc(&dispatchDesc);
-					context->Dispatch(static_cast<UINT>(std::ceil(dispatchDesc.Width / 8.0f)), static_cast<UINT>(std::ceil(dispatchDesc.Height / 8.0f)), 1);
+					context->Dispatch((maskDesc.Width + 7) / 8, (maskDesc.Height + 7) / 8, 1);
+					ID3D11ShaderResourceView* nullViews[2] = {};
+					context->CSSetShaderResources(0, ARRAYSIZE(nullViews), nullViews);
 					ClearDLSSGComputeBindings(context);
 
-					dlssTransparencyMaskFrame = gameViewport->frameCount;
-					dlssTransparencyMaskReady = true;
+					dlssD3D12TransparencyMaskReady[frameIndex] = true;
 				}
-			}
-
-			if (dlssTransparencyMaskReady &&
-				dlssTransparencyMaskFrame == gameViewport->frameCount &&
-				dlssTransparencyMaskTexture &&
-				dlssTransparencyMaskTexture->resource) {
-				D3D11_TEXTURE2D_DESC maskDesc{};
-				dlssTransparencyMaskTexture->resource->GetDesc(&maskDesc);
-				maskDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-				maskDesc.MiscFlags = 0;
-				EnsureSharedD3D12Texture(this, maskDesc, dlssTransparencyMaskSharedTextures[frameIndex], dlssTransparencyMaskD3D12[frameIndex], false);
-				context->CopyResource(dlssTransparencyMaskSharedTextures[frameIndex]->resource.get(), dlssTransparencyMaskTexture->resource.get());
-				dlssD3D12TransparencyMaskReady[frameIndex] = true;
 			}
 		} else {
 			dlssD3D12InputsReady[frameIndex] = false;
@@ -4856,11 +4871,9 @@ void Upscaling::DestroyUpscalingResources()
 	RetireD3D11Texture(frameGenerationPreAlphaTexture);
 	RetireD3D11Texture(frameGenerationMotionVectorTexture);
 	RetireD3D11Texture(frameGenerationDepthTexture);
-	RetireD3D11Texture(dlssTransparencyMaskTexture);
 	frameGenerationPreAlphaReady = false;
 	frameGenerationPreAlphaFrame = 0;
 	frameGenerationBuffersReady = false;
-	dlssTransparencyMaskReady = false;
 	for (std::size_t i = 0; i < dlssgInputsReady.size(); ++i) {
 		RetireSharedD3D12Texture(dlssInputSharedTextures[i], dlssInputD3D12[i]);
 		RetireSharedD3D12Texture(dlssSharpenedSharedTextures[i], dlssSharpenedD3D12[i]);

@@ -840,6 +840,8 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	EndNativeUI();
 	NativeInterfaceUI::ReleaseResources();
 	nativeUITexture = nullptr;
+	nativeUISharedTexture = nullptr;
+	nativeUIReadFenceValue = 0;
 	menuComposite = nullptr;
 	sceneUISRV = nullptr;
 	interopReady = false;
@@ -857,6 +859,10 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	swapChainBufferProxy = nullptr;
 	swapChainBufferProxyENB = nullptr;
 	frameSlotFenceValues.fill(0);
+	inputReuseFenceValues.fill(0);
+	queuedReuseFenceValues.fill(0);
+	presentSlotFenceValues.fill(0);
+	inputsUsedAtPresent.fill(false);
 }
 
 void DX12SwapChain::RestoreResizeDependentResources(const char* a_context)
@@ -1127,9 +1133,13 @@ void DX12SwapChain::CreateInterop()
 	ENBRenderDomain::Get().Initialize(swapChainDesc.Width, swapChainDesc.Height);
 	HANDLE sharedFenceHandle = nullptr;
 	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(d3d12Fence.put())));
-	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(commandFence.put())));
+	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(commandFence.put())));
 	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(d3d12Fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
 	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(d3d11Fence.put())));
+	CloseHandle(sharedFenceHandle);
+	sharedFenceHandle = nullptr;
+	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(commandFence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
+	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(d3d11CommandFence.put())));
 	CloseHandle(sharedFenceHandle);
 	RecreateInteropTextures();
 }
@@ -1231,6 +1241,36 @@ void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
 	a_context.fenceValue = signalValue;
 }
 
+void DX12SwapChain::WaitForFrameStart()
+{
+	if (!IsReady() || deviceLost || IsWindowUnavailable()) {
+		return;
+	}
+	const auto* upscaling = Upscaling::GetSingleton();
+	if (upscaling->IsFrameGenerationActive() || upscaling->IsFSRFrameGenerationActive() ||
+		FidelityFX::GetSingleton()->IsFrameGenerationEnabled() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety()) {
+		return;
+	}
+
+	// Keep at most one previous native Present outstanding before sampling input.
+	// Wait for the second-newest post-Present fence, leaving the newest frame
+	// available to overlap CPU simulation with GPU work. Buffer indices need
+	// not be in chronological order. Zero values also cover initial warm-up.
+	UINT64 newest = 0;
+	UINT64 secondNewest = 0;
+	for (const auto value : presentSlotFenceValues) {
+		if (value > newest) {
+			secondNewest = newest;
+			newest = value;
+		} else if (value > secondNewest) {
+			secondNewest = value;
+		}
+	}
+	WaitForCommandFence(secondNewest);
+	// Present retains its slot-reuse check for standalone loading draws,
+	// FG transitions and wait failures. No resource retirement rules change.
+}
+
 bool DX12SwapChain::FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext* a_context)
 {
 	if (a_frameIndex >= std::size(frameSlotFenceValues) || !commandQueue || !commandFence) {
@@ -1244,6 +1284,12 @@ bool DX12SwapChain::FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext
 		return false;
 	}
 	frameSlotFenceValues[a_frameIndex] = signalValue;
+	presentSlotFenceValues[a_frameIndex] = signalValue;
+	const auto* upscaling = Upscaling::GetSingleton();
+	if (inputsUsedAtPresent[a_frameIndex] || upscaling->IsFrameGenerationActive() ||
+		upscaling->IsFSRFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety()) {
+		inputReuseFenceValues[a_frameIndex] = signalValue;
+	}
 	if (a_context) {
 		a_context->fenceValue = signalValue;
 	}
@@ -1264,7 +1310,6 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 	if (completedValue >= a_value) {
 		return true;
 	}
-
 	if (!commandFenceEvent) {
 		commandFenceEvent.attach(CreateEventW(nullptr, FALSE, FALSE, nullptr));
 		if (!commandFenceEvent) {
@@ -1293,22 +1338,44 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 	return true;
 }
 
-bool DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex)
+bool DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly)
 {
 	if (a_frameIndex >= std::size(frameSlotFenceValues)) {
 		return false;
 	}
 
-	const auto waitValue = frameSlotFenceValues[a_frameIndex];
-	if (waitValue == 0) {
+	const auto waitValue = a_inputsOnly ? inputReuseFenceValues[a_frameIndex] : frameSlotFenceValues[a_frameIndex];
+	if (waitValue == 0 || waitValue <= queuedReuseFenceValues[a_frameIndex]) {
 		return true;
 	}
 
-	if (!WaitForCommandFence(waitValue)) {
+	// Only GPU writes reuse these allocations. Let the CPU keep recording;
+	// Present separately bounds frame lead using the unchanged swapchain slots.
+	if (!d3d11CommandFence || !d3d11Context || deviceLost ||
+		FAILED(d3d11Context->Wait(d3d11CommandFence.get(), waitValue))) {
 		return false;
 	}
-	frameSlotFenceValues[a_frameIndex] = 0;
+	queuedReuseFenceValues[a_frameIndex] = waitValue;
 	return true;
+}
+
+bool DX12SwapChain::GetRetirementFences(uint64_t& a_d3d11, uint64_t& a_d3d12)
+{
+	if (!d3d11Context || !d3d11Fence || !commandFence || deviceLost) { return false; }
+	const auto value = fenceValue++;
+	if (FAILED(d3d11Context->Signal(d3d11Fence.get(), value))) { return false; }
+	a_d3d11 = value;
+	a_d3d12 = commandFenceValue - 1;
+	return true;
+}
+
+bool DX12SwapChain::AreRetirementFencesComplete(uint64_t a_d3d11, uint64_t a_d3d12) const
+{
+	if (!d3d11Fence || !commandFence || deviceLost) { return false; }
+	const auto completed11 = d3d11Fence->GetCompletedValue();
+	const auto completed12 = commandFence->GetCompletedValue();
+	return completed11 != UINT64_MAX && completed12 != UINT64_MAX &&
+		completed11 >= a_d3d11 && completed12 >= a_d3d12;
 }
 
 bool DX12SwapChain::WaitForGPUIdle()
@@ -1328,6 +1395,10 @@ bool DX12SwapChain::WaitForGPUIdle()
 		return false;
 	}
 	frameSlotFenceValues.fill(0);
+	inputReuseFenceValues.fill(0);
+	queuedReuseFenceValues.fill(0);
+	presentSlotFenceValues.fill(0);
+	inputsUsedAtPresent.fill(false);
 	return true;
 }
 
@@ -1530,9 +1601,7 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 	command.list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
 	ExecuteCommandContext(command);
 	if (!rendered) { return; }
-	const auto outputFence = fenceValue++;
-	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), outputFence));
-	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), outputFence));
+	DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), command.fenceValue));
 	d3d11Context->CopyResource(uiTarget, menuComposite->resource11.get());
 	nativeUIIncludesScene = true;
 }
@@ -1553,13 +1622,14 @@ bool DX12SwapChain::BeginNativeUI()
 			desc.Height = swapChainDesc.Height;
 			desc.MiscFlags = 0;
 			desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-			winrt::com_ptr<ID3D11Texture2D> texture;
-			DX::ThrowIfFailed(d3d11Device->CreateTexture2D(&desc, nullptr, texture.put()));
+			auto shared = std::make_unique<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
+			auto texture = shared->resource11;
 			auto ui = std::make_unique<Texture2D>(texture.detach());
 			DX::ThrowIfFailed(d3d11Device->CreateRenderTargetView(ui->resource.get(), nullptr, ui->rtv.put()));
 			DX::ThrowIfFailed(d3d11Device->CreateShaderResourceView(ui->resource.get(), nullptr, ui->srv.put()));
 			DX::ThrowIfFailed(d3d11Device->CreateUnorderedAccessView(ui->resource.get(), nullptr, ui->uav.put()));
 			nativeUITexture = std::move(ui);
+			nativeUISharedTexture = std::move(shared);
 			++nativeUIGeneration;
 			logger::info("[ENB UI] Native screen-space target {}x{}; scene {}x{}, generation={}",
 				desc.Width, desc.Height, ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height(), nativeUIGeneration);
@@ -1591,11 +1661,24 @@ void main(uint3 p : SV_DispatchThreadID)
 			sampler.MaxLOD = D3D11_FLOAT32_MAX;
 			DX::ThrowIfFailed(d3d11Device->CreateSamplerState(&sampler, nativeUISampler.put()));
 		}
+		// Keep the UI allocation stable for Scaleform/ENB caches. Only its next
+		// write waits for the previous D3D12 read; earlier world work can proceed.
+		// This fence is signaled exclusively by D3D12, unlike the interop fence.
+		if (nativeUIReadFenceValue != 0) {
+			DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), nativeUIReadFenceValue));
+			nativeUIReadFenceValue = 0;
+		}
 		// A separate D3D12 scene requires a transparent overlay, including when
 		// menu rendering leaves an old world image in the D3D11 backbuffer.
 		if (presentOverrideFinalColor) {
 			const float transparent[4]{};
 			d3d11Context->ClearRenderTargetView(nativeUITexture->rtv.get(), transparent);
+		} else if (ENBRenderDomain::Get().Width() == swapChainDesc.Width &&
+			ENBRenderDomain::Get().Height() == swapChainDesc.Height) {
+			// Native-size fallback already contains the world. Preserve it for
+			// engine UI, menu background filters and same-frame screenshots.
+			d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
+			d3d11Context->CopyResource(nativeUITexture->resource.get(), swapChainBufferProxyENB->resource11.get());
 		} else {
 			// No separate scene exists in the fallback path: retain its background.
 			winrt::com_ptr<ID3D11ComputeShader> oldShader;
@@ -1702,6 +1785,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		return result;
 	}
 	const auto dlssgPresentSafety = streamline->NeedsDLSSGPresentSafety();
+	// Keep at most the existing number of swapchain slots in flight. Moving
+	// input reuse to the GPU must not create an unbounded CPU submission queue.
+	if (!WaitForCommandFence(presentSlotFenceValues[frameIndex])) {
+		return DXGI_ERROR_DEVICE_REMOVED;
+	}
 
 	auto& commandContext = AcquireCommandContext();
 	auto* commandList = commandContext.list.get();
@@ -1710,30 +1798,31 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		return DXGI_ERROR_INVALID_CALL;
 	}
 
-	if (ENBRenderDomain::Get().Active()) {
+	const bool useSharedNativeUI = ENBRenderDomain::Get().Active();
+	if (useSharedNativeUI) {
 		if (!BeginNativeUI()) {
 			return E_FAIL;
 		}
-		d3d11Context->CopyResource(presentStaging->resource11.get(), nativeUITexture->resource.get());
 	} else if (swapChainBufferProxyENB) {
 		d3d11Context->CopyResource(presentStaging->resource11.get(), swapChainBufferProxyENB->resource11.get());
 	} else {
 		d3d11Context->CopyResource(presentStaging->resource11.get(), swapChainBufferProxy->resource.get());
 	}
-	const auto& enbDomain = ENBRenderDomain::Get();
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	++fenceValue;
 
 	const auto presentedFrameIndex = frameIndex;
 	auto destination = swapChainBuffers[presentedFrameIndex].get();
-	auto copySource = presentStaging->resource12.get();
+	auto copySource = useSharedNativeUI ? nativeUISharedTexture->resource12.get() : presentStaging->resource12.get();
 	commandContext.retainedPresentOverride = std::move(presentOverrideFinalColor);
 	// The menu's D3D11 background filter has already consumed the resolved scene.
 	// Retain its resource through submission, but do not composite it a second time.
 	auto overrideFinalColor = nativeUIIncludesScene ? nullptr : commandContext.retainedPresentOverride.get();
 	const bool usePresentOverride = overrideFinalColor != nullptr;
-	const bool useComposite = usePresentOverride || enbDomain.Active();
+	// BeginNativeUI has already resolved the scene to display size when no
+	// separate world exists. A second fullscreen resolve would be redundant.
+	const bool useComposite = usePresentOverride;
 
 	D3D12_RESOURCE_BARRIER beforeCopy[] = {
 		CD3DX12_RESOURCE_BARRIER::Transition(
@@ -1821,6 +1910,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 
 	ExecuteCommandContext(commandContext);
+	if (useSharedNativeUI) {
+		// The compositor is the last D3D12 reader of this UI texture. FG receives
+		// the composed swapchain image and separate world/depth/motion resources.
+		nativeUIReadFenceValue = commandContext.fenceValue;
+	}
 
 	const auto fidelityFXFrameGenerationActive = upscaling->IsFSRFrameGenerationActive();
 	const auto presentSyncInterval = (dlssgPresentSafety || fidelityFXFrameGenerationActive) ? 0u : SyncInterval;
@@ -1941,11 +2035,13 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 	DX::ThrowIfFailed(commandQueue->Signal(commandFence.get(), signalValue));
 	commandContext.fenceValue = signalValue;
 	frameSlotFenceValues[evaluationFrameIndex] = signalValue;
+	inputReuseFenceValues[evaluationFrameIndex] = signalValue;
+	const auto* upscaling = Upscaling::GetSingleton();
+	inputsUsedAtPresent[evaluationFrameIndex] = upscaling->IsFrameGenerationActive() ||
+		upscaling->IsFSRFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety();
 
 	if (a_waitForD3D11Consumption) {
-		DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), fenceValue));
-		DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), fenceValue));
-		++fenceValue;
+		DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), signalValue));
 	}
 	return result;
 }

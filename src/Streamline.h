@@ -155,6 +155,8 @@ public:
 	 */
 	void UpdateReflex(uint a_reflexMode, bool a_forceEnabled);
 	void BeginRenderFrame(uint32_t a_frameIndex);
+	bool BeginSimulationFrame(uint32_t a_frameIndex);
+	void EndSimulationFrame(uint32_t a_frameIndex);
 
 	/**
 	 * @brief Enable/disable DLSS-G for the current frame.
@@ -185,9 +187,10 @@ public:
 	void OnPresentEnd(HRESULT a_result, bool a_queryState = true);
 	void QueryDLSSGState(std::string_view a_phase);
 	sl::ReflexMode GetCurrentReflexMode() const { return currentReflexMode; }
+	// Latest completed simulation-start -> GPU-end duration; 0 means unavailable.
 	float GetReflexLatencyMs();
 	uint32_t GetOSDGeneratedFramesPerRenderFrame() const { return dlssgActive ? (currentDLSSGGeneratedFrames != 0 ? currentDLSSGGeneratedFrames : 1) : 0; }
-	uint32_t GetDLSSGPresentedFrameMultiplier() const { return lastDLSSGPresentedFrames != std::numeric_limits<uint32_t>::max() && lastDLSSGPresentedFrames != 0 ? lastDLSSGPresentedFrames : 1; }
+	double GetDLSSGPresentedFrameMultiplier() const { return lastDLSSGPresentMultiplier; }
 	uint GetCurrentDLSSQualityMode() const { return currentDLSSQualityMode; }
 	uint GetCurrentDLSSModelPreset() const { return currentDLSSModelPreset; }
 	uint32_t GetPCLStatsWindowMessage() const { return pclStatsWindowMessage; }
@@ -280,6 +283,7 @@ public:
 private:
 	void CheckFeature(sl::Feature a_feature, IDXGIAdapter* a_adapter, bool& a_available, std::string_view a_name);
 	bool EnsureFrameToken(uint32_t a_frameIndex);
+	bool PaceFrame(uint32_t a_frameIndex);
 	bool ApplyNISSharpen(ID3D11Resource* a_inputColor, ID3D11Resource* a_outputColor, ID3D11DeviceContext* a_context, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resource* a_outputColor, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint a_dlssModelPreset);
@@ -296,9 +300,12 @@ private:
 	bool temporalResetPending = true;
 	uint32_t markerFrameIndex = std::numeric_limits<uint32_t>::max();
 	uint32_t reflexSleepFrame = std::numeric_limits<uint32_t>::max();
+	uint32_t simulationMarkerFrame = std::numeric_limits<uint32_t>::max();
+	uint32_t renderMarkerFrame = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGStatus = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGPresentedFrames = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();
+	double lastDLSSGPresentMultiplier = 1.0;
 	uint32_t maxFramesToGenerate = 1;
 	bool dynamicMFGSupported = false;
 	bool dlssgStateKnown = false;
