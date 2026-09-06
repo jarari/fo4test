@@ -1567,9 +1567,8 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 	auto* uiTarget = nativeUIActive && nativeUITexture ? nativeUITexture->resource.get() :
 		swapChainBufferProxy ? swapChainBufferProxy->resource.get() : nullptr;
 	if (!uiTarget) { return; }
-	// Present-time background filters expect a complete frame. Only while the
-	// framework menu is open, resolve the D3D12 scene + engine UI before its
-	// D3D11 blur runs. Normal gameplay keeps the asynchronous split UI path.
+	// Resolve a complete frame for menu background filters, or before ScopeMenu
+	// draws its black surround. Normal gameplay keeps the split UI path.
 	if (!menuComposite) {
 		D3D11_TEXTURE2D_DESC desc{};
 		uiTarget->GetDesc(&desc);
@@ -1729,6 +1728,15 @@ void main(uint3 p : SV_DispatchThreadID)
 		auto* manager = Util::RenderTargetManager_GetSingleton();
 		manager->renderTargetData[0].width = swapChainDesc.Width;
 		manager->renderTargetData[0].height = swapChainDesc.Height;
+		nativeUIActive = true;
+		if (Upscaling::GetSingleton()->scopeMenuOpen && presentOverrideFinalColor) {
+			// Seed the native target before Interface3D/Scaleform draws the scope.
+			// Its black surround then covers world RGB directly, even when an
+			// engine composition pass does not write alpha. Present recognizes
+			// nativeUIIncludesScene and copies the completed frame only once.
+			d3d11Context->OMSetRenderTargets(0, nullptr, nullptr);
+			ResolveNativeUIForMenu();
+		}
 		auto* rtv = nativeUITexture->rtv.get();
 		d3d11Context->OMSetRenderTargets(1, &rtv, nullptr);
 		using SetViewport = void (*)(RE::BSGraphics::RenderTargetManager*);
@@ -1736,7 +1744,6 @@ void main(uint3 p : SV_DispatchThreadID)
 		setViewport(manager);
 		D3D11_VIEWPORT viewport{ 0, 0, static_cast<float>(swapChainDesc.Width), static_cast<float>(swapChainDesc.Height), 0, 1 };
 		d3d11Context->RSSetViewports(1, &viewport);
-		nativeUIActive = true;
 		return true;
 	} catch (const std::exception& e) {
 		logger::error("[ENB UI] Native UI preparation failed: {}", e.what());
