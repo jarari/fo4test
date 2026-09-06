@@ -14,7 +14,7 @@ public:
 	}
 
 	// Null postUI means a spatial-only resolve of baseColor (including R -> D).
-	void Render(
+	bool Render(
 		ID3D12Device* a_device,
 		ID3D12GraphicsCommandList* a_commandList,
 		ID3D12Resource* a_backBuffer,

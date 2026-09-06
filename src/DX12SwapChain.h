@@ -108,6 +108,8 @@ public:
 	bool BeginNativeUI();
 	void PublishNativeUIForOverlays();
 	void EndNativeUI();
+	// A same-frame, display-sized image for the engine's synchronous screenshot encoder.
+	std::shared_ptr<D3D11D3D12SharedTexture> CaptureScreenshot();
 	uint64_t NativeUIGeneration() const { return nativeUIGeneration; }
 	uint64_t ENBSceneResizeGeneration() const { return enbSceneResizeGeneration; }
 	HRESULT ResizeBuffers(UINT a_bufferCount, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags);
@@ -148,6 +150,8 @@ private:
 		winrt::com_ptr<ID3D12GraphicsCommandList4> list;
 		std::unique_ptr<D3D11D3D12SharedTexture> presentStaging;
 		winrt::com_ptr<ID3D12Resource> retainedPresentOverride;
+		std::shared_ptr<D3D11D3D12SharedTexture> screenshotInput;
+		std::shared_ptr<D3D11D3D12SharedTexture> screenshotOutput;
 		UINT index = 0;
 		UINT64 fenceValue = 0;
 	};

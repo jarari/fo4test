@@ -18,6 +18,7 @@
 #include "DX12SwapChain.h"
 #include "ENBRenderDomain.h"
 #include "NativeInterfaceUI.h"
+#include "Screenshot.h"
 
 extern bool enbLoaded;
 
@@ -1534,6 +1535,7 @@ namespace
 
 void Upscaling::InstallHooks()
 {
+	Screenshot::InstallHooks();
 	// Disable TAA shader if using alternative scaling method
 	stl::write_vfunc<0x8, ImageSpaceEffectTemporalAA_IsActive>(RE::VTABLE::ImageSpaceEffectTemporalAA[0]);
 	// Fixed Fallout 4 entry points use explicit gateway prologues. These lengths

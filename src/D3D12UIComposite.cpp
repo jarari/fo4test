@@ -200,7 +200,7 @@ void D3D12UIComposite::CreateSRV(ID3D12Device* a_device, ID3D12Resource* a_resou
 	a_device->CreateShaderResourceView(a_resource, &srvDesc, handle);
 }
 
-void D3D12UIComposite::Render(
+bool D3D12UIComposite::Render(
 	ID3D12Device* a_device,
 	ID3D12GraphicsCommandList* a_commandList,
 	ID3D12Resource* a_backBuffer,
@@ -213,13 +213,13 @@ void D3D12UIComposite::Render(
 	uint32_t a_descriptorSlotCount)
 {
 	if (!a_device || !a_commandList || !a_backBuffer || !a_baseColor || a_width == 0 || a_height == 0) {
-		return;
+		return false;
 	}
 	if (!EnsureResources(a_device, a_backBufferFormat, a_descriptorSlotCount)) {
-		return;
+		return false;
 	}
 	if (a_descriptorSlot >= currentDescriptorSlotCount) {
-		return;
+		return false;
 	}
 
 	const auto srvBaseIndex = a_descriptorSlot * kSRVsPerSlot;
@@ -247,4 +247,5 @@ void D3D12UIComposite::Render(
 	a_commandList->RSSetViewports(1, &viewport);
 	a_commandList->RSSetScissorRects(1, &scissor);
 	a_commandList->DrawInstanced(6, 1, 0, 0);
+	return true;
 }

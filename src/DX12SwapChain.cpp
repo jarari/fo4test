@@ -804,6 +804,8 @@ void DX12SwapChain::SuspendTemporalFeatures(const char* a_reason)
 	presentOverrideFinalColor = nullptr;
 	for (auto& context : commandContexts) {
 		context.retainedPresentOverride = nullptr;
+		context.screenshotInput.reset();
+		context.screenshotOutput.reset();
 	}
 	temporalFeaturesSuspended = true;
 	logger::info("[DX12SwapChain] Suspended temporal features reason={}", a_reason ? a_reason : "unknown");
@@ -845,6 +847,8 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	for (auto& context : commandContexts) {
 		context.presentStaging = nullptr;
 		context.retainedPresentOverride = nullptr;
+		context.screenshotInput.reset();
+		context.screenshotOutput.reset();
 		context.fenceValue = 0;
 	}
 	for (auto& backBuffer : swapChainBuffers) {
@@ -1159,6 +1163,8 @@ void DX12SwapChain::RecreateInteropTextures()
 	}
 	for (auto& context : commandContexts) {
 		context.retainedPresentOverride = nullptr;
+		context.screenshotInput.reset();
+		context.screenshotOutput.reset();
 		textureDesc.Width = swapChainDesc.Width;
 		textureDesc.Height = swapChainDesc.Height;
 		textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -1182,6 +1188,8 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 			context.index = static_cast<UINT>(contextIndex);
 			context.fenceValue = 0;
 			context.retainedPresentOverride = nullptr;
+			context.screenshotInput.reset();
+			context.screenshotOutput.reset();
 			DX::ThrowIfFailed(context.allocator->Reset());
 			DX::ThrowIfFailed(context.list->Reset(context.allocator.get(), nullptr));
 			return context;
@@ -1205,6 +1213,8 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 	context.index = waitContextIndex;
 	context.fenceValue = 0;
 	context.retainedPresentOverride = nullptr;
+	context.screenshotInput.reset();
+	context.screenshotOutput.reset();
 	DX::ThrowIfFailed(context.allocator->Reset());
 	DX::ThrowIfFailed(context.list->Reset(context.allocator.get(), nullptr));
 	return context;
@@ -1403,6 +1413,77 @@ void DX12SwapChain::PublishNativeUIForOverlays()
 	windowTarget.srView->AddRef();
 	windowTarget.uaView->AddRef();
 	nativeUIWindowTargetActive = true;
+}
+
+std::shared_ptr<D3D11D3D12SharedTexture> DX12SwapChain::CaptureScreenshot()
+{
+	if (!IsReady() || deviceLost || IsWindowUnavailable() || sceneResizeActive) {
+		return {};
+	}
+	// Match Present's source selection without changing any engine targets or
+	// consuming presentOverrideFinalColor. This also covers non-ENB split UI.
+	auto* source = nativeUIActive && nativeUITexture ? nativeUITexture->resource.get() :
+		swapChainBufferProxyENB ? swapChainBufferProxyENB->resource11.get() :
+		swapChainBufferProxy ? swapChainBufferProxy->resource.get() : nullptr;
+	if (!source || !swapChainDesc.Width || !swapChainDesc.Height) {
+		return {};
+	}
+	try {
+		D3D11_TEXTURE2D_DESC desc{};
+		source->GetDesc(&desc);
+		if (desc.SampleDesc.Count != 1 || desc.MipLevels != 1 || desc.ArraySize != 1) {
+			return {};
+		}
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.CPUAccessFlags = 0;
+		desc.MiscFlags = 0;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		auto input = std::make_shared<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
+		desc.Width = swapChainDesc.Width;
+		desc.Height = swapChainDesc.Height;
+		desc.Format = swapChainDesc.Format;
+		desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+		auto output = std::make_shared<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
+		auto& command = AcquireCommandContext();
+		// Retain both allocations through submission, including error paths.
+		command.screenshotInput = input;
+		command.screenshotOutput = output;
+		command.retainedPresentOverride = nativeUIIncludesScene ? nullptr : presentOverrideFinalColor;
+		auto* scene = command.retainedPresentOverride.get();
+		auto* ui = input->resource12.get();
+		auto* image = output->resource12.get();
+		d3d11Context->CopyResource(input->resource11.get(), source);
+		const auto inputFence = fenceValue++;
+		DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), inputFence));
+		d3d11Context->Flush();
+		DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), inputFence));
+		std::array<D3D12_RESOURCE_BARRIER, 3> barriers{};
+		UINT count = 0;
+		barriers[count++] = CD3DX12_RESOURCE_BARRIER::Transition(ui, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		barriers[count++] = CD3DX12_RESOURCE_BARRIER::Transition(image, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		if (scene) {
+			barriers[count++] = CD3DX12_RESOURCE_BARRIER::Transition(scene, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+		command.list->ResourceBarrier(count, barriers.data());
+		const bool rendered = D3D12UIComposite::GetSingleton()->Render(d3d12Device.get(), command.list.get(), image,
+			scene ? scene : ui, scene ? ui : nullptr, desc.Format, desc.Width, desc.Height,
+			command.index, static_cast<uint32_t>(std::size(commandContexts)));
+		for (UINT i = 0; i < count; ++i) {
+			std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
+		}
+		command.list->ResourceBarrier(count, barriers.data());
+		ExecuteCommandContext(command);
+		// The game's encoder immediately maps a D3D11 staging copy. Finish the
+		// D3D12 write on the CPU before handing the shared texture to its context.
+		if (!WaitForCommandFence(command.fenceValue) || !rendered) {
+			logger::warn("[Screenshot] Composite unavailable; using the engine capture path");
+			return {};
+		}
+		return output;
+	} catch (const std::exception& e) {
+		logger::error("[Screenshot] Composite failed; using the engine capture path: {}", e.what());
+		return {};
+	}
 }
 
 void DX12SwapChain::ResolveNativeUIForMenu()
