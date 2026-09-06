@@ -1,4 +1,5 @@
 #include "Streamline.h"
+#include "Upscaling.h"
 
 #include "third_party/RTX40MFGUnlock/integration.h"
 
@@ -8,7 +9,6 @@
 
 #include "DX12SwapChain.h"
 #include "Util.h"
-#include "RenderProfiling.h"
 
 namespace
 {
@@ -564,7 +564,6 @@ void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
 	// UpdateConstants/CaptureDLSSGInputs after the world has already rendered.
 	// The SDK requires Sleep even with Reflex Off; the selected mode controls it.
 	if (featureReflex && slReflexSleep) {
-		const ScopedRenderCPUProfile timing("reflex-render-start-sleep");
 		if (SL_FAILED(res, slReflexSleep(*frameToken))) {
 			logger::warn("[Streamline] Reflex sleep failed: {}", magic_enum::enum_name(res));
 		}

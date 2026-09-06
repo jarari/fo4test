@@ -95,9 +95,6 @@ public:
 		uint dlssNRStyle = 0;                                       ///< DLSS-NR style: 0=Natural, 1=Cinematic
 		uint dlssNRUseAutoMask = 0;                                 ///< Ask DLSS-NR to generate its control mask
 		uint osdMode = 0;                                           ///< Debug OSD: 0=Off, 1=Compact, 2=Detailed
-		uint taggedTextureDebug = 0;                                ///< Debug tagged texture view: 0=Off, 1=On
-		uint imageSpaceEffectLog = 0;                               ///< Log unique active image-space effects in the ENB native scope
-		uint enbGPUTiming = 0;                                       ///< Opt-in ENB GPU stages and CPU render-path timings
 		float sharpness = 0.2f;                                       ///< Upscaler sharpness: 0.0=off, 1.0=max
 		float dlssNRIntensity = 1.0f;
 		float dlssNRLocalToneStrength = 1.0f;
@@ -179,7 +176,6 @@ public:
 	bool EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
 	bool EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
 	void TagDLSSGInputs(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
-	void GetTaggedTextureDebugResources(uint32_t a_frameIndex, ID3D12Resource*& a_color, ID3D12Resource*& a_depth, ID3D12Resource*& a_motionVectors) const;
 	void OnD3D12TemporalSuspend();
 
 	// DLSS-G/Streamline can retain tagged resources past the Present that
@@ -226,19 +222,14 @@ public:
 	 * during main rendering pass
 	 */
 	void OverrideRenderTargets(std::initializer_list<int> a_indicesToCopy = {});
-	void OverrideRenderTargetsSelective(std::initializer_list<int> a_targetIndices, std::initializer_list<int> a_indicesToCopy = {});
 
 	/**
 	 * @brief Restore original render targets
 	 * @param a_indicesToCopy Optional array of render target indices that require expensive copy. Empty = copy all.
-	 * @param a_copyAllWhenEmpty Set false to restore pointers and metadata without copying proxy contents.
 	 *
 	 * Restores full resolution render targets after scaled rendering is complete
 	 */
-	void ResetRenderTargets(
-		std::initializer_list<int> a_indicesToCopy = {},
-		bool a_copyAllWhenEmpty = true);
-	void ResetRenderTargetsSelective(std::initializer_list<int> a_targetIndices, std::initializer_list<int> a_indicesToCopy = {});
+	void ResetRenderTargets(std::initializer_list<int> a_indicesToCopy = {});
 
 	/**
 	 * @brief Update a single render target
@@ -425,7 +416,6 @@ public:
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrDepthSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrOpaqueOnlySharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> fsrReactiveMaskSharedTextures;
-	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> debugMotionVectorSharedTextures;
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> enbFallbackSharedTextures;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> enbFallbackD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> dlssInputD3D12;
@@ -441,7 +431,6 @@ public:
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> fsrDepthD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> fsrOpaqueOnlyD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> fsrReactiveMaskD3D12;
-	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> debugMotionVectorD3D12;
 	std::array<bool, kDX12FrameCount> dlssgInputsReady{};
 	std::array<bool, kDX12FrameCount> fsrFrameGenerationInputsReady{};
 	std::array<bool, kDX12FrameCount> fsrD3D12InputsReady{};

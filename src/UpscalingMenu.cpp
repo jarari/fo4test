@@ -5,7 +5,6 @@
 #include "Streamline.h"
 #include "Upscaling.h"
 #include "ENBRenderDomain.h"
-#include "ENBEffectDiagnostics.h"
 
 #include <array>
 #include <mutex>
@@ -20,8 +19,6 @@ namespace
 	bool g_editInitialized = false;
 	bool g_dirty = false;
 	bool g_registered = false;
-	bool g_enbCaptureRequested = false;
-	bool g_enbCaptureAttempted = false;
 	std::int64_t g_menuEventHandle = -1;
 	std::int64_t g_dlssNRHotkeyHandle = -1;
 	bool g_dlssNRHotkeyCapturing = false;
@@ -469,32 +466,12 @@ namespace
 			ImGuiMCP::TextDisabled("Hotkey binding requires a F4SE Menu Framework version with the plugin hotkey API.");
 		}
 
-		ImGuiMCP::SeparatorText("Diagnostics");
-		changed |= CheckboxSetting("ENB GPU / Post-Processing Capture", settings.enbGPUTiming,
-			"Enable and restart once to install ENB 0.501 diagnostic hooks. Captures raw custom/PBMask/GammaFix draw inputs and outputs after quality changes.");
-		if (ImGuiMCP::Button("Capture ENB Post-Processing (3s delay)")) {
-			g_enbCaptureRequested = ENBEffectDiagnostics::RequestCapture();
-			g_enbCaptureAttempted = true;
-		}
-		if (g_enbCaptureAttempted) {
-			const auto* reason = ENBEffectDiagnostics::CaptureUnavailableReason();
-			ImGuiMCP::TextDisabled(g_enbCaptureRequested ? "Capture requested. Close menus within 3 seconds; see Upscaling.log for completion." :
-				reason ? reason : "Capture is available. Press Capture again.");
-		}
 		static constexpr std::array osdModes{ "Disabled", "Compact", "Detailed" };
 		changed |= ComboSetting(
 			"On-Screen Display",
 			settings.osdMode,
 			osdModes,
 			"Shows D3D12 swapchain and upscaler status while DLSS or FSR is active.");
-		changed |= CheckboxSetting(
-			"Tagged Texture Debug View",
-			settings.taggedTextureDebug,
-			"Shows the color, depth, motion-vector, and final-image resources used by the D3D12 upscaler.");
-		changed |= CheckboxSetting(
-			"Image-Space Effect Log",
-			settings.imageSpaceEffectLog,
-			"Logs unique image-space effects dispatched inside the ENB native-resolution scope.");
 
 		g_dirty |= changed;
 	}

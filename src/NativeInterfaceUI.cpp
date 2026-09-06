@@ -9,7 +9,6 @@
 #include "DX12SwapChain.h"
 #include "ENBRenderDomain.h"
 #include "Util.h"
-#include "RenderProfiling.h"
 #include "Upscaling.h"
 
 namespace
@@ -43,7 +42,6 @@ namespace
 		static void thunk(RE::Interface3D::Renderer* a_renderer)
 		{
 			if (!AlreadyRendered(a_renderer)) {
-				const ScopedRenderCPUProfile timing("Interface3D-prepasses", a_renderer->name.c_str());
 				func(a_renderer);
 			}
 		}
@@ -55,7 +53,6 @@ namespace
 		static void thunk(RE::Interface3D::Renderer* a_renderer, uint32_t a_target)
 		{
 			if (!AlreadyRendered(a_renderer)) {
-				const ScopedRenderCPUProfile timing("Interface3D-main", a_renderer->name.c_str());
 				func(a_renderer, a_target);
 			}
 		}
@@ -191,45 +188,6 @@ namespace
 		~RenderScope() { nativeDepth.Restore(); rendering = false; }
 	};
 
-	void TraceModelOutput(RE::Interface3D::Renderer* a_renderer, uint32_t a_target)
-	{
-		if (!Upscaling::GetSingleton()->settings.enbGPUTiming ||
-			Util::State_GetSingleton()->frameCount % 120 != 0 || a_target >= 100) {
-			return;
-		}
-		auto* manager = Util::RenderTargetManager_GetSingleton();
-		const auto mappingOffset = REX::FModule::IsRuntimeOG() ? 0xDC4u : 0xDF4u;
-		const auto* ids = reinterpret_cast<const uint32_t*>(reinterpret_cast<const std::byte*>(manager) + mappingOffset);
-		auto* data = RE::BSGraphics::GetRendererData();
-		if (ids[a_target] >= std::size(data->renderTargets)) {
-			return;
-		}
-		auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
-		winrt::com_ptr<ID3D11RenderTargetView> color;
-		winrt::com_ptr<ID3D11DepthStencilView> depth;
-		context->OMGetRenderTargets(1, color.put(), depth.put());
-		auto extent = [](ID3D11View* a_view) {
-			D3D11_TEXTURE2D_DESC desc{};
-			if (a_view) {
-				winrt::com_ptr<ID3D11Resource> resource;
-				a_view->GetResource(resource.put());
-				if (auto texture = resource.try_as<ID3D11Texture2D>()) {
-					texture->GetDesc(&desc);
-				}
-			}
-			return desc;
-		};
-		const auto c = extent(color.get());
-		const auto d = extent(depth.get());
-		const auto& expected = data->renderTargets[ids[a_target]];
-		const bool targetMatches = color.get() == reinterpret_cast<ID3D11RenderTargetView*>(expected.rtView);
-		const bool depthMatches = !depth || (c.Width == d.Width && c.Height == d.Height &&
-			c.SampleDesc.Count == d.SampleDesc.Count);
-		logger::info("[Interface3D model output] frame={} renderer={} L{}->P{} bound-match={} color={}x{} depth={}x{} compatible={} native-depth={}",
-			Util::State_GetSingleton()->frameCount, a_renderer->name.c_str(), a_target, ids[a_target], targetMatches,
-			c.Width, c.Height, d.Width, d.Height, depthMatches, nativeDepth.slot >= 0);
-	}
-
 	void UpdateDepthBinding(RE::BSGraphics::RenderTargetManager* a_manager)
 	{
 		const auto* swap = DX12SwapChain::GetSingleton();
@@ -358,7 +316,6 @@ namespace
 			RenderScope scope;
 			// Includes MainMenu/FlatScreenModel, which render BEFORE ScreenSpace_RenderMenus.
 			// Leave native RT0 active for subsequent 2D UI and the D3D12 present composite.
-			const ScopedRenderCPUProfile timing("Interface3D-native (inclusive)", a_postAA ? "post-AA" : "pre-AA");
 			func(a_target, a_postAA);
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
@@ -426,15 +383,8 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 		// RT63 is shared with HUDGlass. Produce and consume this renderer's
 		// output consecutively, with the native-color depth hook active for
 		// every intermediate bind. Never cache an SRV for later composition.
-		{
-			const ScopedRenderCPUProfile timing("Interface3D-prepasses-before-upscale", renderer->name.c_str());
-			ModelPrepasses::func(renderer);
-		}
-		TraceModelOutput(renderer, *displayTarget);
-		{
-			const ScopedRenderCPUProfile timing("Interface3D-main-before-upscale", renderer->name.c_str());
-			ModelMain::func(renderer, a_target);
-		}
+		ModelPrepasses::func(renderer);
+		ModelMain::func(renderer, a_target);
 		renderedModels[renderedModelCount++] = renderer;
 		RE::BSAutoWriteLock quadsLock(renderer->cachedQuadsLock);
 		renderer->colorFXInfos.clear();

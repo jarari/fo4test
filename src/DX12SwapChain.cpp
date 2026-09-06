@@ -1,6 +1,5 @@
 #include "DX12SwapChain.h"
 #include "ENBRenderDomain.h"
-#include "ENBEffectDiagnostics.h"
 #include "ENBTiledLighting.h"
 #include "NativeInterfaceUI.h"
 
@@ -14,9 +13,7 @@
 #include "D3D12UIComposite.h"
 #include "FidelityFX.h"
 #include "OSD.h"
-#include "RenderProfiling.h"
 #include "Streamline.h"
-#include "TaggedTextureDebug.h"
 #include "Upscaling.h"
 #include "UpscalingMenu.h"
 #include "third_party/RTX40MFGUnlock/integration.h"
@@ -924,7 +921,6 @@ HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 	sceneResizeActive = true;
 	sceneResizeObserved = false;
 	pendingSceneQuality = a_quality;
-	ENBEffectDiagnostics::BeforeResize();
 	auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
 	context->ClearState();
 	// This notifies the ENB wrapper only. The nested proxy call is handled by
@@ -1173,7 +1169,6 @@ void DX12SwapChain::RecreateInteropTextures()
 
 DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 {
-	const ScopedRenderCPUProfile cpuTiming("command-context-acquire (inclusive)");
 	const auto completedValue = commandFence ? commandFence->GetCompletedValue() : 0;
 	if (completedValue == std::numeric_limits<UINT64>::max()) {
 		deviceLost = true;
@@ -1273,10 +1268,7 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 		logger::error("[DX12SwapChain] SetEventOnCompletion failed result=0x{:08X} value={}", static_cast<uint32_t>(eventResult), a_value);
 		return false;
 	}
-	const auto waitResult = [&]() {
-		const ScopedRenderCPUProfile cpuTiming("command-fence-wait");
-		return WaitForSingleObjectEx(commandFenceEvent.get(), 5000, FALSE);
-	}();
+	const auto waitResult = WaitForSingleObjectEx(commandFenceEvent.get(), 5000, FALSE);
 	if (waitResult != WAIT_OBJECT_0) {
 		const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : E_FAIL;
 		deviceLost = FAILED(removedReason);
@@ -1416,7 +1408,6 @@ void DX12SwapChain::PublishNativeUIForOverlays()
 void DX12SwapChain::ResolveNativeUIForMenu()
 {
 	if (nativeUIIncludesScene || !presentOverrideFinalColor) { return; }
-	const ScopedRenderCPUProfile timing("menu-background-resolve (inclusive)");
 	// Present-time background filters expect a complete frame. Only while the
 	// framework menu is open, resolve the D3D12 scene + engine UI before its
 	// D3D11 blur runs. Normal gameplay keeps the asynchronous split UI path.
@@ -1465,7 +1456,6 @@ bool DX12SwapChain::BeginNativeUI()
 	if (!IsReady() || !swapChainBufferProxyENB) {
 		return false;
 	}
-	const ScopedRenderCPUProfile uiPreparationTiming("native-UI-prepare (inclusive)");
 	try {
 		if (!nativeUITexture) {
 			D3D11_TEXTURE2D_DESC desc{};
@@ -1648,21 +1638,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	auto overrideFinalColor = nativeUIIncludesScene ? nullptr : commandContext.retainedPresentOverride.get();
 	const bool usePresentOverride = overrideFinalColor != nullptr;
 	const bool useComposite = usePresentOverride || enbDomain.Active();
-	if (enbDomain.Active() && upscaling->settings.enbGPUTiming) {
-		const auto* state = Util::State_GetSingleton();
-		if (state && state->frameCount % 120 == 0) {
-			const auto sourceDesc = copySource->GetDesc();
-			const auto destinationDesc = destination->GetDesc();
-			const auto baseDesc = overrideFinalColor ? overrideFinalColor->GetDesc() : sourceDesc;
-			UINT sourceWidth = 0;
-			UINT sourceHeight = 0;
-			const auto sourceSizeResult = swapChain->GetSourceSize(&sourceWidth, &sourceHeight);
-			logger::info("[ENB present] frame={} override={} staging={}x{} base={}x{} destination={}x{} viewport={}x{} real-source={}x{} source-query-ok={}",
-				state->frameCount, usePresentOverride, sourceDesc.Width, sourceDesc.Height,
-				baseDesc.Width, baseDesc.Height, destinationDesc.Width, destinationDesc.Height,
-				swapChainDesc.Width, swapChainDesc.Height, sourceWidth, sourceHeight, SUCCEEDED(sourceSizeResult));
-		}
-	}
 
 	D3D12_RESOURCE_BARRIER beforeCopy[] = {
 		CD3DX12_RESOURCE_BARRIER::Transition(
@@ -1721,52 +1696,16 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			desc.Format);
 	}
 
-	const auto taggedTextureDebug = upscaling->settings.taggedTextureDebug != 0;
 	static bool wasOSDEnabled = false;
 	if (!osdEnabled && wasOSDEnabled) {
 		OSD::GetSingleton()->Reset();
 	}
 	wasOSDEnabled = osdEnabled;
-	if (osdEnabled || taggedTextureDebug) {
+	if (osdEnabled) {
 		if (destinationState != D3D12_RESOURCE_STATE_RENDER_TARGET) {
 			auto beforeOSD = CD3DX12_RESOURCE_BARRIER::Transition(destination, destinationState, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			commandList->ResourceBarrier(1, &beforeOSD);
 			destinationState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		}
-		if (taggedTextureDebug) {
-			ID3D12Resource* color = nullptr;
-			ID3D12Resource* depth = nullptr;
-			ID3D12Resource* motionVectors = nullptr;
-			upscaling->GetTaggedTextureDebugResources(presentedFrameIndex, color, depth, motionVectors);
-			if (color && depth && motionVectors) {
-				D3D12_RESOURCE_BARRIER beforeDebug[] = {
-					CD3DX12_RESOURCE_BARRIER::Transition(color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-					CD3DX12_RESOURCE_BARRIER::Transition(depth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-					CD3DX12_RESOURCE_BARRIER::Transition(motionVectors, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-					CD3DX12_RESOURCE_BARRIER::Transition(copySource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
-				};
-				commandList->ResourceBarrier(static_cast<UINT>(std::size(beforeDebug)), beforeDebug);
-				TaggedTextureDebug::GetSingleton()->Render(
-					d3d12Device.get(),
-					commandList,
-					destination,
-					color,
-					depth,
-					motionVectors,
-					copySource,
-					swapChainDesc.Format,
-					swapChainDesc.Width,
-					swapChainDesc.Height,
-					commandContext.index,
-					static_cast<uint32_t>(std::size(commandContexts)));
-				D3D12_RESOURCE_BARRIER afterDebug[] = {
-					CD3DX12_RESOURCE_BARRIER::Transition(color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-					CD3DX12_RESOURCE_BARRIER::Transition(depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-					CD3DX12_RESOURCE_BARRIER::Transition(motionVectors, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-					CD3DX12_RESOURCE_BARRIER::Transition(copySource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON)
-				};
-				commandList->ResourceBarrier(static_cast<UINT>(std::size(afterDebug)), afterDebug);
-			}
 		}
 		if (osdEnabled) {
 			OSD::GetSingleton()->Render(
@@ -1794,10 +1733,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (emitPresentMarkers) {
 		streamline->OnPresentStart();
 	}
-	const auto result = [&]() {
-		const ScopedRenderCPUProfile cpuTiming("real-present");
-		return swapChain->Present(presentSyncInterval, presentFlags);
-	}();
+	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
 	if (emitPresentMarkers) {
 		streamline->OnPresentEnd(result, false);
 	}
@@ -1875,7 +1811,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentFrame(bool a_evaluateDLSS, bool a_evaluateFSR, bool a_evaluateFSRFrameGeneration, bool a_waitForD3D11Consumption)
 {
-	const ScopedRenderCPUProfile cpuTiming("D3D12-evaluate-submit (inclusive)");
 	D3D12EvaluationResult result{};
 	if (!IsReady() || deviceLost || temporalFeaturesSuspended || IsWindowUnavailable()) {
 		return result;
@@ -1929,18 +1864,15 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkOnCommandLi
 
 	auto* upscaling = Upscaling::GetSingleton();
 	if (a_evaluateFSR) {
-		const ScopedRenderCPUProfile cpuTiming("FSR-record");
 		result.fsr = upscaling->EvaluateD3D12FSR(a_commandList, a_frameIndex);
 	}
 	if (a_evaluateDLSS) {
-		const ScopedRenderCPUProfile cpuTiming("DLSS-NR-SR-record");
 		result.dlss = upscaling->EvaluateD3D12DLSS(a_commandList, a_frameIndex);
 	}
 
 	const bool upscalerRequested = a_evaluateFSR || a_evaluateDLSS;
 	const bool upscalerSucceeded = (!a_evaluateFSR || result.fsr) && (!a_evaluateDLSS || result.dlss);
 	if (a_evaluateFSRFrameGeneration && (!upscalerRequested || upscalerSucceeded)) {
-		const ScopedRenderCPUProfile cpuTiming("FSR-FG-record");
 		result.fsrFrameGeneration = upscaling->EvaluateFSRFrameGeneration(a_commandList, a_frameIndex);
 	}
 

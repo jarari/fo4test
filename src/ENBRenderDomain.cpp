@@ -1,5 +1,4 @@
 #include "ENBRenderDomain.h"
-#include "ENBEffectDiagnostics.h"
 
 #include <algorithm>
 
@@ -27,7 +26,6 @@ void ENBRenderDomain::Initialize(uint32_t a_displayWidth, uint32_t a_displayHeig
 	// Read settings before ENB queries GetDesc and allocates private RTs.
 	auto* upscaling = Upscaling::GetSingleton();
 	upscaling->LoadSettings();
-	ENBEffectDiagnostics::Install();
 	quality = upscaling->settings.upscaleMethodPreference == 0 ? 0 :
 		std::min(upscaling->settings.qualityMode, 4u);
 	const auto extent = CalculateExtent(a_displayWidth, a_displayHeight, quality);
