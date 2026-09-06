@@ -99,7 +99,6 @@ public:
 		float dlssNRIntensity = 1.0f;
 		float dlssNRLocalToneStrength = 1.0f;
 		float dlssNRLocalStructureStrength = 1.0f;
-		float dlssNRGlobalToneStrength = 1.0f;
 		float dlssNRSkinStructureStrength = 1.0f;
 	};
 

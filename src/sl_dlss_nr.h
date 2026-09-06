@@ -38,7 +38,7 @@ namespace sl
 		float intensity = 1.0f;
 		float localToneStrength = 1.0f;
 		float localStructureStrength = 1.0f;
-		float globalToneStrength = 1.0f;
+		float globalToneStrength = 1.0f;  // Retain the provisional Streamline ABI slot; not a user setting.
 
 		// Version 2
 		std::uint32_t style = 0;

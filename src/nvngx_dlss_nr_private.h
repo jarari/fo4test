@@ -60,7 +60,6 @@ inline constexpr char NVSDK_NGX_Parameter_DLSSNR_Reset[] = "DLSSNR.Reset";
 inline constexpr char NVSDK_NGX_Parameter_DLSSNR_Intensity[] = "DLSSNR.Intensity";
 inline constexpr char NVSDK_NGX_Parameter_DLSSNR_LocalToneStrength[] = "DLSSNR.LocalToneStrength";
 inline constexpr char NVSDK_NGX_Parameter_DLSSNR_LocalStructureStrength[] = "DLSSNR.LocalStructureStrength";
-inline constexpr char NVSDK_NGX_Parameter_DLSSNR_GlobalToneStrength[] = "DLSSNR.GlobalToneStrength";
 inline constexpr char NVSDK_NGX_Parameter_DLSSNR_SkinStructureStrength[] = "DLSSNR.SkinStructureStrength";
 inline constexpr char NVSDK_NGX_Parameter_DLSSNR_UseAutoMask[] = "DLSSNR.UseAutoMask";
 inline constexpr char NVSDK_NGX_Parameter_DLSSNR_Style[] = "DLSSNR.Style";
@@ -76,7 +75,6 @@ namespace nvngx::dlss_nr
 		float intensity = 1.0f;
 		float localToneStrength = 1.0f;
 		float localStructureStrength = 1.0f;
-		float globalToneStrength = 1.0f;
 		float skinStructureStrength = 1.0f;
 		bool useAutoMask = false;
 	};

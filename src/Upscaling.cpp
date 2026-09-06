@@ -1780,7 +1780,6 @@ void Upscaling::LoadSettings()
 	const auto previousDLSSNRIntensity = settings.dlssNRIntensity;
 	const auto previousDLSSNRLocalToneStrength = settings.dlssNRLocalToneStrength;
 	const auto previousDLSSNRLocalStructureStrength = settings.dlssNRLocalStructureStrength;
-	const auto previousDLSSNRGlobalToneStrength = settings.dlssNRGlobalToneStrength;
 	const auto previousDLSSNRSkinStructureStrength = settings.dlssNRSkinStructureStrength;
 
 	CSimpleIniA ini;
@@ -1799,13 +1798,12 @@ void Upscaling::LoadSettings()
 	settings.dlssNREnabled = static_cast<uint>(ini.GetLongValue("DLSSNR", "bEnabled", 1) == 1);
 	settings.dlssNRPerformanceMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPerformanceMode", 0), 0, 5));
 	settings.dlssNRPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPreset", 0), 0, 3));
-	settings.dlssNRStyle = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iStyle", 0), 0, 1));
+	settings.dlssNRStyle = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iStyle", 0), 0, 2));
 	settings.dlssNRUseAutoMask = static_cast<uint>(ini.GetLongValue("DLSSNR", "bUseAutoMask", 0) == 1);
-	settings.dlssNRIntensity = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fIntensity", 1.0)), 0.0f, 2.0f);
-	settings.dlssNRLocalToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalToneStrength", 1.0)), 0.0f, 2.0f);
-	settings.dlssNRLocalStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalStructureStrength", 1.0)), 0.0f, 2.0f);
-	settings.dlssNRGlobalToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fGlobalToneStrength", 1.0)), 0.0f, 2.0f);
-	settings.dlssNRSkinStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fSkinStructureStrength", 1.0)), -1.0f, 2.0f);
+	settings.dlssNRIntensity = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fIntensity", 1.0)), 0.0f, 1.0f);
+	settings.dlssNRLocalToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalToneStrength", 1.0)), 0.0f, 1.0f);
+	settings.dlssNRLocalStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalStructureStrength", 1.0)), 0.0f, 1.0f);
+	settings.dlssNRSkinStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fSkinStructureStrength", 1.0)), -1.0f, 1.0f);
 	settings.osdMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iOnScreenDisplay", 0), 0, 2));
 	const auto legacySharpness = ini.GetDoubleValue("Settings", "fRCASSharpness", 0.2);
 	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", legacySharpness)), 0.0f, 1.0f);
@@ -1830,7 +1828,6 @@ void Upscaling::LoadSettings()
 		previousDLSSNRIntensity != settings.dlssNRIntensity ||
 		previousDLSSNRLocalToneStrength != settings.dlssNRLocalToneStrength ||
 		previousDLSSNRLocalStructureStrength != settings.dlssNRLocalStructureStrength ||
-		previousDLSSNRGlobalToneStrength != settings.dlssNRGlobalToneStrength ||
 		previousDLSSNRSkinStructureStrength != settings.dlssNRSkinStructureStrength) {
 		streamline->RequestTemporalReset();
 	}
@@ -1894,7 +1891,7 @@ bool Upscaling::SaveSettings(const Settings& a_settings)
 	ini.SetDoubleValue("DLSSNR", "fIntensity", a_settings.dlssNRIntensity);
 	ini.SetDoubleValue("DLSSNR", "fLocalToneStrength", a_settings.dlssNRLocalToneStrength);
 	ini.SetDoubleValue("DLSSNR", "fLocalStructureStrength", a_settings.dlssNRLocalStructureStrength);
-	ini.SetDoubleValue("DLSSNR", "fGlobalToneStrength", a_settings.dlssNRGlobalToneStrength);
+	ini.Delete("DLSSNR", "fGlobalToneStrength");
 	ini.SetLongValue("DLSSNR", "bUseAutoMask", static_cast<long>(a_settings.dlssNRUseAutoMask));
 	ini.SetDoubleValue("DLSSNR", "fSkinStructureStrength", a_settings.dlssNRSkinStructureStrength);
 
@@ -4607,7 +4604,6 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 	dlssNROptions.intensity = settings.dlssNRIntensity;
 	dlssNROptions.localToneStrength = settings.dlssNRLocalToneStrength;
 	dlssNROptions.localStructureStrength = settings.dlssNRLocalStructureStrength;
-	dlssNROptions.globalToneStrength = settings.dlssNRGlobalToneStrength;
 	dlssNROptions.useAutoMask = settings.dlssNRUseAutoMask != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	dlssNROptions.skinStructureStrength = settings.dlssNRSkinStructureStrength;
 	const auto succeeded = Streamline::GetSingleton()->UpscaleD3D12(

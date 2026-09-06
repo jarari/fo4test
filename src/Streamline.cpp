@@ -118,7 +118,6 @@ namespace
 			a_lhs.intensity == a_rhs.intensity &&
 			a_lhs.localToneStrength == a_rhs.localToneStrength &&
 			a_lhs.localStructureStrength == a_rhs.localStructureStrength &&
-			a_lhs.globalToneStrength == a_rhs.globalToneStrength &&
 			a_lhs.style == a_rhs.style &&
 			a_lhs.preset == a_rhs.preset &&
 			a_lhs.useAutoMask == a_rhs.useAutoMask &&
@@ -1475,7 +1474,6 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		parameters.options.intensity = a_dlssNROptions.intensity;
 		parameters.options.localToneStrength = a_dlssNROptions.localToneStrength;
 		parameters.options.localStructureStrength = a_dlssNROptions.localStructureStrength;
-		parameters.options.globalToneStrength = a_dlssNROptions.globalToneStrength;
 		parameters.options.skinStructureStrength = a_dlssNROptions.skinStructureStrength;
 		parameters.options.useAutoMask = a_dlssNROptions.useAutoMask == sl::Boolean::eTrue;
 		if (directDLSSNR.NeedsFeatureRecreation(parameters)) {

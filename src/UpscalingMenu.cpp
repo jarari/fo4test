@@ -421,22 +421,15 @@ namespace
 			settings.dlssNREnabled,
 			"Runs the experimental DLSS-NR pass after DLSS SR. If NR fails, the prepared SR result is retained.");
 		ImGuiMCP::BeginDisabled(settings.dlssNREnabled == 0);
-		static constexpr std::array nrPresets{ "Default", "Preset 1", "Preset 2", "Preset 3" };
-		changed |= ComboSetting(
-			"NR Preset",
-			settings.dlssNRPreset,
-			nrPresets,
-			"Selects a model preset exposed by the private DLSS-NR preview runtime.");
-		static constexpr std::array nrStyles{ "Natural", "Cinematic" };
+		static constexpr std::array nrStyles{ "Default", "Natural", "Cinematic" };
 		changed |= ComboSetting(
 			"NR Style",
 			settings.dlssNRStyle,
 			nrStyles,
 			"Selects the Neural Rendering appearance style.");
-		changed |= SliderFloatSetting("NR Intensity", settings.dlssNRIntensity, 0.0f, 2.0f, "%.2f", "Controls overall Neural Rendering strength.");
-		changed |= SliderFloatSetting("Local Tone Strength", settings.dlssNRLocalToneStrength, 0.0f, 2.0f, "%.2f", "Controls local tone enhancement.");
-		changed |= SliderFloatSetting("Local Structure Strength", settings.dlssNRLocalStructureStrength, 0.0f, 2.0f, "%.2f", "Controls local structure enhancement.");
-		changed |= SliderFloatSetting("Global Tone Strength", settings.dlssNRGlobalToneStrength, 0.0f, 2.0f, "%.2f", "Controls global tone enhancement.");
+		changed |= SliderFloatSetting("NR Intensity", settings.dlssNRIntensity, 0.0f, 1.0f, "%.2f", "Controls overall Neural Rendering strength.");
+		changed |= SliderFloatSetting("Local Tone Strength", settings.dlssNRLocalToneStrength, 0.0f, 1.0f, "%.2f", "Controls local tone enhancement.");
+		changed |= SliderFloatSetting("Local Structure Strength", settings.dlssNRLocalStructureStrength, 0.0f, 1.0f, "%.2f", "Controls local structure enhancement.");
 		changed |= CheckboxSetting(
 			"Automatic Mask",
 			settings.dlssNRUseAutoMask,
@@ -446,7 +439,7 @@ namespace
 			"Skin Structure Strength",
 			settings.dlssNRSkinStructureStrength,
 			-1.0f,
-			2.0f,
+			1.0f,
 			"%.2f",
 			"Controls structure enhancement in inferred skin regions. -1 inherits Local Structure Strength.");
 		ImGuiMCP::EndDisabled();
