@@ -8,11 +8,11 @@
 
 #include "DX12SwapChain.h"
 #include "Util.h"
+#include "RenderProfiling.h"
 
 namespace
 {
 	constexpr wchar_t kPCLStatsPingMessageName[] = L"PC_Latency_Stats_Ping";
-	constexpr auto kInputSampleMarker = static_cast<sl::PCLMarker>(6);
 	constexpr uint32_t kDLSSGStateQueryInterval = 15;
 
 	void StreamlineLogCallback(sl::LogType a_type, const char* a_message)
@@ -334,6 +334,7 @@ void Streamline::Shutdown()
 	constantsReferenceCamera = nullptr;
 	temporalResetPending = true;
 	markerFrameIndex = std::numeric_limits<uint32_t>::max();
+	reflexSleepFrame = std::numeric_limits<uint32_t>::max();
 	lastDLSSGStatus = std::numeric_limits<uint32_t>::max();
 	lastDLSSGPresentedFrames = std::numeric_limits<uint32_t>::max();
 	lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();
@@ -547,21 +548,31 @@ bool Streamline::EnsureFrameToken(uint32_t a_frameIndex)
 	currentFrameTokenIndex = static_cast<uint32_t>(*frameToken);
 	constantsFrameIndex = std::numeric_limits<uint32_t>::max();
 
-	SetPCLMarker(sl::PCLMarker::eSimulationStart);
-	// Streamline 2.11.1 removed the typed eInputSample enum value, but Reflex/NVAPI
-	// latency reports still expose inputSampleTime for marker value 6.
-	SetPCLMarker(kInputSampleMarker);
+	return true;
+}
 
+void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
+{
+	if (!EnsureFrameToken(a_frameIndex) || reflexSleepFrame == a_frameIndex) {
+		return;
+	}
+	reflexSleepFrame = a_frameIndex;
+	const auto* upscaling = Upscaling::GetSingleton();
+	UpdateReflex(upscaling->settings.reflexMode, upscaling->IsFrameGenerationActive());
+
+	// Pace before the game's first rendering submission, never from
+	// UpdateConstants/CaptureDLSSGInputs after the world has already rendered.
+	// The SDK requires Sleep even with Reflex Off; the selected mode controls it.
 	if (featureReflex && slReflexSleep) {
+		const ScopedRenderCPUProfile timing("reflex-render-start-sleep");
 		if (SL_FAILED(res, slReflexSleep(*frameToken))) {
 			logger::warn("[Streamline] Reflex sleep failed: {}", magic_enum::enum_name(res));
 		}
 	}
 
-	SetPCLMarker(sl::PCLMarker::eSimulationEnd);
+	// Renderer::Begin is a render boundary, not simulation or input sampling.
+	// Do not manufacture zero-duration simulation/input markers around Sleep.
 	SetPCLMarker(sl::PCLMarker::eRenderSubmitStart);
-
-	return true;
 }
 
 void Streamline::RequestTemporalReset()

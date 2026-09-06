@@ -154,6 +154,7 @@ public:
 	 * @brief Configure Reflex based on user settings and DLSS-G requirements.
 	 */
 	void UpdateReflex(uint a_reflexMode, bool a_forceEnabled);
+	void BeginRenderFrame(uint32_t a_frameIndex);
 
 	/**
 	 * @brief Enable/disable DLSS-G for the current frame.
@@ -163,7 +164,7 @@ public:
 	bool HasPendingDLSSGDisable() const { return pendingDLSSGDisable; }
 	void ApplyPendingDLSSGDisable();
 	bool NeedsDLSSGPresentSafety() const;
-	bool NeedsPresentMarkers() const { return NeedsDLSSGPresentSafety() && featurePCL && slPCLSetMarker && presentFrameToken; }
+	bool NeedsPresentMarkers() const { return featurePCL && slPCLSetMarker && (presentFrameToken || frameToken); }
 	void OnDLSSGPresentComplete();
 	uint32_t GetCurrentFrameTokenIndex() const { return currentFrameTokenIndex; }
 	sl::FrameToken* GetFrameTokenForFrame(uint32_t a_frameIndex);
@@ -294,6 +295,7 @@ private:
 	const void* constantsReferenceCamera = nullptr;
 	bool temporalResetPending = true;
 	uint32_t markerFrameIndex = std::numeric_limits<uint32_t>::max();
+	uint32_t reflexSleepFrame = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGStatus = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGPresentedFrames = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();

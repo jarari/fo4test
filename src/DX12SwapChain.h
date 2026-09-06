@@ -190,6 +190,9 @@ private:
 	RE::BSGraphics::RenderTarget savedSceneWindowTarget{};
 	bool nativeUIActive = false;
 	bool nativeUIWindowTargetActive = false;
+	bool nativeUIIncludesScene = false;
+	std::unique_ptr<D3D11D3D12SharedTexture> menuComposite;
+	void ResolveNativeUIForMenu();
 	uint64_t nativeUIGeneration = 0;
 	CommandContext commandContexts[kCommandContextCount];
 	winrt::handle commandFenceEvent;

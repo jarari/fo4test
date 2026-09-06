@@ -22,6 +22,7 @@ namespace
 	bool installationAttempted = false;
 	std::atomic<uint64_t> epoch{ 0 };
 	std::atomic<uint64_t> captureNotBefore{ 0 };
+	std::atomic<bool> captureRequested{ false };
 	using Render = uint32_t (*)(void*, uint32_t, uint32_t, int32_t);
 	using SetTexture = void (*)(void*, const char*, ID3D11ShaderResourceView*);
 	using SetVector = void (*)(void*, const char*, const float*);
@@ -538,7 +539,9 @@ namespace
 	{
 		if (!installed || active) { return originalRender(a_this, a_count, a_start, a_base); }
 		Drain();
-		if (!Enabled()) { return originalRender(a_this, a_count, a_start, a_base); }
+		if (!Enabled() || !captureRequested.load(std::memory_order_relaxed)) {
+			return originalRender(a_this, a_count, a_start, a_base);
+		}
 		const auto deadline = captureNotBefore.load();
 		if (deadline) {
 			if (GetTickCount64() < deadline) { return originalRender(a_this, a_count, a_start, a_base); }
@@ -691,6 +694,10 @@ namespace
 
 void ENBEffectDiagnostics::BeforeResize()
 {
+	// Timing and quality changes must not trigger hundreds of MB of staging
+	// copies/file writes. Resource capture is an explicit, separate operation.
+	captureRequested.store(false, std::memory_order_relaxed);
+	captureNotBefore.store(0);
 	if (installed && Enabled()) {
 		logger::info("[ENBEffect resize] e={} use-effect={} original-post={} original-adaptation={} enable-adaptation={}", epoch.load(),
 			*reinterpret_cast<uint32_t*>(base + 0x1A6580), *reinterpret_cast<uint32_t*>(base + 0x1A6588),
@@ -719,6 +726,7 @@ bool ENBEffectDiagnostics::RequestCapture()
 		return false;
 	}
 	captureNotBefore.store(GetTickCount64() + 3000);
+	captureRequested.store(true, std::memory_order_relaxed);
 	logger::info("[ENBEffect capture] Requested; close menus within 3 seconds. Captures first draw frame and another 120 frames later");
 	return true;
 }
@@ -794,5 +802,5 @@ void ENBEffectDiagnostics::Install()
 	if (!InstallDrawCallSites()) { return; }
 	originalRender = reinterpret_cast<Render>(Detours::X64::DetourFunction(base + 0x78AD0, reinterpret_cast<uintptr_t>(&Effect)));
 	installed = originalRender != nullptr;
-	logger::info("[ENBEffect] 0.501 effect-6 tracking installed={}; first/120-frame samples per quality transition; binary readbacks in TEMP/Upscaling-ENBEffect/PID", installed);
+	logger::info("[ENBEffect] 0.501 effect-6 tracking installed={}; capture button only, no automatic quality-transition readbacks; binary readbacks in TEMP/Upscaling-ENBEffect/PID", installed);
 }

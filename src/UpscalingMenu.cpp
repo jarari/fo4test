@@ -1,6 +1,7 @@
 #include "UpscalingMenu.h"
 
 #include "F4SEMenuFramework.h"
+#include <atomic>
 #include "Streamline.h"
 #include "Upscaling.h"
 #include "ENBRenderDomain.h"
@@ -279,9 +280,12 @@ namespace
 		}
 	}
 
+	std::atomic<bool> g_frameworkMenuOpen{ false };
+
 	void __stdcall OnMenuEvent(F4SEMenuFramework::Events::Type a_type)
 	{
 		if (a_type == F4SEMenuFramework::Events::kOpenMenu) {
+			g_frameworkMenuOpen.store(true, std::memory_order_relaxed);
 			InitializeEditState();
 			return;
 		}
@@ -289,6 +293,7 @@ namespace
 		if (a_type != F4SEMenuFramework::Events::kCloseMenu) {
 			return;
 		}
+		g_frameworkMenuOpen.store(false, std::memory_order_relaxed);
 		g_dlssNRHotkeyCapturing = false;
 
 		std::optional<Settings> settingsToSave;
@@ -493,6 +498,11 @@ namespace
 
 		g_dirty |= changed;
 	}
+}
+
+bool UpscalingMenu::IsOpen()
+{
+	return g_frameworkMenuOpen.load(std::memory_order_relaxed);
 }
 
 void UpscalingMenu::Register()

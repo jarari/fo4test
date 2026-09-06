@@ -10,6 +10,7 @@
 #include "ENBRenderDomain.h"
 #include "Util.h"
 #include "RenderProfiling.h"
+#include "Upscaling.h"
 
 namespace
 {
@@ -17,6 +18,49 @@ namespace
 	thread_local bool rendering = false;
 	thread_local int colorTarget = 0;
 	thread_local int depthTarget = 0;
+	bool modelHooksInstalled = false;
+	thread_local uint32_t modelFrame = UINT32_MAX;
+	thread_local std::array<RE::Interface3D::Renderer*, 64> renderedModels{};
+	thread_local size_t renderedModelCount = 0;
+
+	bool AlreadyRendered(RE::Interface3D::Renderer* a_renderer)
+	{
+		if (modelFrame != Util::State_GetSingleton()->frameCount) {
+			return false;
+		}
+		for (size_t i = 0; i < renderedModelCount; ++i) {
+			if (renderedModels[i] == a_renderer) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Patch RenderAll's calls, not the entry points: TF3DHUD's prepass detour
+	// must run exactly once, including its CommitRenderState callback.
+	struct ModelPrepasses
+	{
+		static void thunk(RE::Interface3D::Renderer* a_renderer)
+		{
+			if (!AlreadyRendered(a_renderer)) {
+				const ScopedRenderCPUProfile timing("Interface3D-prepasses", a_renderer->name.c_str());
+				func(a_renderer);
+			}
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
+
+	struct ModelMain
+	{
+		static void thunk(RE::Interface3D::Renderer* a_renderer, uint32_t a_target)
+		{
+			if (!AlreadyRendered(a_renderer)) {
+				const ScopedRenderCPUProfile timing("Interface3D-main", a_renderer->name.c_str());
+				func(a_renderer, a_target);
+			}
+		}
+		static inline REL::Relocation<decltype(thunk)> func;
+	};
 
 	void DirtyDepthBinding()
 	{
@@ -139,6 +183,53 @@ namespace
 		}
 	} nativeDepth;
 
+	// RT62/63 are native-sized even during pre-AA/model work. Their DSV must
+	// follow each color binding, not just the post-AA RenderAll invocation.
+	struct RenderScope
+	{
+		RenderScope() { rendering = true; }
+		~RenderScope() { nativeDepth.Restore(); rendering = false; }
+	};
+
+	void TraceModelOutput(RE::Interface3D::Renderer* a_renderer, uint32_t a_target)
+	{
+		if (!Upscaling::GetSingleton()->settings.enbGPUTiming ||
+			Util::State_GetSingleton()->frameCount % 120 != 0 || a_target >= 100) {
+			return;
+		}
+		auto* manager = Util::RenderTargetManager_GetSingleton();
+		const auto mappingOffset = REX::FModule::IsRuntimeOG() ? 0xDC4u : 0xDF4u;
+		const auto* ids = reinterpret_cast<const uint32_t*>(reinterpret_cast<const std::byte*>(manager) + mappingOffset);
+		auto* data = RE::BSGraphics::GetRendererData();
+		if (ids[a_target] >= std::size(data->renderTargets)) {
+			return;
+		}
+		auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
+		winrt::com_ptr<ID3D11RenderTargetView> color;
+		winrt::com_ptr<ID3D11DepthStencilView> depth;
+		context->OMGetRenderTargets(1, color.put(), depth.put());
+		auto extent = [](ID3D11View* a_view) {
+			D3D11_TEXTURE2D_DESC desc{};
+			if (a_view) {
+				winrt::com_ptr<ID3D11Resource> resource;
+				a_view->GetResource(resource.put());
+				if (auto texture = resource.try_as<ID3D11Texture2D>()) {
+					texture->GetDesc(&desc);
+				}
+			}
+			return desc;
+		};
+		const auto c = extent(color.get());
+		const auto d = extent(depth.get());
+		const auto& expected = data->renderTargets[ids[a_target]];
+		const bool targetMatches = color.get() == reinterpret_cast<ID3D11RenderTargetView*>(expected.rtView);
+		const bool depthMatches = !depth || (c.Width == d.Width && c.Height == d.Height &&
+			c.SampleDesc.Count == d.SampleDesc.Count);
+		logger::info("[Interface3D model output] frame={} renderer={} L{}->P{} bound-match={} color={}x{} depth={}x{} compatible={} native-depth={}",
+			Util::State_GetSingleton()->frameCount, a_renderer->name.c_str(), a_target, ids[a_target], targetMatches,
+			c.Width, c.Height, d.Width, d.Height, depthMatches, nativeDepth.slot >= 0);
+	}
+
 	void UpdateDepthBinding(RE::BSGraphics::RenderTargetManager* a_manager)
 	{
 		const auto* swap = DX12SwapChain::GetSingleton();
@@ -188,9 +279,11 @@ namespace
 	{
 		static void thunk(RE::BSGraphics::RenderTargetManager* a_manager, int a_slot, int a_target, RE::BSGraphics::SetRenderTargetMode a_mode)
 		{
-			if (rendering && a_slot == 0) {
+			if (a_slot == 0) {
 				colorTarget = a_target;
-				UpdateDepthBinding(a_manager);
+				if (rendering) {
+					UpdateDepthBinding(a_manager);
+				}
 			}
 			func(a_manager, a_slot, a_target, a_mode);
 		}
@@ -202,8 +295,8 @@ namespace
 		static void thunk(RE::BSGraphics::RenderTargetManager* a_manager, int a_target,
 			RE::BSGraphics::SetRenderTargetMode a_mode, int a_slice, bool a_readOnly)
 		{
+			depthTarget = a_target;
 			if (rendering) {
-				depthTarget = a_target;
 				UpdateDepthBinding(a_manager);
 			}
 			func(a_manager, a_target, a_mode, a_slice, a_readOnly);
@@ -255,19 +348,17 @@ namespace
 	{
 		static void thunk(uint32_t a_target, bool a_postAA)
 		{
-			if (!enabled || !a_postAA || a_target != 0 || !ENBRenderDomain::Get().Active() || rendering ||
-				!DX12SwapChain::GetSingleton()->BeginNativeUI()) {
+			if (!enabled || !ENBRenderDomain::Get().Active() || rendering) {
 				func(a_target, a_postAA);
 				return;
 			}
-			struct Scope
-			{
-				Scope() { rendering = true; colorTarget = 0; depthTarget = 0; }
-				~Scope() { nativeDepth.Restore(); rendering = false; }
-			} scope;
+			if (a_postAA && a_target == 0) {
+				DX12SwapChain::GetSingleton()->BeginNativeUI();
+			}
+			RenderScope scope;
 			// Includes MainMenu/FlatScreenModel, which render BEFORE ScreenSpace_RenderMenus.
 			// Leave native RT0 active for subsequent 2D UI and the D3D12 present composite.
-			const ScopedRenderCPUProfile timing("Interface3D-native (inclusive)");
+			const ScopedRenderCPUProfile timing("Interface3D-native (inclusive)", a_postAA ? "post-AA" : "pre-AA");
 			func(a_target, a_postAA);
 		}
 		static inline REL::Relocation<decltype(thunk)> func;
@@ -279,12 +370,86 @@ bool NativeInterfaceUI::IsRendering()
 	return rendering;
 }
 
+void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
+{
+	auto* upscaling = Upscaling::GetSingleton();
+	if (!enabled || !modelHooksInstalled || rendering || a_target != 0 ||
+		!ENBRenderDomain::Get().Active() || !upscaling->IsD3D12DLSSActive() ||
+		upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDLSS) {
+		return;
+	}
+	static REL::Relocation<const bool*> disabled{ REL::ID{ 789743, 4803742 } };
+	static REL::Relocation<const bool*> preAAEnabled{ REL::ID{ 339016, 4803740 } };
+	if (*disabled || !*preAAEnabled) {
+		return;
+	}
+	const auto frame = Util::State_GetSingleton()->frameCount;
+	if (modelFrame != frame) {
+		modelFrame = frame;
+		renderedModelCount = 0;
+	}
+	static REL::Relocation<RE::BSTArray<RE::Interface3D::Renderer*>*> renderers{ REL::ID{ 996993, 4803746 } };
+	static REL::Relocation<RE::BSReadWriteLock*> lock{ REL::ID{ 778095, 4803745 } };
+	static REL::Relocation<bool*> shaderPostAA{ REL::ID{ 801215, 2712496 } };
+	static REL::Relocation<uint32_t*> displayTarget{ REL::ID{ 113725, 2712501 } };
+	using HasMenus = bool (*)(RE::UI*, const RE::BSFixedString&);
+	static REL::Relocation<HasMenus> hasMenus{ REL::ID{ 1574554, 2284758 } };
+
+	RE::BSAutoReadLock listLock(*lock);
+	RenderScope scope;
+	struct ShaderScope
+	{
+		bool previousPostAA = *shaderPostAA;
+		uint32_t previousTarget = *displayTarget;
+		ShaderScope() { *shaderPostAA = true; }
+		~ShaderScope() { *shaderPostAA = previousPostAA; *displayTarget = previousTarget; }
+	} shaderScope;
+	for (auto* renderer : *renderers) {
+		if (renderedModelCount == renderedModels.size()) {
+			break;
+		}
+		if (!renderer || !renderer->enabled || !renderer->postAA || AlreadyRendered(renderer) ||
+			!renderer->screenAttachedElementRoot ||
+			renderer->omsize.get() != RE::Interface3D::OffscreenMenuSize::kFullFrame) {
+			continue;
+		}
+		const auto fx = renderer->postfx.get();
+		const bool hasModel = renderer->defRenderMainScreen ||
+			(renderer->offscreen3DEnabled && (renderer->offscreenElement ||
+				(renderer->highlightedElement && renderer->highlightOffscreen)));
+		if (!hasModel || fx == RE::Interface3D::PostEffect::kPipboy ||
+			fx == RE::Interface3D::PostEffect::kHUDGlass ||
+			fx == RE::Interface3D::PostEffect::kHUDGlassWithMod ||
+			(RE::UI::GetSingleton() && hasMenus(RE::UI::GetSingleton(), renderer->name))) {
+			continue;
+		}
+		// RT63 is shared with HUDGlass. Produce and consume this renderer's
+		// output consecutively, with the native-color depth hook active for
+		// every intermediate bind. Never cache an SRV for later composition.
+		{
+			const ScopedRenderCPUProfile timing("Interface3D-prepasses-before-upscale", renderer->name.c_str());
+			ModelPrepasses::func(renderer);
+		}
+		TraceModelOutput(renderer, *displayTarget);
+		{
+			const ScopedRenderCPUProfile timing("Interface3D-main-before-upscale", renderer->name.c_str());
+			ModelMain::func(renderer, a_target);
+		}
+		renderedModels[renderedModelCount++] = renderer;
+		RE::BSAutoWriteLock quadsLock(renderer->cachedQuadsLock);
+		renderer->colorFXInfos.clear();
+		renderer->backgroundFXInfos.clear();
+	}
+}
+
 void NativeInterfaceUI::ReleaseResources()
 {
 	// Called by the interop resize transaction, after outstanding GPU work drains.
 	// Do not retain a former device's depth allocation across a resize/recreation.
 	nativeDepth.Restore();
 	nativeDepth = {};
+	modelFrame = UINT32_MAX;
+	renderedModelCount = 0;
 }
 
 void NativeInterfaceUI::InstallHooks()
@@ -296,6 +461,18 @@ void NativeInterfaceUI::InstallHooks()
 	// Hook the worker, not RenderPostAA's MOV DL,1 / relative tail jump.
 	const auto render = stl::detour_thunk_gateway<RenderAll>(REL::ID{ 1030129, 2222565 }, 8, "Interface3D native post-AA UI");
 	enabled = create && color && depth && render;
+	const auto renderAll = REL::ID{ 1030129, 2222565 }.address();
+	const auto prepassCall = renderAll + (isOG ? 0x92 : 0x145);
+	const auto mainCall = renderAll + (isOG ? 0x9D : 0x150);
+	if (enabled && stl::is_readable_memory(prepassCall, 5) && stl::is_readable_memory(mainCall, 5) &&
+		*reinterpret_cast<const uint8_t*>(prepassCall) == 0xE8 &&
+		*reinterpret_cast<const uint8_t*>(mainCall) == 0xE8) {
+		stl::write_thunk_call<ModelPrepasses>(prepassCall);
+		stl::write_thunk_call<ModelMain>(mainCall);
+		modelHooksInstalled = true;
+	} else {
+		logger::error("[ENB UI] Interface3D model call sites unavailable; model routing disabled");
+	}
 	if (!enabled) {
 		logger::error("[ENB UI] Incomplete Interface3D hooks; native custom path disabled");
 	}

@@ -18,6 +18,7 @@
 #include "Streamline.h"
 #include "TaggedTextureDebug.h"
 #include "Upscaling.h"
+#include "UpscalingMenu.h"
 #include "third_party/RTX40MFGUnlock/integration.h"
 
 extern bool enbLoaded;
@@ -840,6 +841,7 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	EndNativeUI();
 	NativeInterfaceUI::ReleaseResources();
 	nativeUITexture = nullptr;
+	menuComposite = nullptr;
 	sceneUISRV = nullptr;
 	interopReady = false;
 	presentOverrideFinalColor = nullptr;
@@ -1388,12 +1390,16 @@ void DX12SwapChain::EndNativeUI()
 		nativeUIWindowTargetActive = false;
 	}
 	nativeUIActive = false;
+	nativeUIIncludesScene = false;
 	ENBRenderDomain::Get().ApplySceneDimensions();
 }
 
 void DX12SwapChain::PublishNativeUIForOverlays()
 {
 	if (!nativeUIActive || nativeUIWindowTargetActive) { return; }
+	if (UpscalingMenu::IsOpen()) {
+		ResolveNativeUIForMenu();
+	}
 	// Only after engine UI/model rendering has finished. RendererWindow is
 	// also an engine input; aliasing it during Interface3D can feed UI back
 	// into model composition. Late Present overlays still need this alias.
@@ -1405,6 +1411,50 @@ void DX12SwapChain::PublishNativeUIForOverlays()
 	windowTarget.srView->AddRef();
 	windowTarget.uaView->AddRef();
 	nativeUIWindowTargetActive = true;
+}
+
+void DX12SwapChain::ResolveNativeUIForMenu()
+{
+	if (nativeUIIncludesScene || !presentOverrideFinalColor) { return; }
+	const ScopedRenderCPUProfile timing("menu-background-resolve (inclusive)");
+	// Present-time background filters expect a complete frame. Only while the
+	// framework menu is open, resolve the D3D12 scene + engine UI before its
+	// D3D11 blur runs. Normal gameplay keeps the asynchronous split UI path.
+	if (!menuComposite) {
+		D3D11_TEXTURE2D_DESC desc{};
+		nativeUITexture->resource->GetDesc(&desc);
+		desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+		menuComposite = std::make_unique<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
+	}
+	auto& command = AcquireCommandContext();
+	auto* staging = command.presentStaging.get();
+	d3d11Context->CopyResource(staging->resource11.get(), nativeUITexture->resource.get());
+	const auto inputFence = fenceValue++;
+	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), inputFence));
+	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), inputFence));
+	command.retainedPresentOverride = presentOverrideFinalColor;
+	auto* scene = command.retainedPresentOverride.get();
+	auto* output = menuComposite->resource12.get();
+	auto* input = staging->resource12.get();
+	D3D12_RESOURCE_BARRIER before[]{
+		CD3DX12_RESOURCE_BARRIER::Transition(scene, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+		CD3DX12_RESOURCE_BARRIER::Transition(input, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+		CD3DX12_RESOURCE_BARRIER::Transition(output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)
+	};
+	command.list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
+	D3D12UIComposite::GetSingleton()->Render(d3d12Device.get(), command.list.get(), output, scene, input,
+		swapChainDesc.Format, swapChainDesc.Width, swapChainDesc.Height,
+		command.index, static_cast<uint32_t>(std::size(commandContexts)));
+	for (auto& barrier : before) {
+		std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+	}
+	command.list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
+	ExecuteCommandContext(command);
+	const auto outputFence = fenceValue++;
+	DX::ThrowIfFailed(commandQueue->Signal(d3d12Fence.get(), outputFence));
+	DX::ThrowIfFailed(d3d11Context->Wait(d3d11Fence.get(), outputFence));
+	d3d11Context->CopyResource(nativeUITexture->resource.get(), menuComposite->resource11.get());
+	nativeUIIncludesScene = true;
 }
 
 bool DX12SwapChain::BeginNativeUI()
@@ -1593,7 +1643,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	auto destination = swapChainBuffers[presentedFrameIndex].get();
 	auto copySource = presentStaging->resource12.get();
 	commandContext.retainedPresentOverride = std::move(presentOverrideFinalColor);
-	auto overrideFinalColor = commandContext.retainedPresentOverride.get();
+	// The menu's D3D11 background filter has already consumed the resolved scene.
+	// Retain its resource through submission, but do not composite it a second time.
+	auto overrideFinalColor = nativeUIIncludesScene ? nullptr : commandContext.retainedPresentOverride.get();
 	const bool usePresentOverride = overrideFinalColor != nullptr;
 	const bool useComposite = usePresentOverride || enbDomain.Active();
 	if (enbDomain.Active() && upscaling->settings.enbGPUTiming) {

@@ -134,6 +134,11 @@ struct Renderer_Begin_ENBDomains
 {
 	static void thunk(RE::BSGraphics::Renderer* a_renderer, uint32_t a_window)
 	{
+		if (a_window == 0) {
+			// OG and AE increment State::frameCount inside Begin. Acquire that
+			// upcoming token before rendering; late constants reuse it without Sleep.
+			Streamline::GetSingleton()->BeginRenderFrame(Util::State_GetSingleton()->frameCount + 1);
+		}
 		g_nativeUIRenderer = a_renderer;
 		auto* swap = DX12SwapChain::GetSingleton();
 		swap->EndNativeUI();
@@ -217,6 +222,7 @@ struct IMenu_DisplayMenu_ViewportTrace
 {
 	static void thunk(RE::IMenu* a_menu, bool a_visible)
 	{
+		const ScopedRenderCPUProfile timing("Scaleform-DisplayMenu", a_menu ? a_menu->menuName.c_str() : "null");
 		if (ENBRenderDomain::Get().Active() && Upscaling::GetSingleton()->settings.enbGPUTiming) {
 			TraceScaleformViewport(a_menu);
 		}
@@ -1255,6 +1261,8 @@ namespace
 		kEarlyImageSpace,
 		kLateImageSpace,
 		kSRInput,
+		kWorldDeferred,
+		kWorldForward,
 		kCount
 	};
 
@@ -1326,7 +1334,7 @@ namespace
 				if (SUCCEEDED(startStatus) && SUCCEEDED(endStatus) && !disjoint.Disjoint && disjoint.Frequency && end >= start) {
 					constexpr std::array names{
 						"depth-override", "native-depth", "bridge-capture", "bridge-promote", "prepass-prime",
-						"early-imagespace", "late-imagespace", "SR-input"
+						"early-imagespace", "late-imagespace", "SR-input", "world-deferred", "world-forward"
 					};
 					logger::info("[ENB GPU] {}: {:.3f} ms (quality={}, frame={})",
 						names[static_cast<std::size_t>(a_phase)],
@@ -5640,6 +5648,8 @@ struct DrawWorld_Render_PreUI_DeferredPrePass
 {
 	static void thunk(struct DrawWorld* This)
 	{
+		const ScopedRenderCPUProfile cpuTiming("world-deferred (inclusive)");
+		const ScopedENBGPUTiming gpuTiming(ENBGPUPhase::kWorldDeferred);
 		auto upscaling = Upscaling::GetSingleton();
 		upscaling->OverrideSamplerStates();
 		func(This);
@@ -5653,6 +5663,8 @@ struct DrawWorld_Render_PreUI_Forward
 {
 	static void thunk(struct DrawWorld* This)
 	{
+		const ScopedRenderCPUProfile cpuTiming("world-forward (inclusive)");
+		const ScopedENBGPUTiming gpuTiming(ENBGPUPhase::kWorldForward);
 		auto upscaling = Upscaling::GetSingleton();
 
 		upscaling->OverrideSamplerStates();
@@ -6048,13 +6060,13 @@ void Upscaling::InstallHooks()
 		"Interface3D::Renderer::Create");
 
 	const auto isOG = REX::FModule::IsRuntimeOG();
+	stl::detour_thunk_gateway<Renderer_Begin_ENBDomains>(
+		REL::ID{ 288964, 2276833 }, isOG ? 8 : 6, "Renderer::Begin frame pacing and ENB domains");
 
 	if (enbLoaded) {
 		NativeInterfaceUI::InstallHooks();
 		InstallNativeENBOverlay();
 		ENBEffectDiagnostics::RegisterModule(FindENBModule());
-		stl::detour_thunk_gateway<Renderer_Begin_ENBDomains>(
-			REL::ID{ 288964, 2276833 }, isOG ? 8 : 6, "Renderer::Begin ENB domains");
 		stl::detour_thunk_gateway<UI_ScreenSpace_RenderMenus_Native>(
 			REL::ID{ 230711, 2284762 }, 5, "UI::ScreenSpace_RenderMenus native");
 		stl::detour_thunk_gateway<IMenu_DisplayMenu_ViewportTrace>(
@@ -8219,6 +8231,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	if (!upscalingTexture) {
 		return;
 	}
+	NativeInterfaceUI::RenderModelsBeforeUpscale(static_cast<uint32_t>(a_renderTargetIndex));
 
 	static auto rendererData = RE::BSGraphics::GetRendererData();
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
@@ -8313,9 +8326,12 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			std::max(1u, static_cast<uint32_t>(renderSize.y)));
 	}
 
-	if (!preparedENBInput && !(virtualENB && d3d12DLSSActive)) {
+	if (!preparedENBInput && !(virtualENB &&
+		(d3d12DLSSActive || upscaleMethod == UpscaleMethod::kSpatialFallback))) {
 		// Non-ENB and native-AA paths already satisfy the ordinary render-rect
 		// contract. ENB+DRS reaches here only if the guarded conversion failed.
+		// ENB spatial fallback snapshots frameBufferResource directly below;
+		// its full-frame copy to upscalingTexture was never consumed.
 		context->CopyResource(upscalingTexture->resource.get(), frameBufferResource);
 	}
 
@@ -8374,7 +8390,8 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 				frameGenerationMotionVectorTexture &&
 				frameGenerationMotionVectorTexture->srv;
 			const bool usePatchedDepth =
-				upscaleMethod == UpscaleMethod::kDisabled &&
+				(upscaleMethod == UpscaleMethod::kDisabled ||
+					(virtualENB && upscaleMethod == UpscaleMethod::kDLSS)) &&
 				usePatchedMotionVectors &&
 				frameGenerationDepthTexture &&
 				frameGenerationDepthTexture->srv;
