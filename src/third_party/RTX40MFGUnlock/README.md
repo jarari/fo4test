@@ -4,7 +4,7 @@ This directory contains code derived from Michael Robles' **RTX40MFG-Unlock**
 project:
 
 - Upstream repository: <https://github.com/dashdogy/RTX40MFG-Unlock>
-- Imported revision: **v1.2**, `767b9e916023a2a2157dacdd40c22deeaad1aac9`
+- Imported revision: **v1.2.1**, `7296840a6f0c0a7dbb436958486bd2a77aa216be`
 - Upstream license: MIT; see [LICENSE](LICENSE)
 
 Credit for the DLSS-G wrapper/NGX patch signatures, provider validation, and
@@ -16,6 +16,9 @@ Ada midpoint correction belongs to the RTX40MFG-Unlock project and its author.
 are vendored without source changes (apart from line endings) from that revision.
 This includes the validated 310.1–310.9 provider profiles, payload/layout checks,
 DLSS-G versus DirectSR identity checks, and 1/3/5 generated-frame wrapper limits.
+The v1.2.1 hotfix admits exactly DLSS-G 310.9.1 using the existing verified
+310.9 temporal profile; unknown 310.9.2 remains rejected. The host integration
+and loader adaptation are unchanged from the v1.2 import.
 `integration.*` and `loader_discovery.cpp` adapt discovery and fail-closed pattern
 patching from upstream `patcher.cpp` to this Fallout 4 F4SE plugin.
 
