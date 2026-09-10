@@ -4197,6 +4197,59 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 	return fsrD3D12InputsReady[frameIndex];
 }
 
+void Upscaling::EnsureNRGuideResources(UINT width, UINT height, bool afterSR)
+{
+	D3D11_TEXTURE2D_DESC motionDesc{};
+	motionDesc.Width = width;
+	motionDesc.Height = height;
+	motionDesc.MipLevels = motionDesc.ArraySize = motionDesc.SampleDesc.Count = 1;
+	motionDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+	motionDesc.Usage = D3D11_USAGE_DEFAULT;
+	motionDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	motionDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	auto depthDesc = motionDesc;
+	depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	std::array<bool, kDX12FrameCount> replaceMotion{}, replaceDepth{};
+	bool changed = false;
+	bool replacingLiveResource = false;
+	for (size_t i = 0; i < kDX12FrameCount; ++i) {
+		replaceMotion[i] = !nrMotionD3D12[i] || !SharedTextureMatches(nrMotionSharedTextures[i], motionDesc);
+		replaceDepth[i] = afterSR && (!nrDepthD3D12[i] || !SharedTextureMatches(nrDepthSharedTextures[i], depthDesc));
+		changed |= replaceMotion[i] || replaceDepth[i];
+		replacingLiveResource |= (replaceMotion[i] && (nrMotionSharedTextures[i] || nrMotionD3D12[i])) ||
+			(replaceDepth[i] && (nrDepthSharedTextures[i] || nrDepthD3D12[i]));
+	}
+	if (!changed) { return; }
+
+	// Complete the entire slot set before permitting NR again. Lazy replacement
+	// in CaptureNRMotion used to drain the GPU again on later slots, after the
+	// new feature had already been created and evaluation had resumed.
+	DeferNRUntilPresent(false);
+	nrMotionReady.fill(false);
+	nrMotionHistoryValid = false;
+	if (replacingLiveResource && !DX12SwapChain::GetSingleton()->WaitForInteropIdle()) {
+		DX::ThrowIfFailed(DXGI_ERROR_DEVICE_REMOVED);
+	}
+	for (size_t i = 0; i < kDX12FrameCount; ++i) {
+		if (replaceMotion[i]) {
+			nrMotionD3D12[i] = nullptr;
+			nrMotionSharedTextures[i].reset();
+		}
+		if (replaceDepth[i]) {
+			nrDepthD3D12[i] = nullptr;
+			nrDepthSharedTextures[i].reset();
+		}
+	}
+	for (size_t i = 0; i < kDX12FrameCount; ++i) {
+		if (replaceMotion[i]) {
+			EnsureSharedD3D12Texture(this, motionDesc, nrMotionSharedTextures[i], nrMotionD3D12[i], true, true);
+		}
+		if (replaceDepth[i]) {
+			EnsureSharedD3D12Texture(this, depthDesc, nrDepthSharedTextures[i], nrDepthD3D12[i], true, true);
+		}
+	}
+}
+
 bool Upscaling::CaptureNRMotion(UINT slot, UINT width, UINT height)
 {
 	auto* data = RE::BSGraphics::GetRendererData();
@@ -4231,15 +4284,6 @@ void main(uint3 id : SV_DispatchThreadID) {
 		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		if (FAILED(device->CreateBuffer(&desc, nullptr, nrMotionConstants.put()))) { return false; }
 	}
-	D3D11_TEXTURE2D_DESC desc{};
-	desc.Width = width;
-	desc.Height = height;
-	desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
-	// RG32F with this shared-resource contract fails CreateTexture2D with
-	// E_INVALIDARG. Use the same shareable RG16F format as the existing MV path.
-	desc.Format = DXGI_FORMAT_R16G16_FLOAT;
-	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-	EnsureSharedD3D12Texture(this, desc, nrMotionSharedTextures[slot], nrMotionD3D12[slot], true, true);
 	// The shared helper creates the resource/UAV, not an SRV. Raw SR guides
 	// previously only needed CopySubresourceRegion and therefore had no SRV.
 	if (!dlssMotionVectorSharedTextures[slot]->srv) {
@@ -4330,20 +4374,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		if (FAILED(device->CreateBuffer(&desc, nullptr, nrAfterMotionConstants.put()))) { return false; }
 	}
-	D3D11_TEXTURE2D_DESC desc{};
 	const float2 outputSize = displaySize;
-	desc.Width = static_cast<UINT>(outputSize.x);
-	desc.Height = static_cast<UINT>(outputSize.y);
-	desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
-	// RG32F with this shared-resource contract fails CreateTexture2D with
-	// E_INVALIDARG. Use the same shareable RG16F format as the existing MV path.
-	desc.Format = DXGI_FORMAT_R16G16_FLOAT;
-	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-	EnsureSharedD3D12Texture(this, desc, nrMotionSharedTextures[slot], nrMotionD3D12[slot], true, true);
 	{
-		auto depthDesc = desc;
-		depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
-		EnsureSharedD3D12Texture(this, depthDesc, nrDepthSharedTextures[slot], nrDepthD3D12[slot], true, true);
 		if (!dlssDepthSharedTextures[slot]->srv) {
 			D3D11_SHADER_RESOURCE_VIEW_DESC view{};
 			view.Format = DXGI_FORMAT_R32_FLOAT;
@@ -4396,7 +4428,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 	context->CSSetShaderResources(0, 2, srvs);
 	context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
 	context->CSSetShader(nrAfterMotionCS.get(), nullptr, 0);
-	context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+	context->Dispatch((static_cast<UINT>(outputSize.x) + 7) / 8, (static_cast<UINT>(outputSize.y) + 7) / 8, 1);
 	// The shared helper clears slot 0 only; detach the added depth bindings
 	// before either API consumes these resources.
 	ID3D11ShaderResourceView* nullSRV = nullptr;
@@ -4701,8 +4733,8 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		}
 
 		if (useD3D12DLSS) {
-			// Never feed FG's alpha repair or dilated fallback into temporal NR/SR.
-			// These writes use the same frame-slot wait and submission as color/FG.
+			// Keep a separate raw guide copy for NR. SR continues to consume the
+			// original dlssg guide resources, matching the 1.5.3 path.
 			auto* engineMotion = reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMotionVectors)].texture);
 			auto* engineDepth = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
 			auto* copyDepth = GetCopyDepthToFrameGenerationCS();
@@ -4733,13 +4765,16 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			context->CSSetShader(copyDepth, nullptr, 0);
 			context->Dispatch((rawMotionDesc.Width + 7) / 8, (rawMotionDesc.Height + 7) / 8, 1);
 			ClearDLSSGComputeBindings(context);
-			dlssD3D12MotionVectorFormats[frameIndex] = rawMotionDesc.Format;
-			dlssD3D12DepthFormats[frameIndex] = sharedDepthDesc.Format;
-			if (IsDLSSNRReady()) {
+			if (settings.dlssNREnabled != 0) {
 				try {
-					nrMotionReady[frameIndex] = nrAfterSR[frameIndex] ?
-						CaptureNRAfterSRGuides(frameIndex, rawMotionDesc.Width, rawMotionDesc.Height, a_displaySize) :
-						CaptureNRMotion(frameIndex, rawMotionDesc.Width, rawMotionDesc.Height);
+					const bool afterSR = nrAfterSR[frameIndex];
+					EnsureNRGuideResources(afterSR ? static_cast<UINT>(a_displaySize.x) : rawMotionDesc.Width,
+						afterSR ? static_cast<UINT>(a_displaySize.y) : rawMotionDesc.Height, afterSR);
+					if (IsDLSSNRReady()) {
+						nrMotionReady[frameIndex] = afterSR ?
+							CaptureNRAfterSRGuides(frameIndex, rawMotionDesc.Width, rawMotionDesc.Height, a_displaySize) :
+							CaptureNRMotion(frameIndex, rawMotionDesc.Width, rawMotionDesc.Height);
+					}
 				} catch (const std::exception& e) {
 					// A failed optional NR conversion must not discard valid SR inputs.
 					nrMotionHistoryValid = false;
@@ -4779,7 +4814,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		}
 
 		static uint64_t fsrFrameGenerationFrameID = 0;
-		dlssgInputRenderSizes[frameIndex] = useD3D12DLSS ? a_renderSize : dlssgInputSize;
+		dlssgInputRenderSizes[frameIndex] = dlssgInputSize;
 		dlssgInputDisplaySizes[frameIndex] = a_displaySize;
 		dlssgInputFrameTokenIndices[frameIndex] = streamline->GetCurrentFrameTokenIndex();
 		dlssgInputsReady[frameIndex] = useDLSSGThisFrame;

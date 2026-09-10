@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cwchar>
 #include <iterator>
+#include <mutex>
 #include <string_view>
 #include <type_traits>
 
@@ -17,6 +18,54 @@ namespace
 
 	std::atomic<PFun_GetModuleFileNameW> g_originalGetModuleFileNameW = nullptr;
 	std::atomic<HMODULE> g_spoofedCallerModule = nullptr;
+
+	// NGX allocation callbacks have no user-data argument. Retain the owning
+	// backend's device until its features and runtime have finished shutdown.
+	std::mutex g_nrAllocationMutex;
+	nvngx::dlss_nr::D3D12Backend* g_nrAllocationOwner = nullptr;
+	Microsoft::WRL::ComPtr<ID3D12Device> g_nrAllocationDevice;
+
+	void NVSDK_CONV AllocateNRResource(D3D12_RESOURCE_DESC* a_desc, int a_state,
+		D3D12_HEAP_PROPERTIES* a_heap, ID3D12Resource** a_output)
+	{
+		if (!a_output) { return; }
+		*a_output = nullptr;
+		Microsoft::WRL::ComPtr<ID3D12Device> device;
+		{
+			std::scoped_lock lock(g_nrAllocationMutex);
+			device = g_nrAllocationDevice;
+		}
+		if (!device || !a_desc || !a_heap) { return; }
+		// Match NGX's committed allocation, including its heap, node masks,
+		// resource flags and initial state. Upload/readback allocations stay as-is.
+		const auto result = device->CreateCommittedResource(a_heap, D3D12_HEAP_FLAG_NONE,
+			a_desc, static_cast<D3D12_RESOURCE_STATES>(a_state), nullptr, IID_PPV_ARGS(a_output));
+		if (FAILED(result)) {
+			logger::warn("[DLSS-NR Direct] Resource allocation failed hr=0x{:08X}", static_cast<uint32_t>(result));
+			return;
+		}
+		if (a_heap->Type == D3D12_HEAP_TYPE_DEFAULT) {
+			// The transition ETL ties a 146 MiB NR internal buffer's promotion
+			// into local VRAM to evaluation dropping from ~68 ms to ~8 ms.
+			// These repeatedly accessed working buffers should outlive cold game
+			// allocations in VRAM. This is a residency hint, not a memory pin.
+			Microsoft::WRL::ComPtr<ID3D12Device1> residencyDevice;
+			if (SUCCEEDED(device.As(&residencyDevice))) {
+				ID3D12Pageable* resource = *a_output;
+				constexpr auto priority = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
+				const auto priorityResult = residencyDevice->SetResidencyPriority(1, &resource, &priority);
+				if (FAILED(priorityResult)) {
+					logger::warn("[DLSS-NR Direct] Residency priority failed hr=0x{:08X}", static_cast<uint32_t>(priorityResult));
+				}
+			}
+		}
+	}
+
+	void NVSDK_CONV ReleaseNRResource(IUnknown* a_resource)
+	{
+		// Feature teardown already drains GPU use. Preserve immediate NR release.
+		if (a_resource) { a_resource->Release(); }
+	}
 
 	DWORD WINAPI NVSDK_NGX_GetModuleFileNameW_Proxy(HMODULE a_module, LPWSTR a_filename, DWORD a_size)
 	{
@@ -409,6 +458,15 @@ namespace nvngx::dlss_nr
 		NVSDK_NGX_Parameter* a_parameters,
 		const D3D12EvaluationParameters& a_evaluationParameters)
 	{
+		{
+			std::scoped_lock lock(g_nrAllocationMutex);
+			if (!g_nrAllocationOwner || g_nrAllocationOwner == this) {
+				g_nrAllocationOwner = this;
+				g_nrAllocationDevice = device_;
+				a_parameters->Set(NVSDK_NGX_Parameter_ResourceAllocCallback, reinterpret_cast<void*>(&AllocateNRResource));
+				a_parameters->Set(NVSDK_NGX_Parameter_ResourceReleaseCallback, reinterpret_cast<void*>(&ReleaseNRResource));
+			}
+		}
 		const auto upscaling =
 			a_evaluationParameters.inputWidth != a_evaluationParameters.outputWidth ||
 			a_evaluationParameters.inputHeight != a_evaluationParameters.outputHeight;
@@ -995,6 +1053,13 @@ namespace nvngx::dlss_nr
 			}
 		}
 		initialized_ = false;
+		{
+			std::scoped_lock lock(g_nrAllocationMutex);
+			if (g_nrAllocationOwner == this) {
+				g_nrAllocationOwner = nullptr;
+				g_nrAllocationDevice.Reset();
+			}
+		}
 
 		RestoreModuleNameHook();
 		if (runtime_) {
