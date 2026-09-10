@@ -135,7 +135,7 @@ public:
 	// DLSS Operations
 	// ========================================
 
-	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened);
+	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened);
 
 	/**
 	 * @brief Update Streamline constants for current frame

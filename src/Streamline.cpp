@@ -1022,9 +1022,14 @@ void Streamline::ClearDLSSGResourceTags(ID3D12GraphicsCommandList* a_commandList
 	const sl::Extent fullExtent{
 		0,
 		0,
-		dx12->IsReady() ? dx12->swapChainDesc.Width : static_cast<uint32_t>(gameViewport->screenWidth),
-		dx12->IsReady() ? dx12->swapChainDesc.Height : static_cast<uint32_t>(gameViewport->screenHeight)
+		dx12->swapChainDesc.Width ? dx12->swapChainDesc.Width : static_cast<uint32_t>(gameViewport->screenWidth),
+		dx12->swapChainDesc.Height ? dx12->swapChainDesc.Height : static_cast<uint32_t>(gameViewport->screenHeight)
 	};
+	if (fullExtent.width == 0 || fullExtent.height == 0) {
+		// Do not submit an optional 0x0 backbuffer extent while the proxy
+		// swapchain is between creation and its first ResizeBuffers.
+		return;
+	}
 
 	sl::ResourceTag backbufferTag = { nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle{}, &fullExtent };
 	sl::ResourceTag hudlessTag = { nullptr, sl::kBufferTypeHUDLessColor, sl::ResourceLifecycle{} };
@@ -1304,7 +1309,7 @@ bool Streamline::ApplyNISSharpen(ID3D11Resource* a_inputColor, ID3D11Resource* a
 bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resource* a_outputColor, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness)
 {
 	const auto sharpness = std::clamp(a_sharpness, 0.0f, 1.0f);
-	if (sharpness <= 0.0f || !featureNIS || !slNISSetOptions || !slEvaluateFeature || !slSetTagForFrame || !a_inputColor || !a_outputColor || !a_commandList || !a_frameToken) {
+	if (sharpness <= 0.0f || !featureNIS || !slNISSetOptions || !slEvaluateFeature || !a_inputColor || !a_outputColor || !a_commandList || !a_frameToken) {
 		return false;
 	}
 
@@ -1316,16 +1321,13 @@ bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resour
 	sl::Resource colorIn = { sl::ResourceType::eTex2d, a_inputColor, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 	sl::Resource colorOut = { sl::ResourceType::eTex2d, a_outputColor, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 	sl::ResourceTag resourceTags[] = {
-		{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent },
-		{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &fullExtent }
+		{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &fullExtent },
+		{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &fullExtent }
 	};
-	if (SL_FAILED(result, slSetTagForFrame(*a_frameToken, viewport, resourceTags, _countof(resourceTags), a_commandList))) {
-		logger::warn("[Streamline] Could not tag D3D12 NIS sharpen resources: {}", magic_enum::enum_name(result));
-		return false;
-	}
-
+	// These slot-owned colors are consumed on this list. Local tags avoid a
+	// volatile input clone and do not replace SR's or FG's global tags.
 	sl::ViewportHandle view(viewport);
-	const sl::BaseStructure* inputs[] = { &view };
+	const sl::BaseStructure* inputs[] = { &view, &resourceTags[0], &resourceTags[1] };
 	if (SL_FAILED(result, slEvaluateFeature(sl::kFeatureNIS, *a_frameToken, inputs, _countof(inputs), a_commandList))) {
 		logger::warn("[Streamline] D3D12 NIS sharpen evaluate failed: {}", magic_enum::enum_name(result));
 		return false;
@@ -1335,17 +1337,16 @@ bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resour
 	return true;
 }
 
-bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_transparencyMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened)
+bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened)
 {
 	if (a_sharpened) {
 		*a_sharpened = false;
 	}
 
-	if (!slEvaluateFeature || !slSetTagForFrame || !a_color || !a_outputColor || !a_motionVectors || !a_depth || !a_commandList || !a_frameToken) {
+	if (!slEvaluateFeature || !a_color || !a_outputColor || !a_motionVectors || !a_depth || !a_commandList || !a_frameToken) {
 		logger::warn(
-			"[Streamline] D3D12 upscaling unavailable before tagging evaluate={} setTag={} color={} output={} mvec={} depth={} commandList={} frameToken={}",
+			"[Streamline] D3D12 upscaling unavailable evaluate={} color={} output={} mvec={} depth={} commandList={} frameToken={}",
 			static_cast<bool>(slEvaluateFeature),
-			static_cast<bool>(slSetTagForFrame),
 			static_cast<void*>(a_color),
 			static_cast<void*>(a_outputColor),
 			static_cast<void*>(a_motionVectors),
@@ -1408,8 +1409,7 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 
 	sl::Resource depth = { sl::ResourceType::eTex2d, a_depth, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 	sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectors, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
-	sl::Resource biasCurrentColor = { sl::ResourceType::eTex2d, a_transparencyMask, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
-	sl::Resource transparency = { sl::ResourceType::eTex2d, a_transparencyMask, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
+	sl::Resource animatedTexture = { sl::ResourceType::eTex2d, a_animatedTextureMask, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 
 	const auto evaluate = [&](
 		bool a_useDLSSNR,
@@ -1452,41 +1452,26 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		sl::Resource colorIn = { sl::ResourceType::eTex2d, a_featureColor, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 		sl::Resource colorOut = { sl::ResourceType::eTex2d, a_featureOutput, nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON };
 		sl::ResourceTag resourceTags[] = {
-			{ &colorIn, inputColorType, sl::ResourceLifecycle::eOnlyValidNow, &a_colorExtent },
-			{ &colorOut, outputColorType, sl::ResourceLifecycle::eOnlyValidNow, &a_outputExtent },
+			{ &colorIn, inputColorType, sl::ResourceLifecycle::eValidUntilEvaluate, &a_colorExtent },
+			{ &colorOut, outputColorType, sl::ResourceLifecycle::eValidUntilEvaluate, &a_outputExtent },
 			{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent },
 			{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &lowResExtent },
-			{ &biasCurrentColor, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent },
-			{ &transparency, sl::kBufferTypeTransparencyHint, sl::ResourceLifecycle::eOnlyValidNow, &lowResExtent }
+			{ &animatedTexture, sl::kBufferTypeAnimatedTextureHint, sl::ResourceLifecycle::eValidUntilEvaluate, &lowResExtent }
 		};
-		const auto numResourceTags = static_cast<uint32_t>(a_useDLSSNR || !a_transparencyMask ? _countof(resourceTags) - 2 : _countof(resourceTags));
-		if (SL_FAILED(result, slSetTagForFrame(*a_frameToken, viewport, resourceTags, numResourceTags, a_commandList))) {
-			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
-				logger::warn(
-					"[Streamline] Could not tag D3D12 {} resources: {} token={} tags={} input={}x{} output={}x{} color={} outputResource={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
-					featureName,
-					magic_enum::enum_name(result),
-					static_cast<uint32_t>(*a_frameToken),
-					numResourceTags,
-					a_colorExtent.width,
-					a_colorExtent.height,
-					a_outputExtent.width,
-					a_outputExtent.height,
-					static_cast<void*>(a_featureColor),
-					static_cast<void*>(a_featureOutput),
-					static_cast<void*>(a_motionVectors),
-					static_cast<void*>(a_depth),
-					static_cast<void*>(a_transparencyMask),
-					magic_enum::enum_name(a_colorFormat),
-					magic_enum::enum_name(a_motionVectorFormat),
-					magic_enum::enum_name(a_depthFormat));
-			}
-			return false;
-		}
-
+		// A Pipboy history hint is not an alpha/transparency classification.
+		// Keep this local to SR; NR and FG must not inherit this resource.
+		const auto numResourceTags = static_cast<uint32_t>(a_useDLSSNR || !a_animatedTextureMask ? _countof(resourceTags) - 1 : _countof(resourceTags));
+		// Evaluation borrows these resources on the same command list. Global
+		// eOnlyValidNow tags make SL allocate/copy color through its resource
+		// pool, including the native-sized NR intermediate in Before SR.
+		// Slot fences already protect GPU use. Keep SR guides local so the
+		// separate FG tags remain owned by the D3D12 TagDLSSGResources overload.
 		sl::ViewportHandle view(viewport);
-		const sl::BaseStructure* inputs[] = { &view };
-		if (SL_FAILED(result, slEvaluateFeature(feature, *a_frameToken, inputs, _countof(inputs), a_commandList))) {
+		const sl::BaseStructure* inputs[] = {
+			&view, &resourceTags[0], &resourceTags[1], &resourceTags[2],
+			&resourceTags[3], &resourceTags[4]
+		};
+		if (SL_FAILED(result, slEvaluateFeature(feature, *a_frameToken, inputs, numResourceTags + 1, a_commandList))) {
 			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
 				logger::warn(
 					"[Streamline] D3D12 {} evaluate failed: {} token={} input={}x{} output={}x{} color={} outputResource={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
@@ -1501,7 +1486,7 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 					static_cast<void*>(a_featureOutput),
 					static_cast<void*>(a_motionVectors),
 					static_cast<void*>(a_depth),
-					static_cast<void*>(a_transparencyMask),
+					static_cast<void*>(a_animatedTextureMask),
 					magic_enum::enum_name(a_colorFormat),
 					magic_enum::enum_name(a_motionVectorFormat),
 					magic_enum::enum_name(a_depthFormat));
@@ -1811,10 +1796,7 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 	slConstants.reset = resetHistory ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	slConstants.motionVectors3D = sl::Boolean::eFalse;
 	slConstants.orthographicProjection = sl::Boolean::eFalse;
-	// The normal path copies engine MV (with first-person repair), not a
-	// complete nearest-depth dilation. The fallback's selective 5x5 filter
-	// also does not satisfy the fully-dilated contract.
-	slConstants.motionVectorsDilated = sl::Boolean::eFalse;
+	slConstants.motionVectorsDilated = sl::Boolean::eTrue;
 	slConstants.motionVectorsJittered = sl::Boolean::eFalse;
 
 	if (SL_FAILED(res, slSetConstants(slConstants, *frameToken, viewport))) {
