@@ -8,6 +8,7 @@
 
 #include "DX12SwapChain.h"
 #include "Util.h"
+#include "PipboyTemporalMask.h"
 
 namespace
 {
@@ -522,6 +523,8 @@ bool FidelityFX::UpscaleD3D12(
 	ID3D12Resource* a_depth,
 	ID3D12Resource* a_reactiveMask,
 	ID3D12Resource* a_opaqueOnlyColor,
+	ID3D12Resource* a_pipboyMask,
+	uint32_t a_frameSlot,
 	float2 a_jitter,
 	float2 a_renderSize,
 	float2 a_displaySize,
@@ -555,9 +558,9 @@ bool FidelityFX::UpscaleD3D12(
 	lastFrameTime = currentFrameTime;
 
 	auto reactiveResource = ffxApiGetResourceDX12(nullptr, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-	if (a_reactiveMask && a_opaqueOnlyColor) {
+	if (a_reactiveMask && (a_opaqueOnlyColor || a_pipboyMask)) {
 		bool reactiveMaskGenerated = false;
-		if (contextConsumesReactiveMask) {
+		if (contextConsumesReactiveMask && a_opaqueOnlyColor) {
 			ffx::DispatchDescUpscaleGenerateReactiveMask reactiveDispatch{};
 			reactiveDispatch.commandList = a_commandList;
 			reactiveDispatch.colorOpaqueOnly = ffxApiGetResourceDX12(a_opaqueOnlyColor, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
@@ -577,6 +580,10 @@ bool FidelityFX::UpscaleD3D12(
 			}
 		}
 
+		if (contextConsumesReactiveMask && a_pipboyMask) {
+			reactiveMaskGenerated = PipboyTemporalMask::MergeReactive(a_device, a_commandList,
+				a_pipboyMask, a_reactiveMask, a_frameSlot, reactiveMaskGenerated) || reactiveMaskGenerated;
+		}
 		const auto reactiveReadBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
 			a_reactiveMask,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

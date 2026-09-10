@@ -92,6 +92,8 @@ public:
 		ID3D12Resource* a_depth,
 		ID3D12Resource* a_reactiveMask,
 		ID3D12Resource* a_opaqueOnlyColor,
+		ID3D12Resource* a_pipboyMask,
+		uint32_t a_frameSlot,
 		float2 a_jitter,
 		float2 a_renderSize,
 		float2 a_displaySize,

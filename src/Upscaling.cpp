@@ -20,6 +20,7 @@
 #include "NativeInterfaceUI.h"
 #include "Screenshot.h"
 #include "SceneReShade.h"
+#include "PipboyTemporalMask.h"
 
 extern bool enbLoaded;
 
@@ -1533,6 +1534,9 @@ struct DrawWorld_Imagespace
 		// temporal requests/jitter throughout a frozen menu.
 		if (g_upscalingUpdateFrame != Util::State_GetSingleton()->frameCount) {
 			Upscaling::GetSingleton()->UpdateUpscaling();
+		}
+		if (!EngineOwnsFrozenBackground()) {
+			PipboyTemporalMask::Capture();
 		}
 		func(This);
 
@@ -4038,6 +4042,36 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	}
 }
 
+void Upscaling::CopyPipboyMaskForSR(uint32_t slot, UINT width, UINT height)
+{
+	// Called only after the existing shared-input slot wait. No new CPU wait.
+	pipboyMaskReady[slot] = false;
+	auto* source = PipboyTemporalMask::Current(width, height);
+	if (!source) return;
+	try {
+		D3D11_TEXTURE2D_DESC desc{};
+		source->GetDesc(&desc);
+		desc.Width = width;
+		desc.Height = height;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		EnsureSharedD3D12Texture(this, desc, pipboyMaskSharedTextures[slot], pipboyMaskD3D12[slot], false);
+		const D3D11_BOX box{ 0, 0, 0, width, height, 1 };
+		auto* context = reinterpret_cast<ID3D11DeviceContext*>(RE::BSGraphics::GetRendererData()->context);
+		context->CopySubresourceRegion(pipboyMaskSharedTextures[slot]->resource.get(), 0, 0, 0, 0, source, 0, &box);
+		pipboyMaskReady[slot] = true;
+		static UINT loggedWidth = 0;
+		static UINT loggedHeight = 0;
+		if (loggedWidth != width || loggedHeight != height) {
+			logger::info("[Pipboy SR] temporal mask shared for SR slot={} extent={}x{} d3d12={}",
+				slot, width, height, static_cast<void*>(pipboyMaskD3D12[slot].get()));
+			loggedWidth = width;
+			loggedHeight = height;
+		}
+	} catch (const std::exception& e) {
+		logger::warn("[Pipboy SR] Shared mask unavailable: {}", e.what());
+	}
+}
+
 bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTexture, float2 a_jitter, float2 a_renderSize, float2 a_displaySize)
 {
 	if (!upscalingTexture || !DX12SwapChain::GetSingleton()->IsReady()) {
@@ -4110,6 +4144,7 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 	reactiveDesc.Usage = D3D11_USAGE_DEFAULT;
 	reactiveDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 	EnsureSharedD3D12Texture(this, reactiveDesc, fsrReactiveMaskSharedTextures[frameIndex], fsrReactiveMaskD3D12[frameIndex], true);
+	CopyPipboyMaskForSR(frameIndex, reactiveDesc.Width, reactiveDesc.Height);
 
 	if (!a_motionVectorTexture) {
 		fsrD3D12InputsReady[frameIndex] = false;
@@ -4610,6 +4645,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			// not a transparency mask. Leave optional hints absent rather than
 			// treating tonemapping/exposure changes as transparent geometry.
 			dlssD3D12TransparencyMaskReady[frameIndex] = false;
+			CopyPipboyMaskForSR(frameIndex, static_cast<UINT>(a_renderSize.x), static_cast<UINT>(a_renderSize.y));
 		} else {
 			dlssD3D12InputsReady[frameIndex] = false;
 			dlssD3D12TransparencyMaskReady[frameIndex] = false;
@@ -4864,18 +4900,18 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 	auto* dlssSharpenedOutput = dlssSharpenedD3D12[a_frameIndex].get();
 	auto* motionVectors = dlssMotionVectorD3D12[a_frameIndex].get();
 	auto* depth = dlssDepthD3D12[a_frameIndex].get();
-	auto* transparencyMask = dlssD3D12TransparencyMaskReady[a_frameIndex] ? dlssTransparencyMaskD3D12[a_frameIndex].get() : nullptr;
+	auto* animatedTextureMask = pipboyMaskReady[a_frameIndex] ? pipboyMaskD3D12[a_frameIndex].get() : nullptr;
 	if (!dlssInput || !dlssOutput || !motionVectors || !depth || !a_commandList) {
 		logger::warn(
-			"[Upscaling] D3D12 DLSS inputs missing frameIndex={} input={} output={} mvec={} depth={} commandList={} transparencyReady={} transparency={} tokenIndex={} render={}x{} display={}x{} formats color={} mvec={} depth={}",
+			"[Upscaling] D3D12 DLSS inputs missing frameIndex={} input={} output={} mvec={} depth={} commandList={} pipboyMaskReady={} animatedTexture={} tokenIndex={} render={}x{} display={}x{} formats color={} mvec={} depth={}",
 			a_frameIndex,
 			static_cast<void*>(dlssInput),
 			static_cast<void*>(dlssOutput),
 			static_cast<void*>(motionVectors),
 			static_cast<void*>(depth),
 			static_cast<void*>(a_commandList),
-			dlssD3D12TransparencyMaskReady[a_frameIndex],
-			static_cast<void*>(transparencyMask),
+			pipboyMaskReady[a_frameIndex],
+			static_cast<void*>(animatedTextureMask),
 			dlssgInputFrameTokenIndices[a_frameIndex],
 			dlssgInputRenderSizes[a_frameIndex].x,
 			dlssgInputRenderSizes[a_frameIndex].y,
@@ -4926,7 +4962,7 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 		useSharpenedOutput || useNeuralOutput ? dlssSharpenedOutput : nullptr,
 		motionVectors,
 		depth,
-		transparencyMask,
+		animatedTextureMask,
 		a_commandList,
 		frameToken,
 		dlssgInputRenderSizes[a_frameIndex],
@@ -4966,14 +5002,14 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 		ClearFeatureRequestFailure(FeatureRequest::kDLSS);
 	} else {
 		logger::warn(
-			"[Upscaling] D3D12 DLSS evaluate returned false frameIndex={} token={} input={} output={} mvec={} depth={} transparency={} render={}x{} display={}x{} formats color={} mvec={} depth={}",
+			"[Upscaling] D3D12 DLSS evaluate returned false frameIndex={} token={} input={} output={} mvec={} depth={} animatedTexture={} render={}x{} display={}x{} formats color={} mvec={} depth={}",
 			a_frameIndex,
 			static_cast<uint32_t>(*frameToken),
 			static_cast<void*>(dlssInput),
 			static_cast<void*>(dlssOutput),
 			static_cast<void*>(motionVectors),
 			static_cast<void*>(depth),
-			static_cast<void*>(transparencyMask),
+			static_cast<void*>(animatedTextureMask),
 			dlssgInputRenderSizes[a_frameIndex].x,
 			dlssgInputRenderSizes[a_frameIndex].y,
 			dlssgInputDisplaySizes[a_frameIndex].x,
@@ -4998,6 +5034,7 @@ bool Upscaling::EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint3
 	auto* depth = fsrDepthD3D12[a_frameIndex].get();
 	auto* opaqueOnly = fsrOpaqueOnlyD3D12[a_frameIndex].get();
 	auto* reactiveMask = fsrReactiveMaskD3D12[a_frameIndex].get();
+	auto* pipboyMask = pipboyMaskReady[a_frameIndex] ? pipboyMaskD3D12[a_frameIndex].get() : nullptr;
 	if (!color || !output || !motionVectors || !depth || !a_commandList) {
 		fsrD3D12InputsReady[a_frameIndex] = false;
 		ReportFeatureRequestFailure(FeatureRequest::kFSR, "D3D12 FSR inputs");
@@ -5013,6 +5050,10 @@ bool Upscaling::EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint3
 	beforeDispatch[beforeDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	if (opaqueOnly && reactiveMask) {
 		beforeDispatch[beforeDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(opaqueOnly, D3D12_RESOURCE_STATE_COMMON, shaderReadState);
+	}
+	if (reactiveMask && (opaqueOnly || pipboyMask)) {
+		// FSR's reactive generation and the optional Pipboy merge both write
+		// this resource before the SDK consumes it as a read-only input.
 		beforeDispatch[beforeDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(reactiveMask, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 	}
 	a_commandList->ResourceBarrier(beforeDispatchCount, beforeDispatch);
@@ -5026,6 +5067,8 @@ bool Upscaling::EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint3
 		depth,
 		reactiveMask,
 		opaqueOnly,
+		pipboyMask,
+		a_frameIndex,
 		fsrInputJitters[a_frameIndex],
 		fsrInputRenderSizes[a_frameIndex],
 		fsrInputDisplaySizes[a_frameIndex],
@@ -5039,6 +5082,8 @@ bool Upscaling::EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint3
 	afterDispatch[afterDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
 	if (opaqueOnly && reactiveMask) {
 		afterDispatch[afterDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(opaqueOnly, shaderReadState, D3D12_RESOURCE_STATE_COMMON);
+	}
+	if (reactiveMask && (opaqueOnly || pipboyMask)) {
 		afterDispatch[afterDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(reactiveMask, shaderReadState, D3D12_RESOURCE_STATE_COMMON);
 	}
 	a_commandList->ResourceBarrier(afterDispatchCount, afterDispatch);
@@ -5223,6 +5268,8 @@ void Upscaling::DestroyUpscalingResources(bool a_preserveNativeNR, bool a_intero
 	nrMotionReady.fill(false);
 	nrMotionHistoryValid = false;
 	fsrDepthCaptureFrames.fill(0);
+	PipboyTemporalMask::Release();
+	pipboyMaskReady.fill(false);
 	RetireD3D11Texture(upscalingTexture);
 	RetireD3D11Texture(dlssOutputTexture);
 	RetireD3D11Texture(spatialFallbackTexture);
@@ -5235,6 +5282,7 @@ void Upscaling::DestroyUpscalingResources(bool a_preserveNativeNR, bool a_intero
 	frameGenerationPreAlphaFrame = 0;
 	frameGenerationBuffersReady = false;
 	for (std::size_t i = 0; i < dlssgInputsReady.size(); ++i) {
+		RetireSharedD3D12Texture(pipboyMaskSharedTextures[i], pipboyMaskD3D12[i]);
 		RetireSharedD3D12Texture(dlssInputSharedTextures[i], dlssInputD3D12[i]);
 		if (!a_preserveNativeNR) {
 			RetireSharedD3D12Texture(dlssSharpenedSharedTextures[i], dlssSharpenedD3D12[i]);

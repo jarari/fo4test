@@ -35,10 +35,9 @@ void ENBRenderDomain::Initialize(uint32_t a_displayWidth, uint32_t a_displayHeig
 	active = true;
 	logger::info("[ENB domain] scene={}x{} display={}x{} quality={}; low-resolution ENB -> LDR NR -> SR -> native screen-space UI. Live quality changes resize scene resources only; HWND and real swapchain unchanged",
 		width, height, a_displayWidth, a_displayHeight, quality);
-	// The Pip-Boy's logical menu space must follow the promoted physical allocation;
-	// see NativeInterfaceUI::ScalePipboyLogicalSpace. Runs before the engine creates
-	// the Pip-Boy render targets.
-	NativeInterfaceUI::ScalePipboyLogicalSpace(a_displayHeight);
+	// NG has no binary verification for the OG/AE cursor changes.
+	if (REX::FModule::IsRuntimeNG()) NativeInterfaceUI::ScaleLegacyNGPipboyLogicalSpace(a_displayHeight);
+
 }
 
 void ENBRenderDomain::ApplySceneDimensions()

@@ -5,6 +5,7 @@
 #include <limits>
 
 #include "Util.h"
+#include "PipboyCursor.h"
 
 namespace
 {
@@ -20,12 +21,14 @@ namespace
 		uint32_t DisplacementOffset() const { return extendedRegister ? 3u : 2u; }
 		uint32_t InstructionSize() const { return DisplacementOffset() + sizeof(int32_t); }
 	};
-	std::array<ReadPatch, 14> patches{};
+	std::array<ReadPatch, 20> patches{};
 	size_t patchCount = 0;
 	uint32_t* displaySize = nullptr;
 	bool installed = false;
 	bool edgesInstalled = false;
 	bool looksInstalled = false;
+	bool cursorInstalled = false;
+	size_t looksPatchEnd = 0;
 	size_t layoutPatchCount = 0;
 	size_t edgePatchEnd = 0;
 	bool InstallRange(size_t begin, size_t end);
@@ -67,11 +70,24 @@ namespace
 		patches[patchCount++] = { looksMove + (og ? 0x6D : 0x79), true };
 		patches[patchCount++] = { looksPick + 0x6, true };
 		patches[patchCount++] = { looksPick + (og ? 0x3B : 0x38), false };
+		looksPatchEnd = patchCount;
+		// Win32 clipping and MenuCursor initialization consume display pixels.
+		if (!REX::FModule::IsRuntimeNG()) {
+			const auto clip = REL::ID{847266, 2228915}.address();
+			patches[patchCount++] = { clip + (og ? 0x10B : 0x10F), false, 0x05, false, true };
+			patches[patchCount++] = { clip + (og ? 0x136 : 0x13A), true, 0x05, false, true };
+			patches[patchCount++] = { clip + (og ? 0x1C0 : 0x1C4), false, 0x05, false, true };
+			patches[patchCount++] = { clip + (og ? 0x1E5 : 0x1E9), true, 0x05, false, true };
+			const auto initUI = REL::ID{1525013, 2228970}.address();
+			patches[patchCount++] = { initUI + (og ? 0x367 : 0x54C), true, 0x05, false, true };
+			patches[patchCount++] = { initUI + (og ? 0x36D : 0x555), false, 0x0D, true, true };
+		}
 		// Validate/commit all six LooksMenu reads together. A rejected group
 		// must not disable the existing movie or edge patches.
 		const bool layoutInstalled = InstallRange(0, layoutPatchCount);
 		edgesInstalled = InstallRange(layoutPatchCount, edgePatchEnd);
-		looksInstalled = InstallRange(edgePatchEnd, patchCount);
+		looksInstalled = InstallRange(edgePatchEnd, looksPatchEnd);
+		cursorInstalled = looksPatchEnd != patchCount && InstallRange(looksPatchEnd, patchCount);
 		return layoutInstalled;
 	}
 
@@ -135,19 +151,20 @@ void NativeUILayout::SetDisplaySize(uint32_t a_width, uint32_t a_height)
 	}
 	::InterlockedExchange(reinterpret_cast<volatile LONG*>(displaySize), static_cast<LONG>(a_width));
 	::InterlockedExchange(reinterpret_cast<volatile LONG*>(displaySize + 1), static_cast<LONG>(a_height));
-	if (!installed && !edgesInstalled && !looksInstalled) {
+	if (!installed && !edgesInstalled && !looksInstalled && !cursorInstalled) {
 		installed = Install();
 	}
-	logger::info("[ENB UI layout] Stable display size {}x{}; Movie/crosshair reads patched={}; menu edge reads patched={}; LooksMenu reads patched={}", a_width, a_height, installed, edgesInstalled, looksInstalled);
+	PipboyCursor::UpdateDisplayBounds(a_width, a_height);
+	logger::info("[ENB UI layout] Stable display size {}x{}; Movie/crosshair reads patched={}; menu edge reads patched={}; LooksMenu reads patched={}; cursor reads patched={}", a_width, a_height, installed, edgesInstalled, looksInstalled, cursorInstalled);
 }
 
 void NativeUILayout::Restore()
 {
-	if (!installed && !edgesInstalled && !looksInstalled) {
+	if (!installed && !edgesInstalled && !looksInstalled && !cursorInstalled) {
 		return;
 	}
 	for (size_t i = 0; i < patchCount; ++i) {
-		if (i < layoutPatchCount ? !installed : (i < edgePatchEnd ? !edgesInstalled : !looksInstalled)) {
+		if (i < layoutPatchCount ? !installed : (i < edgePatchEnd ? !edgesInstalled : (i < looksPatchEnd ? !looksInstalled : !cursorInstalled))) {
 			continue;
 		}
 		const auto& patch = patches[i];
@@ -161,4 +178,5 @@ void NativeUILayout::Restore()
 	installed = false;
 	edgesInstalled = false;
 	looksInstalled = false;
+	cursorInstalled = false;
 }

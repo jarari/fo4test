@@ -1,4 +1,5 @@
 #include "NativeInterfaceUI.h"
+#include "PipboyCursor.h"
 
 #include <algorithm>
 #include <array>
@@ -738,6 +739,7 @@ namespace
 				func(a_target, a_postAA);
 				return;
 			}
+			PipboyCursor::RefreshViewport();
 			if (a_postAA && a_target == 0) {
 				DX12SwapChain::GetSingleton()->BeginNativeUI();
 			}
@@ -839,6 +841,7 @@ void NativeInterfaceUI::ReleaseResources()
 
 void NativeInterfaceUI::InstallHooks(bool a_nativeDomains)
 {
+	PipboyCursor::InstallHooks(a_nativeDomains);
 	const auto isOG = REX::FModule::IsRuntimeOG();
 	bool nativeHooksReady = true;
 	if (a_nativeDomains) {
@@ -912,7 +915,7 @@ namespace
 	}
 }
 
-void NativeInterfaceUI::ScalePipboyLogicalSpace(uint32_t a_displayHeight)
+void NativeInterfaceUI::ScaleLegacyNGPipboyLogicalSpace(uint32_t a_displayHeight)
 {
 	// PromotePipboyExtent grows only the PHYSICAL Pip-Boy colour/depth allocation to
 	// the display height. Three LOGICAL quantities describe that same surface, and if
@@ -931,7 +934,7 @@ void NativeInterfaceUI::ScalePipboyLogicalSpace(uint32_t a_displayHeight)
 	// Scaling all three by one factor leaves the Pip-Boy visually identical while the
 	// cursor both covers and correctly addresses the whole surface.
 	static bool scaled = false;
-	if (scaled || !a_displayHeight || !ENBRenderDomain::Get().Active()) {
+	if (!REX::FModule::IsRuntimeNG() || scaled || !a_displayHeight || !ENBRenderDomain::Get().Active()) {
 		return;
 	}
 	// All or nothing: scaling the buffer without the rect would move the clip rather

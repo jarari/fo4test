@@ -355,6 +355,10 @@ public:
 	ID3D11ComputeShader* GetCopyDepthToFrameGenerationCS();
 	ID3D11ComputeShader* GetGenerateFrameGenerationBuffersCS();
 	ID3D11ComputeShader* GetGenerateDLSSTransparencyMaskCS();
+	void CopyPipboyMaskForSR(uint32_t slot, UINT width, UINT height);
+	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> pipboyMaskSharedTextures;
+	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> pipboyMaskD3D12;
+	std::array<bool, kDX12FrameCount> pipboyMaskReady{};
 	ID3D11ComputeShader* GetSpatialFallbackUpscaleCS();
 
 	/**
