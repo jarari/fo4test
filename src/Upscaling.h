@@ -441,6 +441,7 @@ public:
 	float2 nrMotionPreviousJitter{}, nrMotionPreviousSize{}, nrMotionCurrentDelta{};
 	winrt::com_ptr<ID3D11ComputeShader> nrAfterMotionCS;
 	winrt::com_ptr<ID3D11Buffer> nrAfterMotionConstants;
+	void EnsureNRGuideResources(UINT width, UINT height, bool afterSR);
 	bool CaptureNRMotion(UINT slot, UINT width, UINT height);
 	bool CaptureNRAfterSRGuides(UINT slot, UINT width, UINT height, float2 displaySize);
 	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> dlssTransparencyMaskSharedTextures;
