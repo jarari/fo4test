@@ -259,6 +259,21 @@ struct Interface3D_Renderer_Create
 			(a_name == "WorkbenchItem3D" || a_name == "Container3D" || a_name == "PipboyMenu")) {
 			renderer->postAA = true;
 			renderer->useFullPremultAlpha = true;
+			// Promoting the Pip-Boy into the post-AA pass also drops it into
+			// PowerArmorRenderer's UI_DEPTH_PRIORITY::kStandard group, which vanilla
+			// never shares with it (vanilla draws the Pip-Boy in the later
+			// postAA=false pass). Interface3D::RenderAll re-sorts the renderer array
+			// in place on every call with an unstable sort keyed only on
+			// Renderer::depth, so renderers tied at kStandard get rotated and the
+			// Pip-Boy and the power-armour HUD swap draw order between frames. That
+			// order decides which side of the one-shot scene flatten the Pip-Boy
+			// lands on, and HUDGlass blending reads its destination, so their
+			// overlap alternates. kPipboy is unused by any renderer, so giving the
+			// Pip-Boy its own key only pins the order - and pins it where vanilla
+			// puts it: the Pip-Boy last, over a HUD glass that read the plain scene.
+			if (a_name == "PipboyMenu" && a_depth == RE::UI_DEPTH_PRIORITY::kStandard) {
+				renderer->depth = RE::UI_DEPTH_PRIORITY::kPipboy;
+			}
 		}
 		return renderer;
 	}
@@ -1616,10 +1631,14 @@ void Upscaling::InstallHooks()
 		"Interface3D::Renderer::Create");
 
 	const auto isOG = REX::FModule::IsRuntimeOG();
+	const auto isNG = REX::FModule::IsRuntimeNG();
 	// Normal simulation pacing before input/jobs, then the scene handoff.
 	// The existing CALL5 helper retains each previous callee in func.
+	// NG 1.10.984: Main::Run was inlined into the startup routine (id 2718225);
+	// the standalone copy (id 2228908) is never called, and the live
+	// `call Main::OnIdle` sits at +0xEB instead of AE's +0xCB.
 	stl::write_thunk_call<Main_Run_OnIdle>(
-		REL::ID{ 1125396, 4484191 }.address() + (isOG ? 0xBB : 0xCB));
+		REL::ID{ 1125396, 2718225, 4484191 }.address() + (isOG ? 0xBB : isNG ? 0xEB : 0xCB));
 	stl::write_thunk_call<Main_OnIdle_Swap>(
 		REL::ID{ 633524, 2228917 }.address() + (isOG ? 0x6EC : 0xCDC));
 	logger::info("[Reflex] Installed Main simulation hooks; previous OnIdle={:x}, Swap={:x}",

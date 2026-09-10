@@ -33,7 +33,7 @@ namespace
 	bool Install()
 	{
 		const bool og = REX::FModule::IsRuntimeOG();
-		const auto movie = REL::ID{ 206895, 4494254 }.address();
+		const auto movie = REL::ID{ 206895, 2287430, 4494254 }.address();
 		const auto spread = REL::ID{ 1218510, 2220267 }.address();
 		patches[0] = { movie + 0x1C, true, 0x0D };
 		patches[1] = { movie + (og ? 0x2E : 0x3E), false };

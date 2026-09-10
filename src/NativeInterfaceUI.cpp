@@ -1,8 +1,11 @@
 #include "NativeInterfaceUI.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <intrin.h>
 #include <utility>
 
@@ -177,6 +180,8 @@ namespace
 	{
 		static void thunk(RE::Interface3D::Renderer* a_renderer)
 		{
+			if (a_renderer && a_renderer->postfx.get() == RE::Interface3D::PostEffect::kPipboy) {
+			}
 			if (!AlreadyRendered(a_renderer)) {
 				const auto effect = a_renderer->postfx.get();
 				const bool usesHUDGlass = effect == RE::Interface3D::PostEffect::kHUDGlass ||
@@ -758,8 +763,8 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 		upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDLSS) {
 		return;
 	}
-	static REL::Relocation<const bool*> disabled{ REL::ID{ 789743, 4803742 } };
-	static REL::Relocation<const bool*> preAAEnabled{ REL::ID{ 339016, 4803740 } };
+	static REL::Relocation<const bool*> disabled{ REL::ID{ 789743, 2696451, 4803742 } };
+	static REL::Relocation<const bool*> preAAEnabled{ REL::ID{ 339016, 2696449, 4803740 } };
 	if (*disabled || !*preAAEnabled) {
 		return;
 	}
@@ -768,8 +773,8 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 		modelFrame = frame;
 		renderedModelCount = 0;
 	}
-	static REL::Relocation<RE::BSTArray<RE::Interface3D::Renderer*>*> renderers{ REL::ID{ 996993, 4803746 } };
-	static REL::Relocation<RE::BSReadWriteLock*> lock{ REL::ID{ 778095, 4803745 } };
+	static REL::Relocation<RE::BSTArray<RE::Interface3D::Renderer*>*> renderers{ REL::ID{ 996993, 2696455, 4803746 } };
+	static REL::Relocation<RE::BSReadWriteLock*> lock{ REL::ID{ 778095, 2696454, 4803745 } };
 	static REL::Relocation<bool*> shaderPostAA{ REL::ID{ 801215, 2712496 } };
 	static REL::Relocation<uint32_t*> displayTarget{ REL::ID{ 113725, 2712501 } };
 	using HasMenus = bool (*)(RE::UI*, const RE::BSFixedString&);
@@ -863,4 +868,123 @@ void NativeInterfaceUI::InstallHooks(bool a_nativeDomains)
 	if (!enabled) {
 		logger::error("[ENB UI] Incomplete Interface3D hooks; native custom path disabled");
 	}
+}
+
+namespace
+{
+	// The Pip-Boy cursor viewport rect is a raw .rdata constant with no stable
+	// address-library id across runtimes, so locate it structurally instead of by
+	// id: the cursor movie's root-path literal sits immediately before it, and the
+	// rect itself is the unique { 0, 0, 1920, 1080 } quad that follows. Verified on
+	// 1.10.984 at .rdata 0x23A9E40, directly after "root1.Cursor_mc" at 0x23A9E30.
+	std::int32_t* FindPipboyCursorViewportRect()
+	{
+		static constexpr char kCursorRoot[]{ "root1.Cursor_mc" };
+		static constexpr std::int32_t kStockRect[]{ 0, 0, 1920, 1080 };
+		const auto* base = reinterpret_cast<const std::uint8_t*>(::GetModuleHandleW(nullptr));
+		if (!base) {
+			return nullptr;
+		}
+		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+		const auto* section = IMAGE_FIRST_SECTION(nt);
+		for (std::uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+			if (std::memcmp(section->Name, ".rdata", 6) != 0) {
+				continue;
+			}
+			const auto* begin = base + section->VirtualAddress;
+			const auto* end = begin + section->Misc.VirtualSize;
+			for (const auto* at = begin;;) {
+				at = std::search(at, end, std::begin(kCursorRoot), std::end(kCursorRoot));
+				if (at == end) {
+					break;
+				}
+				const auto* probe = at + sizeof(kCursorRoot);
+				for (; probe + sizeof(kStockRect) <= end && probe < at + 0x40; probe += sizeof(std::int32_t)) {
+					if (std::memcmp(probe, kStockRect, sizeof(kStockRect)) == 0) {
+						return const_cast<std::int32_t*>(reinterpret_cast<const std::int32_t*>(probe));
+					}
+				}
+				at += sizeof(kCursorRoot);
+			}
+		}
+		return nullptr;
+	}
+}
+
+void NativeInterfaceUI::ScalePipboyLogicalSpace(uint32_t a_displayHeight)
+{
+	// PromotePipboyExtent grows only the PHYSICAL Pip-Boy colour/depth allocation to
+	// the display height. Three LOGICAL quantities describe that same surface, and if
+	// they do not follow the identical growth they end up describing a small top-left
+	// corner of it:
+	//   * uPipboyTarget{Width,Height} - the offscreen buffer size the engine reports
+	//     through Interface3D::Renderer::Offscreen_GetRenderTarget{Width,Height}.
+	//   * uPipboyConstraint* - where Pip-Boy content is placed inside that buffer.
+	//   * CursorMenu's hard-coded { 0, 0, 1920, 1080 } viewport rect. CursorMenu
+	//     special-cases the "PipboyMenu" renderer and hand-builds its viewport rather
+	//     than going through Interface3D::Renderer::SetViewport like every other
+	//     custom renderer, and Scaleform clips the draw to min(rect, buffer). With a
+	//     promoted target that stranded the mouse cursor sprite inside a
+	//     uPipboyTarget-sized top-left window of the map, and no INI setting can
+	//     reach the 1920x1080 constant.
+	// Scaling all three by one factor leaves the Pip-Boy visually identical while the
+	// cursor both covers and correctly addresses the whole surface.
+	static bool scaled = false;
+	if (scaled || !a_displayHeight || !ENBRenderDomain::Get().Active()) {
+		return;
+	}
+	// All or nothing: scaling the buffer without the rect would move the clip rather
+	// than remove it, so bail out entirely if the rect cannot be located.
+	auto* cursorRect = FindPipboyCursorViewportRect();
+	if (!cursorRect) {
+		logger::warn("[ENB UI] Pip-Boy cursor viewport rect not found; leaving the Pip-Boy logical space unscaled");
+		return;
+	}
+	auto* targetWidth = RE::GetINISetting("uPipboyTargetWidth:Display");
+	auto* targetHeight = RE::GetINISetting("uPipboyTargetHeight:Display");
+	if (!targetWidth || !targetHeight) {
+		return;
+	}
+	const auto logicalWidth = targetWidth->GetUInt();
+	const auto logicalHeight = targetHeight->GetUInt();
+	if (!logicalWidth || !logicalHeight || logicalHeight >= a_displayHeight) {
+		return;  // already display-sized: nothing is promoted, so nothing to scale
+	}
+	const auto scale = static_cast<double>(a_displayHeight) / static_cast<double>(logicalHeight);
+	const auto scaleValue = [scale](uint32_t a_value) {
+		return static_cast<uint32_t>(std::lround(static_cast<double>(a_value) * scale));
+	};
+
+	// Matches PromotePipboyExtent's own aspect-preserving growth, so the engine now
+	// allocates the promoted extent directly and the promotion becomes a no-op.
+	targetWidth->SetUInt(scaleValue(logicalWidth));
+	targetHeight->SetUInt(a_displayHeight);
+
+	static constexpr const char* constraints[]{
+		"uPipboyConstraintTLX:Pipboy",
+		"uPipboyConstraintTLY:Pipboy",
+		"uPipboyConstraintWidth:Pipboy",
+		"uPipboyConstraintHeight:Pipboy",
+		"uPipboyConstraintTLX_PowerArmor:Pipboy",
+		"uPipboyConstraintTLY_PowerArmor:Pipboy",
+		"uPipboyConstraintWidth_PowerArmor:Pipboy",
+		"uPipboyConstraintHeight_PowerArmor:Pipboy"
+	};
+	for (const auto* name : constraints) {
+		if (auto* setting = RE::GetINISetting(name)) {
+			setting->SetUInt(scaleValue(setting->GetUInt()));
+		}
+	}
+
+	// { left, top, width, height }; only the extent grows, the origin stays 0,0.
+	const auto rectWidth = static_cast<std::int32_t>(scaleValue(1920));
+	const auto rectHeight = static_cast<std::int32_t>(scaleValue(1080));
+	REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(cursorRect + 2), rectWidth);
+	REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(cursorRect + 3), rectHeight);
+
+	scaled = true;
+	logger::info("[ENB UI] Scaled Pip-Boy logical space x{:.4f}: target {}x{} -> {}x{}, cursor rect 1920x1080 -> {}x{}",
+		scale, logicalWidth, logicalHeight, targetWidth->GetUInt(), targetHeight->GetUInt(),
+		rectWidth, rectHeight);
 }

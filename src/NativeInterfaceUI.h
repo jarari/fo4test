@@ -8,4 +8,5 @@ namespace NativeInterfaceUI
 	void ReleaseResources();
 	bool IsRendering();
 	void RenderModelsBeforeUpscale(uint32_t a_target);
+	void ScalePipboyLogicalSpace(uint32_t a_displayHeight);
 }
