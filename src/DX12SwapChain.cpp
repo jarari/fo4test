@@ -396,7 +396,7 @@ namespace
 		return isProxy;
 	}
 
-	DXGI_SWAP_CHAIN_DESC1 MakeSwapChainDescFromWindow(const DXGI_SWAP_CHAIN_DESC& a_swapChainDesc, BOOL a_allowTearing)
+	DXGI_SWAP_CHAIN_DESC1 MakeSwapChainDescFromWindow(const DXGI_SWAP_CHAIN_DESC& a_swapChainDesc, BOOL a_allowTearing, bool a_applicationWaitable)
 	{
 		DXGI_SWAP_CHAIN_DESC1 desc{};
 		desc.BufferCount = kDX12FrameCount;
@@ -405,7 +405,7 @@ namespace
 		desc.Format = a_swapChainDesc.BufferDesc.Format;
 		desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 		desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-		desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+		desc.Flags = a_applicationWaitable ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0;
 		desc.SampleDesc.Count = 1;
 
 		RECT clientRect{};
@@ -647,7 +647,18 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 	BOOL allowTearing = FALSE;
 	std::ignore = a_dxgiFactory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing));
 
-	swapChainDesc = MakeSwapChainDescFromWindow(a_swapChainDesc, allowTearing);
+	// SL owns queue pacing when its DLSS-G plugin is loaded, even with FG Off.
+	// Requesting the waitable flag instead transfers that responsibility to us
+	// in SL 2.14+. Check plugin loading, not the user's current FG setting.
+	bool streamlinePacing = a_streamline && a_streamline->UsesD3D12() && a_streamline->featureDLSSG;
+	if (a_streamline && a_streamline->UsesD3D12() && a_streamline->slIsFeatureLoaded) {
+		bool loaded = false;
+		if (a_streamline->slIsFeatureLoaded(sl::kFeatureDLSS_G, loaded) == sl::Result::eOk) {
+			streamlinePacing = loaded;
+		}
+	}
+	applicationFrameLatencyWaitable = !streamlinePacing;
+	swapChainDesc = MakeSwapChainDescFromWindow(a_swapChainDesc, allowTearing, applicationFrameLatencyWaitable);
 
 	IDXGIFactory5* factoryForSwapChain = a_dxgiFactory;
 	winrt::com_ptr<IDXGIFactory5> upgradedFactory;
@@ -678,15 +689,21 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 			fullscreenDesc.Windowed = a_swapChainDesc.Windowed;
 
 			IDXGISwapChain4* fidelityFXSwapChain = nullptr;
+			// FSR exposes its own application waitable object. Keep this request
+			// separate so a failed FSR creation cannot change the SL fallback.
+			auto fidelityFXDesc = swapChainDesc;
+			fidelityFXDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 			if (FidelityFX::GetSingleton()->CreateFrameGenerationSwapChainForHwnd(
 					upgradedFactory.get(),
 					a_swapChainDesc.OutputWindow,
-					&swapChainDesc,
+					&fidelityFXDesc,
 					&fullscreenDesc,
 					commandQueue.get(),
 					&fidelityFXSwapChain) &&
 				fidelityFXSwapChain) {
 				swapChain.attach(fidelityFXSwapChain);
+				applicationFrameLatencyWaitable = true;
+				swapChainDesc = fidelityFXDesc;
 				logger::info("[DX12SwapChain] FidelityFX frame generation swapchain created for hwnd: swapchain={}", static_cast<void*>(swapChain.get()));
 			} else {
 				if (fidelityFXSwapChain) {
@@ -875,6 +892,12 @@ void DX12SwapChain::RestoreResizeDependentResources(const char* a_context)
 {
 	try {
 		std::ignore = swapChain->GetDesc1(&swapChainDesc);
+		// SL can expose its internal waitable flag through GetDesc1. Preserve
+		// the application's creation contract rather than adopting that flag.
+		swapChainDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+		if (applicationFrameLatencyWaitable) {
+			swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+		}
 		RefreshBackBuffers();
 		RecreateInteropTextures();
 		frameIndex = swapChain->GetCurrentBackBufferIndex();
@@ -1063,7 +1086,12 @@ HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_wi
 			a_height = swapChainDesc.Height;
 		}
 	}
-	const auto resizeFlags = a_flags | swapChainDesc.Flags;
+	// DXGI does not allow changing the waitable flag through ResizeBuffers.
+	// In particular, ignore a flag echoed from SL's internal swapchain by ENB.
+	auto resizeFlags = (a_flags | swapChainDesc.Flags) & ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	if (applicationFrameLatencyWaitable) {
+		resizeFlags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	}
 	HRESULT result = S_OK;
 	if (a_useResizeBuffers1) {
 		std::array<UINT, kDX12FrameCount> nodeMasks{};
@@ -1274,15 +1302,10 @@ void DX12SwapChain::ConfigureFrameLatency()
 	frameLatencyEvent.close();
 	frameLatencyFrameValid = false;
 	if (!swapChain) { return; }
-	const auto* streamline = Streamline::GetSingleton();
-	if (streamline->UsesD3D12() && streamline->featureDLSSG &&
-		!FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive()) {
-		// The SL proxy forwards the latency event to its underlying swapchain.
-		// DuplicateHandle shares that event's signal; it does not create another
-		// notification for us. Leave queue throttling to the DLSS-G presenter,
-		// which remains installed even while generation is Off. A second waiter
-		// can starve its flip-queue wait (30ms timeouts with VSync enabled).
-		logger::info("[Presentation] Streamline owns DXGI queue pacing, including FG Off; retaining pre-input FPS limiter and fence pacing");
+	if (!applicationFrameLatencyWaitable) {
+		// No app flag at creation: never consume or reconfigure SL's waitable.
+		// This stays true across FG toggles and ordinary resource resizes.
+		logger::info("[Presentation] No application DXGI waitable requested; presenter owns queue pacing; retaining pre-input FPS limiter and fence pacing");
 		return;
 	}
 	const auto result = swapChain->SetMaximumFrameLatency(1);

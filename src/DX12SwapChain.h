@@ -228,6 +228,8 @@ private:
 	bool fidelityFXFrameGenerationSwapChainAllowed = false;
 	double desktopRefreshHz = 0.0;
 	PresentPacing presentPacing;
+	// Creation-time contract, independent of FG mode and the SL proxy's internal flags.
+	bool applicationFrameLatencyWaitable = false;
 	void ConfigureFrameLatency();
 	void WaitForPresentationCapacity(uint32_t frame);
 	std::mutex frameLatencyMutex;
