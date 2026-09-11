@@ -19,7 +19,7 @@
 #include "ENBRenderDomain.h"
 #include "NativeInterfaceUI.h"
 #include "Screenshot.h"
-#include "SceneReShade.h"
+#include "ReShadeDepth.h"
 #include "PipboyTemporalMask.h"
 
 extern bool enbLoaded;
@@ -1249,6 +1249,11 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 	static void thunk(RE::BSGraphics::RenderTargetManager* This, uint a2, uint a3, uint a4, uint a5)
 	{
 		auto upscaling = Upscaling::GetSingleton();
+		// Capture while the completed world depth is still current, before SR/NR
+		// submits their command context. Capturing on scope exit made the D3D11
+		// dispatch wait on the same frame's NR fence through WaitForFrameSlot,
+		// which left ReShade consuming the previous depth generation.
+		auto captureReShadeDepth = [&]() { upscaling->CaptureReShadeDepth(); };
 
 		static auto renderTargetManager = Util::RenderTargetManager_GetSingleton();
 		static auto gameViewport = Util::State_GetSingleton();
@@ -1274,17 +1279,23 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 			upscaling->ResetDepth();
 			upscaling->ResetRenderTargets({ static_cast<int>(a5) });
 			SetDynamicResolutionRatio(renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio);
+			upscaling->reshadeSceneDepthFrame = static_cast<uint64_t>(gameViewport->frameCount) + 1;
+			captureReShadeDepth();
 			upscaling->Upscale(static_cast<int>(a5));
 			return;
 		}
 
 		if (upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDisabled) {
 			func(This, a2, a3, a4, a5);
+			upscaling->reshadeSceneDepthFrame = static_cast<uint64_t>(gameViewport->frameCount) + 1;
+			captureReShadeDepth();
 			upscaling->Upscale(static_cast<int>(a5));
 			return;
 		}
 
 		func(This, a2, a3, a4, a5);
+		upscaling->reshadeSceneDepthFrame = static_cast<uint64_t>(gameViewport->frameCount) + 1;
+		captureReShadeDepth();
 		upscaling->CaptureDLSSGInputs(static_cast<int>(a5));
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
@@ -1380,6 +1391,7 @@ struct DrawWorld_FrameGenerationForward
 	static void thunk(void* This)
 	{
 		func(This);
+		Upscaling::GetSingleton()->reshadeSceneDepthFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
 
 		if (!frameGenerationFirstPersonAlphaFix) {
 			Upscaling::GetSingleton()->CopyFrameGenerationBuffers();
@@ -1850,7 +1862,6 @@ void Upscaling::LoadSettings()
 
 	auto streamline = Streamline::GetSingleton();
 	const auto currentUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
-	if (currentUpscaleMethodPreference == UpscaleMethod::kDisabled) SceneReShade::Reset();
 	if (ENBRenderDomain::Get().Active() && previousQualityMode != settings.qualityMode) {
 		logger::info("[ENB domain] Requested quality {}; active quality {} ({}x{}); scene-only resize queued, HWND/display unchanged",
 			settings.qualityMode, ENBRenderDomain::Get().Quality(), ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height());
@@ -3242,6 +3253,67 @@ ID3D11ComputeShader* Upscaling::GetCopyDepthToFrameGenerationCS()
 	return copyDepthToFrameGenerationCS.get();
 }
 
+ID3D11ComputeShader* Upscaling::GetReShadeDepthCS()
+{
+	if (!reshadeDepthCS) {
+		// ReShade receives the world depth after the engine has rendered with its
+		// per-frame projection jitter. Sample the raster image at the inverse
+		// jittered position; this keeps ReShade's depth grid aligned with the
+		// unjittered color pixel centers without touching the engine depth target.
+		constexpr char source[] = R"(
+Texture2D<float> DepthInput : register(t0);
+RWTexture2D<float> DepthOutput : register(u0);
+cbuffer Parameters : register(b0)
+{
+    float2 SourceSize;
+    float2 OutputSize;
+    float2 Jitter;
+    float2 Padding;
+};
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint2)OutputSize)) return;
+    // Jitter is subpixel (the capture uses values in [-0.5, 0.5]). A
+    // nearest-neighbor Load would therefore return the original texel for
+    // almost every pixel and silently perform no correction. Interpolate the
+    // four neighboring depth samples at the inverse-jittered center instead.
+    float2 sourcePosition = (float2(id.xy) + 0.5) * SourceSize / OutputSize - Jitter;
+    sourcePosition = clamp(sourcePosition, 0.5, SourceSize - 0.5);
+    float2 samplePosition = sourcePosition - 0.5;
+    int2 p0 = int2(floor(samplePosition));
+    float2 f = samplePosition - float2(p0);
+    int2 p1 = min(p0 + 1, int2(SourceSize) - 1);
+    float d00 = DepthInput.Load(int3(p0, 0));
+    float d10 = DepthInput.Load(int3(int2(p1.x, p0.y), 0));
+    float d01 = DepthInput.Load(int3(int2(p0.x, p1.y), 0));
+    float d11 = DepthInput.Load(int3(p1, 0));
+    DepthOutput[id.xy] = lerp(lerp(d00, d10, f.x), lerp(d01, d11, f.x), f.y);
+}
+)";
+		winrt::com_ptr<ID3DBlob> code, errors;
+		if (FAILED(D3DCompile(source, sizeof(source) - 1, "ReShadeDepth", nullptr, nullptr,
+			"main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code.put(), errors.put())) ||
+			FAILED(reinterpret_cast<ID3D11Device*>(RE::BSGraphics::GetRendererData()->device)->CreateComputeShader(
+				code->GetBufferPointer(), code->GetBufferSize(), nullptr, reshadeDepthCS.put()))) {
+			logger::warn("[ReShade depth] Could not create jitter correction shader");
+			return nullptr;
+		}
+	}
+	if (!reshadeDepthConstants) {
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = 32;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		if (FAILED(reinterpret_cast<ID3D11Device*>(RE::BSGraphics::GetRendererData()->device)->CreateBuffer(
+			&desc, nullptr, reshadeDepthConstants.put()))) {
+			reshadeDepthCS = nullptr;
+			return nullptr;
+		}
+	}
+	return reshadeDepthCS.get();
+}
+
 ID3D11ComputeShader* Upscaling::GetGenerateFrameGenerationBuffersCS()
 {
 	if (!generateFrameGenerationBuffersCS) {
@@ -3642,15 +3714,6 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		const auto& display = DX12SwapChain::GetSingleton()->swapChainDesc;
 		renderSize = { static_cast<float>(ENBRenderDomain::Get().Width()), static_cast<float>(ENBRenderDomain::Get().Height()) };
 		displaySize = { static_cast<float>(display.Width), static_cast<float>(display.Height) };
-	}
-	{
-		DXGI_SWAP_CHAIN_DESC desc{};
-		auto* swap = reinterpret_cast<IDXGISwapChain*>(rendererData->renderWindow[0].swapChain);
-		if (swap && SUCCEEDED(swap->GetDesc(&desc))) {
-			auto* depth = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
-			SceneReShade::Render(static_cast<ID3D11Texture2D*>(frameBufferResource), depth, desc.OutputWindow,
-				static_cast<UINT>(renderSize.x), static_cast<UINT>(renderSize.y));
-		}
 	}
 	osdRenderSize = renderSize;
 	osdNativeSize = displaySize;
@@ -4069,6 +4132,160 @@ void Upscaling::CopyPipboyMaskForSR(uint32_t slot, UINT width, UINT height)
 		}
 	} catch (const std::exception& e) {
 		logger::warn("[Pipboy SR] Shared mask unavailable: {}", e.what());
+	}
+}
+
+Upscaling::ReShadeDepthCaptureInfo Upscaling::GetCurrentSharedDepthInfo() const
+{
+	const auto slot = DX12SwapChain::GetSingleton()->GetFrameIndex();
+	if (slot >= kDX12FrameCount) {
+		return {};
+	}
+	const auto frame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+	// ReShade must not reuse the SR/FG depth snapshots: those resources retain
+	// the engine's jittered raster grid and may be consumed asynchronously by
+	// Streamline. Its bridge owns a separate corrected snapshot.
+	if (reshadeDepthCaptureFrames[slot] != frame || !reshadeDepthD3D12[slot]) {
+		return {};
+	}
+	const auto desc = reshadeDepthD3D12[slot]->GetDesc();
+	return {
+		reshadeDepthD3D12[slot].get(),
+		reshadeDepthPhysicalSourceWidths[slot],
+		reshadeDepthPhysicalSourceHeights[slot],
+		reshadeDepthSampleWidths[slot],
+		reshadeDepthSampleHeights[slot],
+		static_cast<uint32_t>(desc.Width),
+		static_cast<uint32_t>(desc.Height),
+		reshadeDepthJitters[slot]
+	};
+}
+
+ID3D12Resource* Upscaling::GetCurrentSharedDepth() const
+{
+	return GetCurrentSharedDepthInfo().resource;
+}
+
+void Upscaling::CaptureReShadeDepth()
+{
+	auto* swap = DX12SwapChain::GetSingleton();
+	if (!ReShadeDepth::IsRequested() || !swap->IsReady() || swap->IsWindowUnavailable() || GetCurrentSharedDepth()) {
+		return;
+	}
+	const auto slot = swap->GetFrameIndex();
+	if (slot >= kDX12FrameCount) {
+		return;
+	}
+	reshadeDepthCaptureFrames[slot] = 0;
+	if (reshadeSceneDepthFrame != static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1) {
+		return;  // A restored/frozen background is not a new world-depth render.
+	}
+	try {
+		auto* data = RE::BSGraphics::GetRendererData();
+		auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(data->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
+		if (!srv) {
+			return;
+		}
+		winrt::com_ptr<ID3D11Resource> resource;
+		srv->GetResource(resource.put());
+		auto texture = resource.try_as<ID3D11Texture2D>();
+		if (!texture) {
+			return;
+		}
+		D3D11_TEXTURE2D_DESC desc{};
+		texture->GetDesc(&desc);
+		if (desc.SampleDesc.Count != 1) {
+			return;
+		}
+		const auto physicalSourceWidth = desc.Width;
+		const auto physicalSourceHeight = desc.Height;
+		if (ENBRenderDomain::Get().Active()) {
+			desc.Width = std::min(desc.Width, ENBRenderDomain::Get().Width());
+			desc.Height = std::min(desc.Height, ENBRenderDomain::Get().Height());
+		} else {
+			const auto* state = Util::State_GetSingleton();
+			const auto ratios = GetDynamicResolutionRatios();
+			desc.Width = std::min(desc.Width, std::max(1u, static_cast<UINT>(state->screenWidth * ratios.width)));
+			desc.Height = std::min(desc.Height, std::max(1u, static_cast<UINT>(state->screenHeight * ratios.height)));
+		}
+		// The engine may retain a native-sized depth allocation while rendering
+		// only the active render rectangle in its top-left corner. The valid
+		// sample extent is therefore the same clamped extent used for the output,
+		// rather than the physical allocation size.
+		const auto sampleWidth = desc.Width;
+		const auto sampleHeight = desc.Height;
+		desc.Format = DXGI_FORMAT_R32_FLOAT;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		desc.MiscFlags = 0;
+		auto* shader = GetReShadeDepthCS();
+		if (!shader || !swap->WaitForFrameSlot(slot, true)) {
+			return;
+		}
+		EnsureSharedD3D12Texture(this, desc, reshadeDepthSharedTextures[slot], reshadeDepthD3D12[slot], true);
+		auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
+		// Preserve the exact state touched by this optional fallback dispatch.
+		ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+		winrt::com_ptr<ID3D11DepthStencilView> dsv;
+		context->OMGetRenderTargets(static_cast<UINT>(std::size(rtvs)), rtvs, dsv.put());
+		winrt::com_ptr<ID3D11ComputeShader> oldShader;
+		ID3D11ClassInstance* instances[256]{};
+		UINT instanceCount = static_cast<UINT>(std::size(instances));
+		context->CSGetShader(oldShader.put(), instances, &instanceCount);
+		winrt::com_ptr<ID3D11ShaderResourceView> oldSRV;
+		winrt::com_ptr<ID3D11UnorderedAccessView> oldUAV;
+		winrt::com_ptr<ID3D11Buffer> oldCB;
+		context->CSGetShaderResources(0, 1, oldSRV.put());
+		context->CSGetUnorderedAccessViews(0, 1, oldUAV.put());
+		context->CSGetConstantBuffers(0, 1, oldCB.put());
+		struct ReShadeDepthConstants {
+			float2 sourceSize;
+			float2 outputSize;
+			float2 jitter;
+			float2 padding{};
+		};
+		const ReShadeDepthConstants constants{
+			{ static_cast<float>(sampleWidth), static_cast<float>(sampleHeight) },
+			{ static_cast<float>(desc.Width), static_cast<float>(desc.Height) },
+			jitter,
+			{}
+		};
+		context->UpdateSubresource(reshadeDepthConstants.get(), 0, nullptr, &constants, 0, 0);
+		context->OMSetRenderTargets(0, nullptr, nullptr);
+		context->CSSetShaderResources(0, 1, &srv);
+		auto* uav = reshadeDepthSharedTextures[slot]->uav.get();
+		context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+		auto* cb = reshadeDepthConstants.get();
+		context->CSSetConstantBuffers(0, 1, &cb);
+		context->CSSetShader(shader, nullptr, 0);
+		context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+		ID3D11ShaderResourceView* nullSRV = nullptr;
+		ID3D11UnorderedAccessView* nullUAV = nullptr;
+		context->CSSetShaderResources(0, 1, &nullSRV);
+		context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+		auto* restoreSRV = oldSRV.get();
+		auto* restoreUAV = oldUAV.get();
+		auto* restoreCB = oldCB.get();
+		context->CSSetShaderResources(0, 1, &restoreSRV);
+		context->CSSetUnorderedAccessViews(0, 1, &restoreUAV, nullptr);
+		context->CSSetConstantBuffers(0, 1, &restoreCB);
+		context->CSSetShader(oldShader.get(), instances, instanceCount);
+		context->OMSetRenderTargets(static_cast<UINT>(std::size(rtvs)), rtvs, dsv.get());
+		for (auto* rtv : rtvs) {
+			if (rtv) rtv->Release();
+		}
+		for (UINT i = 0; i < instanceCount; ++i) {
+			if (instances[i]) instances[i]->Release();
+		}
+		reshadeDepthPhysicalSourceWidths[slot] = physicalSourceWidth;
+		reshadeDepthPhysicalSourceHeights[slot] = physicalSourceHeight;
+		reshadeDepthSampleWidths[slot] = sampleWidth;
+		reshadeDepthSampleHeights[slot] = sampleHeight;
+		reshadeDepthJitters[slot] = jitter;
+		reshadeDepthCaptureFrames[slot] = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+	} catch (const std::exception& e) {
+		logger::error("[ReShade depth] Fallback capture failed: {}", e.what());
 	}
 }
 
@@ -5270,6 +5487,18 @@ void Upscaling::DestroyUpscalingResources(bool a_preserveNativeNR, bool a_intero
 	fsrDepthCaptureFrames.fill(0);
 	PipboyTemporalMask::Release();
 	pipboyMaskReady.fill(false);
+	reshadeDepthCaptureFrames.fill(0);
+	reshadeDepthPhysicalSourceWidths.fill(0);
+	reshadeDepthPhysicalSourceHeights.fill(0);
+	reshadeDepthSampleWidths.fill(0);
+	reshadeDepthSampleHeights.fill(0);
+	reshadeDepthJitters.fill({});
+	reshadeSceneDepthFrame = 0;
+	reshadeDepthCS = nullptr;
+	reshadeDepthConstants = nullptr;
+	for (std::size_t i = 0; i < kDX12FrameCount; ++i) {
+		RetireSharedD3D12Texture(reshadeDepthSharedTextures[i], reshadeDepthD3D12[i]);
+	}
 	RetireD3D11Texture(upscalingTexture);
 	RetireD3D11Texture(dlssOutputTexture);
 	RetireD3D11Texture(spatialFallbackTexture);

@@ -19,7 +19,7 @@
 #include "Streamline.h"
 #include "Upscaling.h"
 #include "UpscalingMenu.h"
-#include "SceneReShade.h"
+#include "ReShadeDepth.h"
 #include "third_party/RTX40MFGUnlock/integration.h"
 
 extern bool enbLoaded;
@@ -861,7 +861,6 @@ void DX12SwapChain::ProcessWindowStateTransition()
 
 void DX12SwapChain::ReleaseResizeDependentResources()
 {
-	SceneReShade::Reset();
 	EndNativeUI();
 	NativeInterfaceUI::ReleaseResources();
 	nativeUITexture = nullptr;
@@ -886,6 +885,7 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	queuedReuseFenceValues.fill(0);
 	presentSlotFenceValues.fill(0);
 	inputsUsedAtPresent.fill(false);
+	reshadeSnapshotFrames.fill(0);
 }
 
 void DX12SwapChain::RestoreResizeDependentResources(const char* a_context)
@@ -908,7 +908,6 @@ void DX12SwapChain::RestoreResizeDependentResources(const char* a_context)
 
 HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 {
-	SceneReShade::Reset();
 	auto& domain = ENBRenderDomain::Get();
 	auto* data = RE::BSGraphics::GetRendererData();
 	if (!data) { return E_UNEXPECTED; }
@@ -1243,6 +1242,8 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 			context.index = static_cast<UINT>(contextIndex);
 			context.fenceValue = 0;
 			context.retainedPresentOverride = nullptr;
+			context.retainedReShadeDepth = nullptr;
+			context.retainedReShadeSnapshot = nullptr;
 			context.screenshotInput.reset();
 			context.screenshotOutput.reset();
 			DX::ThrowIfFailed(context.allocator->Reset());
@@ -1268,6 +1269,8 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 	context.index = waitContextIndex;
 	context.fenceValue = 0;
 	context.retainedPresentOverride = nullptr;
+	context.retainedReShadeDepth = nullptr;
+	context.retainedReShadeSnapshot = nullptr;
 	context.screenshotInput.reset();
 	context.screenshotOutput.reset();
 	DX::ThrowIfFailed(context.allocator->Reset());
@@ -1535,6 +1538,7 @@ bool DX12SwapChain::WaitForGPUIdle()
 	queuedReuseFenceValues.fill(0);
 	presentSlotFenceValues.fill(0);
 	inputsUsedAtPresent.fill(false);
+	reshadeSnapshotFrames.fill(0);
 	return true;
 }
 
@@ -1921,15 +1925,18 @@ void main(uint3 p : SV_DispatchThreadID)
 
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
+	ReShadeDepth::AdvancePresent();
 	// TEST does not consume the staged scene or advance resource retirement.
 	if (Flags & DXGI_PRESENT_TEST) {
 		return swapChain ? swapChain->Present(SyncInterval, Flags) : DXGI_ERROR_INVALID_CALL;
 	}
 	if (deviceLost) {
+		ReShadeDepth::Invalidate();
 		presentPacing.Reset();
 		return DXGI_ERROR_DEVICE_REMOVED;
 	}
 	if (!IsReady()) {
+		ReShadeDepth::Invalidate();
 		presentPacing.Reset();
 		return DXGI_ERROR_INVALID_CALL;
 	}
@@ -1946,6 +1953,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	streamline->ApplyPendingDLSSGDisable();
 	if (IsWindowUnavailable()) {
+		ReShadeDepth::Invalidate();
 		presentPacing.Reset();
 		presentOverrideFinalColor = nullptr;
 		const auto presentedFrameIndex = frameIndex;
@@ -1999,6 +2007,23 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	const auto presentedFrameIndex = frameIndex;
 	auto destination = swapChainBuffers[presentedFrameIndex].get();
+	// Upscaler evaluation normally already submitted an independent snapshot.
+	// Only standalone/fallback frames need a late copy. Its input reuse is
+	// fenced at submission, never extended to post-Present just for ReShade.
+	auto* reshadeDepth = upscaling->GetCurrentSharedDepth();
+	const auto depthFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+	const bool copiedReShadeDepth = reshadeSnapshotFrames[presentedFrameIndex] != depthFrame &&
+		ReShadeDepth::Prepare(commandList, reshadeDepth, presentedFrameIndex, commandContext.retainedReShadeSnapshot);
+	if (copiedReShadeDepth) {
+		commandContext.retainedReShadeDepth.copy_from(reshadeDepth);
+	} else {
+		commandContext.retainedReShadeDepth = nullptr;
+	}
+	// Consume the frame stamp even if this Present could not publish depth.
+	// Repeated Presents without world rendering must never recycle old depth.
+	upscaling->dlssDepthCaptureFrames[presentedFrameIndex] = 0;
+	upscaling->fsrDepthCaptureFrames[presentedFrameIndex] = 0;
+	upscaling->reshadeDepthCaptureFrames[presentedFrameIndex] = 0;
 	auto copySource = presentStaging->resource12.get();
 	commandContext.retainedPresentOverride = std::move(presentOverrideFinalColor);
 	// The menu's D3D11 background filter has already consumed the resolved scene.
@@ -2096,6 +2121,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 
 	ExecuteCommandContext(commandContext);
+	if (copiedReShadeDepth) {
+		inputReuseFenceValues[presentedFrameIndex] = std::max(inputReuseFenceValues[presentedFrameIndex], commandContext.fenceValue);
+		reshadeSnapshotFrames[presentedFrameIndex] = depthFrame;
+		ReShadeDepth::PublishSubmittedDepth();
+	}
 
 	const auto vsyncMode = upscaling->settings.vsyncMode;
 	UINT presentSyncInterval = vsyncMode == 2 ? 1u : vsyncMode == 1 ? 0u : SyncInterval;
@@ -2130,6 +2160,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
 	if (result != S_OK) { presentPacing.Reset(); }
+	ReShadeDepth::EndPresent();
 	if (emitPresentMarkers) {
 		streamline->OnPresentEnd(result, false);
 	}
@@ -2254,18 +2285,30 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 	auto& commandContext = AcquireCommandContext();
 	auto* commandList = commandContext.list.get();
 
+	// Detach depth while the inputs are owned by this evaluation submission.
+	// ReShade's output queue will only see the detached, completed snapshot.
+	auto* upscaling = Upscaling::GetSingleton();
+	const auto depthFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+	auto* sharedDepth = upscaling->GetCurrentSharedDepth();
+	const bool copiedReShadeDepth = reshadeSnapshotFrames[evaluationFrameIndex] != depthFrame &&
+		ReShadeDepth::Prepare(commandList, sharedDepth, evaluationFrameIndex, commandContext.retainedReShadeSnapshot, true);
+	if (copiedReShadeDepth) commandContext.retainedReShadeDepth.copy_from(sharedDepth);
+
 	result = EvaluateD3D12WorkOnCommandList(commandList, evaluationFrameIndex, a_evaluateDLSS, a_evaluateFSR, a_evaluateFSRFrameGeneration);
 
-	if (!result.Any()) {
+	if (!result.Any() && !copiedReShadeDepth) {
 		DX::ThrowIfFailed(commandList->Close());
 		return result;
 	}
 
 	ExecuteCommandContext(commandContext);
+	if (copiedReShadeDepth) {
+		reshadeSnapshotFrames[evaluationFrameIndex] = depthFrame;
+		ReShadeDepth::PublishSubmittedDepth();
+	}
 	const auto signalValue = commandContext.fenceValue;
 	frameSlotFenceValues[evaluationFrameIndex] = signalValue;
 	inputReuseFenceValues[evaluationFrameIndex] = signalValue;
-	auto* upscaling = Upscaling::GetSingleton();
 	inputsUsedAtPresent[evaluationFrameIndex] = upscaling->IsFrameGenerationActive() ||
 		upscaling->IsFSRFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety();
 

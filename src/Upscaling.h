@@ -312,8 +312,33 @@ public:
 	void PreFrameGenerationAlpha();
 	bool PostFrameGenerationAlpha();
 	void CopyFrameGenerationBuffers();
+	void CaptureReShadeDepth();
+	struct ReShadeDepthCaptureInfo
+	{
+		ID3D12Resource* resource = nullptr;
+		uint32_t physicalSourceWidth = 0;
+		uint32_t physicalSourceHeight = 0;
+		uint32_t sampleWidth = 0;
+		uint32_t sampleHeight = 0;
+		uint32_t outputWidth = 0;
+		uint32_t outputHeight = 0;
+		float2 engineJitter{};
+	};
+	ReShadeDepthCaptureInfo GetCurrentSharedDepthInfo() const;
+	ID3D12Resource* GetCurrentSharedDepth() const;
+	uint64_t reshadeSceneDepthFrame = 0;
 	std::array<uint64_t, kDX12FrameCount> dlssDepthCaptureFrames{};
 	std::array<uint64_t, kDX12FrameCount> fsrDepthCaptureFrames{};
+	std::array<uint64_t, kDX12FrameCount> reshadeDepthCaptureFrames{};
+	std::array<uint32_t, kDX12FrameCount> reshadeDepthPhysicalSourceWidths{};
+	std::array<uint32_t, kDX12FrameCount> reshadeDepthPhysicalSourceHeights{};
+	std::array<uint32_t, kDX12FrameCount> reshadeDepthSampleWidths{};
+	std::array<uint32_t, kDX12FrameCount> reshadeDepthSampleHeights{};
+	std::array<float2, kDX12FrameCount> reshadeDepthJitters{};
+	std::array<std::unique_ptr<Texture2D>, kDX12FrameCount> reshadeDepthSharedTextures;
+	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> reshadeDepthD3D12;
+	winrt::com_ptr<ID3D11ComputeShader> reshadeDepthCS;
+	winrt::com_ptr<ID3D11Buffer> reshadeDepthConstants;
 
 	ID3D11ShaderResourceView* originalDepthView;	    ///< Original depth buffer SRV
 	std::unique_ptr<Texture2D> depthOverrideTexture;    ///< Dynamic resolution depth override texture
@@ -353,6 +378,7 @@ public:
 	 */
 	ID3D11ComputeShader* GetOverrideDepthCS();
 	ID3D11ComputeShader* GetCopyDepthToFrameGenerationCS();
+	ID3D11ComputeShader* GetReShadeDepthCS();
 	ID3D11ComputeShader* GetGenerateFrameGenerationBuffersCS();
 	ID3D11ComputeShader* GetGenerateDLSSTransparencyMaskCS();
 	void CopyPipboyMaskForSR(uint32_t slot, UINT width, UINT height);

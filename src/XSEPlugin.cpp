@@ -1,7 +1,7 @@
-#include "SceneReShade.h"
 #include "DX11Hooks.h"
 #include "Upscaling.h"
 #include "UpscalingMenu.h"
+#include "ReShadeDepth.h"
 
 #include "ENB/ENBSeriesAPI.h"
 
@@ -114,7 +114,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 #endif
 
 	InitializeLog();
-	SceneReShade::Initialize();
+	ReShadeDepth::Initialize();
 
 	auto& trampoline = REL::GetTrampoline();
 	trampoline.create(1024);

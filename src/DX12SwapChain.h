@@ -160,6 +160,8 @@ private:
 		winrt::com_ptr<ID3D12GraphicsCommandList4> list;
 		std::unique_ptr<D3D11D3D12SharedTexture> presentStaging;
 		winrt::com_ptr<ID3D12Resource> retainedPresentOverride;
+		winrt::com_ptr<ID3D12Resource> retainedReShadeDepth;
+		winrt::com_ptr<ID3D12Resource> retainedReShadeSnapshot;
 		// Reused only after this context's fence completes, unlike a global
 		// upload buffer which CPU text updates could overwrite while in flight.
 		winrt::com_ptr<ID3D12Resource> osdUpload;
@@ -225,6 +227,7 @@ private:
 	std::array<UINT64, kDX12FrameCount> queuedReuseFenceValues{};
 	std::array<UINT64, kDX12FrameCount> presentSlotFenceValues{};
 	std::array<bool, kDX12FrameCount> inputsUsedAtPresent{};
+	std::array<uint64_t, kDX12FrameCount> reshadeSnapshotFrames{};
 	bool fidelityFXFrameGenerationSwapChainAllowed = false;
 	double desktopRefreshHz = 0.0;
 	PresentPacing presentPacing;
