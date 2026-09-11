@@ -1578,7 +1578,7 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 			NRDiagnosticCapture::Copy(a_commandList, "reshade_depth", reshadeDepth,
 				static_cast<UINT>(reshadeDesc.Width), static_cast<UINT>(reshadeDesc.Height));
 			NRDiagnosticCapture::Annotate(a_commandList,
-				std::format("\"reshade_depth_physical_source_extent\":[{},{}],\"reshade_depth_sample_extent\":[{},{}],\"reshade_depth_output_extent\":[{},{}],\"reshade_depth_engine_jitter\":[{},{}],\"reshade_depth_streamline_jitter\":[{},{}],\"reshade_depth_sampling\":\"bilinear((id+0.5)*sample_extent/output_extent-engine_jitter)\"",
+					std::format("\"reshade_depth_physical_source_extent\":[{},{}],\"reshade_depth_sample_extent\":[{},{}],\"reshade_depth_output_extent\":[{},{}],\"reshade_depth_engine_jitter\":[{},{}],\"reshade_depth_streamline_jitter\":[{},{}],\"reshade_depth_sampling\":\"bilinear((id+0.5)*sample_extent/output_extent-engine_jitter)\"",
 					reshadeInfo.physicalSourceWidth, reshadeInfo.physicalSourceHeight,
 					reshadeInfo.sampleWidth, reshadeInfo.sampleHeight,
 					reshadeInfo.outputWidth, reshadeInfo.outputHeight,

@@ -118,7 +118,7 @@ namespace NRDiagnosticCapture
 					"DXGI formats: 28=RGBA8 UNORM; 34=RG16 FLOAT (motion); 41=R32 FLOAT (depth).\n"
 					"Optional nr_mv: format 34=RG16 FLOAT, NR-only pixel motion; jitter delta applies only before SR.\n"
 					"Optional reshade_depth: corrected ReShade depth snapshot. JSON records physical source, valid sample, output extents, and engine/Streamline jitter.\n"
-					"ReShade sampling is bilinear at (id+0.5)*sample_extent/output_extent-engine_jitter; Streamline jitter is the negated engine jitter.\n"
+					"ReShade sampling is bilinear at (id+0.5)*sample_extent/output_extent+engine_jitter; Streamline jitter is the negated engine jitter.\n"
 					"Other formats retain their original DXGI numeric format; no gamma or range conversion.\n"
 					"input is render-size; SR is display-size before NIS/UI. NR extent follows nr_position (before_sr/after_sr).\n"
 					"jitter is the published Streamline jitter in pixels. MV pixels are unmodified engine values.\n"
@@ -257,9 +257,9 @@ namespace NRDiagnosticCapture
 		// image matches the actual DEPTH binding. Keep the bounded budget large
 		// enough for that extra full-resolution readback, but still abort rather
 		// than stall or silently omit frames if disk/GPU progress cannot keep up.
-		constexpr auto readbackBudget = 1024ull * 1024 * 1024;
+		constexpr auto readbackBudget = 2ull * 1024 * 1024 * 1024;
 		if (image.bytes > readbackBudget || s.allocated > readbackBudget - image.bytes) {
-			Fail(s, "1 GiB readback budget exceeded"); return;
+			Fail(s, "2 GiB readback budget exceeded"); return;
 		}
 		const auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
 		const auto buffer = CD3DX12_RESOURCE_DESC::Buffer(image.bytes);

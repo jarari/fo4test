@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include "ENBRenderDomain.h"
 #include "NativeInterfaceUI.h"
 #include "Screenshot.h"
+#include "SceneReShade.h"
 #include "ReShadeDepth.h"
 #include "PipboyTemporalMask.h"
 
@@ -1862,6 +1864,9 @@ void Upscaling::LoadSettings()
 
 	auto streamline = Streamline::GetSingleton();
 	const auto currentUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
+	if (currentUpscaleMethodPreference == UpscaleMethod::kDisabled) {
+		SceneReShade::Reset();
+	}
 	if (ENBRenderDomain::Get().Active() && previousQualityMode != settings.qualityMode) {
 		logger::info("[ENB domain] Requested quality {}; active quality {} ({}x{}); scene-only resize queued, HWND/display unchanged",
 			settings.qualityMode, ENBRenderDomain::Get().Quality(), ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height());
@@ -3186,7 +3191,10 @@ void Upscaling::CheckResources()
 		if (dx12Ready) {
 			// SDK feature destruction and shared-resource release are only safe
 			// after all queued evaluations and intercepted Presents have drained.
-			if (!DX12SwapChain::GetSingleton()->WaitForGPUIdle()) {
+			// Switching SR/FG/NR resources can release D3D11 shared textures as
+			// well as D3D12 resources (especially in the ENB path). Drain both
+			// directions before destroying the old method's resources.
+			if (!DX12SwapChain::GetSingleton()->WaitForInteropIdle()) {
 				return;  // Keep the old resources and retry the transaction next frame.
 			}
 		}
@@ -3258,7 +3266,7 @@ ID3D11ComputeShader* Upscaling::GetReShadeDepthCS()
 	if (!reshadeDepthCS) {
 		// ReShade receives the world depth after the engine has rendered with its
 		// per-frame projection jitter. Sample the raster image at the inverse
-		// jittered position and write directly at output resolution. Keeping the
+    // jittered position and write directly at output resolution. Keeping the
 		// correction and the render-to-display conversion in one pass prevents
 		// ReShade's own screen-size sampler from applying a second, mismatched
 		// coordinate transform.
@@ -3280,6 +3288,9 @@ void main(uint3 id : SV_DispatchThreadID)
     // nearest-neighbor Load would therefore return the original texel for
     // almost every pixel and silently perform no correction. Interpolate the
     // four neighboring depth samples at the inverse-jittered center instead.
+    // The engine raster is displaced by -engine jitter. To recover the
+    // unjittered output coordinate, read the source at that displaced raster
+    // position, i.e. subtract engine jitter from the output center.
     float2 sourcePosition = (float2(id.xy) + 0.5) * SourceSize / OutputSize - Jitter;
     sourcePosition = clamp(sourcePosition, 0.5, SourceSize - 0.5);
     float2 samplePosition = sourcePosition - 0.5;
@@ -3719,6 +3730,43 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	}
 	osdRenderSize = renderSize;
 	osdNativeSize = displaySize;
+	// Run the native ReShade D3D11 runtime at the same late scene boundary as
+	// the old pre-SR path. Its real swapchain creation lets Generic Depth observe
+	// the game's device/resource events instead of receiving a synthetic DEPTH
+	// binding from this plugin.
+	{
+		DXGI_SWAP_CHAIN_DESC desc{};
+		auto* swap = reinterpret_cast<IDXGISwapChain*>(rendererData->renderWindow[0].swapChain);
+		if (swap && SUCCEEDED(swap->GetDesc(&desc))) {
+			auto* sceneDepth = reinterpret_cast<ID3D11ShaderResourceView*>(
+				rendererData->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
+			// Fallout 4 can keep the main depth allocation at display size while
+			// DLSS renders only a top-left dynamic-resolution rectangle. The native
+			// SRV therefore has the right resource identity but the wrong sampling
+			// coordinate space for the scene runtime. CopyDepth() already produces
+			// a render-sized raw-depth SRV for the same frame; use it here so ReShade
+			// sees a full scene-sized depth image instead of a cropped display-sized
+			// allocation. Native-AA keeps the engine SRV unchanged.
+			const auto renderWidth = static_cast<UINT>(renderSize.x);
+			const auto renderHeight = static_cast<UINT>(renderSize.y);
+			const bool hasDynamicDepthRect = renderWidth < static_cast<UINT>(displaySize.x) ||
+				renderHeight < static_cast<UINT>(displaySize.y);
+			if (hasDynamicDepthRect && depthOverrideTexture && depthOverrideTexture->srv) {
+				D3D11_TEXTURE2D_DESC overrideDesc{};
+				winrt::com_ptr<ID3D11Resource> overrideResource;
+				depthOverrideTexture->srv->GetResource(overrideResource.put());
+				if (auto overrideTexture = overrideResource.try_as<ID3D11Texture2D>()) {
+					overrideTexture->GetDesc(&overrideDesc);
+					if (overrideDesc.Width == renderWidth && overrideDesc.Height == renderHeight &&
+						overrideDesc.SampleDesc.Count == 1) {
+						sceneDepth = depthOverrideTexture->srv.get();
+					}
+				}
+			}
+			SceneReShade::Render(static_cast<ID3D11Texture2D*>(frameBufferResource), sceneDepth, desc.OutputWindow,
+				renderWidth, renderHeight);
+		}
+	}
 
 	if (!(virtualENB &&
 		(d3d12DLSSActive || upscaleMethod == UpscaleMethod::kSpatialFallback))) {
@@ -4171,6 +4219,7 @@ ID3D12Resource* Upscaling::GetCurrentSharedDepth() const
 
 void Upscaling::CaptureReShadeDepth()
 {
+	const auto engineFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
 	auto* swap = DX12SwapChain::GetSingleton();
 	if (!ReShadeDepth::IsRequested() || !swap->IsReady() || swap->IsWindowUnavailable() || GetCurrentSharedDepth()) {
 		return;
@@ -4180,7 +4229,7 @@ void Upscaling::CaptureReShadeDepth()
 		return;
 	}
 	reshadeDepthCaptureFrames[slot] = 0;
-	if (reshadeSceneDepthFrame != static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1) {
+	if (reshadeSceneDepthFrame != engineFrame) {
 		return;  // A restored/frozen background is not a new world-depth render.
 	}
 	try {
@@ -4231,10 +4280,16 @@ void Upscaling::CaptureReShadeDepth()
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 		desc.MiscFlags = 0;
 		auto* shader = GetReShadeDepthCS();
-		if (!shader || !swap->WaitForFrameSlot(slot, true)) {
+		if (!shader) {
 			return;
 		}
-		EnsureSharedD3D12Texture(this, desc, reshadeDepthSharedTextures[slot], reshadeDepthD3D12[slot], true);
+		if (!swap->WaitForReShadeDepthSlot(slot)) {
+			return;
+		}
+		// This is an independent ReShade source, not an NR guide. Use the normal
+		// deferred retirement path when its extent changes; an immediate interop
+		// drain here stalls DEPTH behind every queued SR/FG frame.
+		EnsureSharedD3D12Texture(this, desc, reshadeDepthSharedTextures[slot], reshadeDepthD3D12[slot], true, false);
 		auto* context = reinterpret_cast<ID3D11DeviceContext*>(data->context);
 		// Preserve the exact state touched by this optional fallback dispatch.
 		ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
@@ -4256,10 +4311,20 @@ void Upscaling::CaptureReShadeDepth()
 			float2 jitter;
 			float2 padding{};
 		};
+		// Use the offset actually applied to the projection for this scene. The
+		// cached temporal value can advance before this late render hook runs.
+		const auto* viewportState = Util::State_GetSingleton();
+		float2 appliedJitter = jitter;
+		if (viewportState && sampleWidth && sampleHeight) {
+			appliedJitter = {
+				-viewportState->offsetX * static_cast<float>(sampleWidth) * 0.5f,
+				 viewportState->offsetY * static_cast<float>(sampleHeight) * 0.5f
+			};
+		}
 		const ReShadeDepthConstants constants{
 			{ static_cast<float>(sampleWidth), static_cast<float>(sampleHeight) },
 			{ static_cast<float>(desc.Width), static_cast<float>(desc.Height) },
-			jitter,
+			appliedJitter,
 			{}
 		};
 		context->UpdateSubresource(reshadeDepthConstants.get(), 0, nullptr, &constants, 0, 0);
@@ -4289,12 +4354,20 @@ void Upscaling::CaptureReShadeDepth()
 		for (UINT i = 0; i < instanceCount; ++i) {
 			if (instances[i]) instances[i]->Release();
 		}
+		// The dispatch is recorded and all temporary bindings are restored.
+		// Publish this exact shared resource through the dedicated DEPTH bridge;
+		// this fence is independent from the SR/FG/NR command-fence domain.
+		uint64_t readyFence = 0;
+		if (!swap->SignalReShadeDepthReady(readyFence)) {
+			return;
+		}
+		ReShadeDepth::PublishCapturedDepth(reshadeDepthD3D12[slot].get(), slot, engineFrame, readyFence);
 		reshadeDepthPhysicalSourceWidths[slot] = physicalSourceWidth;
 		reshadeDepthPhysicalSourceHeights[slot] = physicalSourceHeight;
 		reshadeDepthSampleWidths[slot] = sampleWidth;
 		reshadeDepthSampleHeights[slot] = sampleHeight;
-		reshadeDepthJitters[slot] = jitter;
-		reshadeDepthCaptureFrames[slot] = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
+		reshadeDepthJitters[slot] = appliedJitter;
+		reshadeDepthCaptureFrames[slot] = engineFrame;
 	} catch (const std::exception& e) {
 		logger::error("[ReShade depth] Fallback capture failed: {}", e.what());
 	}

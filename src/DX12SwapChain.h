@@ -106,6 +106,13 @@ public:
 	void WaitForFrameStart();
 	ID3D12Device* GetD3D12Device() const { return d3d12Device.get(); }
 	bool WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly = false);
+	// ReShade DEPTH uses a dedicated D3D11<->D3D12 bridge. It never waits on
+	// the SR/FG/NR command-fence domain.
+	bool WaitForReShadeDepthSlot(UINT a_frameIndex);
+	bool SignalReShadeDepthReady(UINT64& a_value);
+	void MarkReShadeDepthRead(UINT a_frameIndex, UINT64 a_fenceValue);
+	ID3D12Fence* GetReShadeDepthReadyFence() const { return reshadeDepthReadyFence.get(); }
+	ID3D12Fence* GetReShadeDepthReadFence() const { return reshadeDepthReadFence.get(); }
 	// Retirement is stamped after this frame's recorded work is submitted.
 	bool GetRetirementFences(uint64_t& a_d3d11, uint64_t& a_d3d12);
 	bool AreRetirementFencesComplete(uint64_t a_d3d11, uint64_t a_d3d12) const;
@@ -160,8 +167,6 @@ private:
 		winrt::com_ptr<ID3D12GraphicsCommandList4> list;
 		std::unique_ptr<D3D11D3D12SharedTexture> presentStaging;
 		winrt::com_ptr<ID3D12Resource> retainedPresentOverride;
-		winrt::com_ptr<ID3D12Resource> retainedReShadeDepth;
-		winrt::com_ptr<ID3D12Resource> retainedReShadeSnapshot;
 		// Reused only after this context's fence completes, unlike a global
 		// upload buffer which CPU text updates could overwrite while in flight.
 		winrt::com_ptr<ID3D12Resource> osdUpload;
@@ -194,6 +199,10 @@ private:
 	winrt::com_ptr<ID3D12Fence> d3d12Fence;
 	winrt::com_ptr<ID3D12Fence> commandFence;
 	winrt::com_ptr<ID3D11Fence> d3d11CommandFence;
+	winrt::com_ptr<ID3D11Fence> reshadeDepthReadyFence11;
+	winrt::com_ptr<ID3D11Fence> reshadeDepthReadFence11;
+	winrt::com_ptr<ID3D12Fence> reshadeDepthReadyFence;
+	winrt::com_ptr<ID3D12Fence> reshadeDepthReadFence;
 	winrt::com_ptr<ID3D12Resource> swapChainBuffers[kDX12FrameCount];
 	std::unique_ptr<Texture2D> swapChainBufferProxy;
 	std::unique_ptr<D3D11D3D12SharedTexture> swapChainBufferProxyENB;
@@ -225,9 +234,11 @@ private:
 	std::array<UINT64, kDX12FrameCount> frameSlotFenceValues{};
 	std::array<UINT64, kDX12FrameCount> inputReuseFenceValues{};
 	std::array<UINT64, kDX12FrameCount> queuedReuseFenceValues{};
+	std::array<UINT64, kDX12FrameCount> reshadeDepthReuseFenceValues{};
+	std::array<UINT64, kDX12FrameCount> queuedReShadeDepthFenceValues{};
+	UINT64 reshadeDepthReadyValue = 1;
 	std::array<UINT64, kDX12FrameCount> presentSlotFenceValues{};
 	std::array<bool, kDX12FrameCount> inputsUsedAtPresent{};
-	std::array<uint64_t, kDX12FrameCount> reshadeSnapshotFrames{};
 	bool fidelityFXFrameGenerationSwapChainAllowed = false;
 	double desktopRefreshHz = 0.0;
 	PresentPacing presentPacing;
