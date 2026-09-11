@@ -39,14 +39,14 @@ wrapper, rather than an arbitrary patched module. Its compiled maximum also
 caps the advertised state. Inspected plugin/provider DLL references are retained
 for plugin lifetime to prevent cached patch pointers from becoming stale.
 
-The host adaptation does not import upstream's Vulkan/control-route machinery,
-but it now installs a per-provider D3D12 `NVSDK_NGX_D3D12_CreateFeature` entry
-detour.  The first call for `NVSDK_NGX_Feature_FrameGeneration` selects the
-provider that NGX actually entered, then publishes the Ada midpoint correction
-for that image.  Passive module discovery still patches device capability only;
-it never publishes a midpoint fix for an unconfirmed candidate.  A provider
-change after selection remains fail-closed and requires recreation because the
-midpoint publication is process-global.
+The host adaptation does not import upstream's Vulkan/control-route machinery.
+Provider discovery first publishes the Ada midpoint correction when the loader
+returns the provider, or after a complete scan when exactly one candidate is
+present. This keeps the correction ahead of NGX feature initialization. A
+per-provider D3D12 `NVSDK_NGX_D3D12_CreateFeature` entry detour is installed
+only when multiple candidates remain ambiguous; it is a late fallback, not the
+normal publication path. A provider change after selection remains fail-closed
+and requires recreation because the midpoint publication is process-global.
 
 `Streamline::Initialize` clears both `eAllowOTA` and `eLoadDownloadedPlugins`.
 Upstream's conditional OTA-enabling and selective-wrapper redirect policies

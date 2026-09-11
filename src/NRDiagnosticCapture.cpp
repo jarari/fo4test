@@ -253,10 +253,13 @@ namespace NRDiagnosticCapture
 		image.sourceHeight = sourceHeight;
 		image.name = name;
 		device->GetCopyableFootprints(&desc, 0, 1, 0, &image.footprint, &image.rows, &image.rowBytes, &image.bytes);
-		// Abort, rather than stall or silently omit frames, if disk/GPU progress
-		// cannot keep up with the bounded readback budget.
-		if (image.bytes > 512ull * 1024 * 1024 || s.allocated > 512ull * 1024 * 1024 - image.bytes) {
-			Fail(s, "512 MiB readback budget exceeded"); return;
+		// ReShade depth is captured at presentation resolution so the diagnostic
+		// image matches the actual DEPTH binding. Keep the bounded budget large
+		// enough for that extra full-resolution readback, but still abort rather
+		// than stall or silently omit frames if disk/GPU progress cannot keep up.
+		constexpr auto readbackBudget = 1024ull * 1024 * 1024;
+		if (image.bytes > readbackBudget || s.allocated > readbackBudget - image.bytes) {
+			Fail(s, "1 GiB readback budget exceeded"); return;
 		}
 		const auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
 		const auto buffer = CD3DX12_RESOURCE_DESC::Buffer(image.bytes);

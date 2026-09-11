@@ -505,16 +505,64 @@ namespace RTX40MFGUnlock
 				if (!result.candidate) {
 					logger::warn("[RTX40MFGUnlock] NGX provider signature is unsupported: {}", Narrow(path.c_str()));
 				}
-				if (record.ngxPatched && midpoint_fix::AdapterVerified()) {
-					// Do not publish the process-global midpoint descriptor while
-					// this is only a passive module candidate.  The provider may be
-					// an inactive game-local DLL while NGX selects the ProgramData
-					// image, or vice versa.  The entry detour below resolves that
-					// choice at the first DLSS-G CreateFeature call.
-					record.createHookInstalled = InstallNgxCreateFeatureHook(record, path);
-				}
 			}
 			return record;
+		}
+
+		bool TryPatchSoleProviderLocked()
+		{
+			if (!midpoint_fix::AdapterVerified() || midpoint_fix::Ready()) {
+				return midpoint_fix::Ready();
+			}
+
+			ModuleRecord* candidate = nullptr;
+			std::size_t candidateCount = 0;
+			for (auto& record : g_modules) {
+				if (!record.ngx || !record.ngxPatched) {
+					continue;
+				}
+				candidate = &record;
+				++candidateCount;
+			}
+			if (candidateCount != 1 || !candidate) {
+				return false;
+			}
+
+			const auto path = LoadedModulePath(candidate->module);
+			if (!midpoint_fix::PatchProvider(candidate->module, path.c_str())) {
+				return false;
+			}
+
+			candidate->midpointPatched = true;
+			g_activeNgxProvider = candidate->module;
+			logger::info(
+				"[RTX40MFGUnlock] Active NGX provider selected before DLSS-G CreateFeature: {}",
+				Narrow(path.c_str()));
+			return true;
+		}
+
+		void InstallAmbiguousProviderHooksLocked()
+		{
+			if (midpoint_fix::Ready()) {
+				return;
+			}
+
+			std::size_t candidateCount = 0;
+			for (const auto& record : g_modules) {
+				candidateCount += record.ngx && record.ngxPatched ? 1u : 0u;
+			}
+			if (candidateCount < 2) {
+				return;
+			}
+
+			for (auto& record : g_modules) {
+				if (!record.ngx || !record.ngxPatched || record.midpointPatched ||
+					record.createHookInstalled) {
+					continue;
+				}
+				const auto path = LoadedModulePath(record.module);
+				record.createHookInstalled = InstallNgxCreateFeatureHook(record, path);
+			}
 		}
 
 		bool PatchLoadedModulesLocked()
@@ -544,6 +592,12 @@ namespace RTX40MFGUnlock
 				} while (Module32NextW(snapshot, &entry));
 			}
 			CloseHandle(snapshot);
+
+			// Publish the midpoint payload before NGX initializes the feature. The
+			// complete scan makes a single candidate unambiguous; entry observers are
+			// reserved for the genuinely ambiguous multi-provider case.
+			TryPatchSoleProviderLocked();
+			InstallAmbiguousProviderHooksLocked();
 
 			return Ready();
 		}
@@ -575,7 +629,7 @@ namespace RTX40MFGUnlock
 		return midpoint_fix::AdapterVerified();
 	}
 
-	void InspectLoadedModule(HMODULE a_module) noexcept
+	void InspectLoadedModule(HMODULE a_module, bool a_tryEarlyProviderPatch) noexcept
 	{
 		// Retain inspected code: cached patch addresses and upstream PTX descriptors
 		// must not outlive their DLL. Only relevant modules keep this reference.
@@ -599,9 +653,9 @@ namespace RTX40MFGUnlock
 						g_modules.push_back(record);
 						retained = nullptr; // Deliberately held for plugin lifetime.
 					}
-				} else if (existing->ngxPatched && !existing->createHookInstalled) {
-					const auto path = LoadedModulePath(retained);
-					existing->createHookInstalled = InstallNgxCreateFeatureHook(*existing, path);
+				}
+				if (a_tryEarlyProviderPatch) {
+					TryPatchSoleProviderLocked();
 				}
 			}
 		} catch (...) {
@@ -637,8 +691,7 @@ namespace RTX40MFGUnlock
 		return midpoint_fix::AdapterVerified() && midpoint_fix::Ready() &&
 			wrapper != g_modules.end() &&
 			wrapper->wrapperPatched && provider != g_modules.end() &&
-			provider->ngx && provider->ngxPatched && provider->createHookInstalled &&
-			provider->midpointPatched;
+			provider->ngx && provider->ngxPatched && provider->midpointPatched;
 	}
 
 	std::uint32_t MaximumGeneratedFrames() noexcept

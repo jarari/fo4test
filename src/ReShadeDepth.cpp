@@ -377,7 +377,7 @@ bool ReShadeDepth::Prepare(ID3D12GraphicsCommandList* a_list, ID3D12Resource* a_
 				}
 			}
 			if (!g_runtime) return false;
-			logger::info("[ReShade depth] Matched game D3D12 runtime; jitter-corrected render-resolution depth, no linearization");
+			logger::info("[ReShade depth] Matched game D3D12 runtime; jitter-corrected display-resolution depth, no linearization");
 		}
 		if (!g_copyReady) {
 			DX::ThrowIfFailed(sourceDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(g_copyReady.put())));

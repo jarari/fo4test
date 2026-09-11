@@ -21,7 +21,7 @@ HMODULE WINAPI HookLoadLibraryA(LPCSTR name)
     }
     const auto module = original(name);
     const auto error = GetLastError();
-    InspectLoadedModule(module);
+    InspectLoadedModule(module, true);
     SetLastError(error);
     return module;
 }
@@ -34,7 +34,7 @@ HMODULE WINAPI HookLoadLibraryW(LPCWSTR name)
     }
     const auto module = original(name);
     const auto error = GetLastError();
-    InspectLoadedModule(module);
+    InspectLoadedModule(module, true);
     SetLastError(error);
     return module;
 }
@@ -47,7 +47,7 @@ HMODULE WINAPI HookLoadLibraryExA(LPCSTR name, HANDLE file, DWORD flags)
     }
     const auto module = original(name, file, flags);
     const auto error = GetLastError();
-    InspectLoadedModule(module);
+    InspectLoadedModule(module, true);
     SetLastError(error);
     return module;
 }
@@ -60,7 +60,7 @@ HMODULE WINAPI HookLoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags)
     }
     const auto module = original(name, file, flags);
     const auto error = GetLastError();
-    InspectLoadedModule(module);
+    InspectLoadedModule(module, true);
     SetLastError(error);
     return module;
 }

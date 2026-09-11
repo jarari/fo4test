@@ -3258,8 +3258,10 @@ ID3D11ComputeShader* Upscaling::GetReShadeDepthCS()
 	if (!reshadeDepthCS) {
 		// ReShade receives the world depth after the engine has rendered with its
 		// per-frame projection jitter. Sample the raster image at the inverse
-		// jittered position; this keeps ReShade's depth grid aligned with the
-		// unjittered color pixel centers without touching the engine depth target.
+		// jittered position and write directly at output resolution. Keeping the
+		// correction and the render-to-display conversion in one pass prevents
+		// ReShade's own screen-size sampler from applying a second, mismatched
+		// coordinate transform.
 		constexpr char source[] = R"(
 Texture2D<float> DepthInput : register(t0);
 RWTexture2D<float> DepthOutput : register(u0);
@@ -4144,7 +4146,8 @@ Upscaling::ReShadeDepthCaptureInfo Upscaling::GetCurrentSharedDepthInfo() const
 	const auto frame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount) + 1;
 	// ReShade must not reuse the SR/FG depth snapshots: those resources retain
 	// the engine's jittered raster grid and may be consumed asynchronously by
-	// Streamline. Its bridge owns a separate corrected snapshot.
+	// Streamline. Its bridge owns a separate corrected, display-resolution
+	// snapshot.
 	if (reshadeDepthCaptureFrames[slot] != frame || !reshadeDepthD3D12[slot]) {
 		return {};
 	}
@@ -4214,6 +4217,14 @@ void Upscaling::CaptureReShadeDepth()
 		// rather than the physical allocation size.
 		const auto sampleWidth = desc.Width;
 		const auto sampleHeight = desc.Height;
+		const auto outputWidth = std::max<UINT>(1, swap->swapChainDesc.Width);
+		const auto outputHeight = std::max<UINT>(1, swap->swapChainDesc.Height);
+		// The DEPTH semantic is consumed by effects running over the real
+		// presentation surface, not over the engine's dynamic-resolution scene
+		// rectangle. Preserve the source extent for sampling but make the shared
+		// output match ReShade's screen coordinates.
+		desc.Width = outputWidth;
+		desc.Height = outputHeight;
 		desc.Format = DXGI_FORMAT_R32_FLOAT;
 		desc.MipLevels = 1;
 		desc.ArraySize = 1;
