@@ -593,19 +593,31 @@ namespace
 		}
 	}
 
+	bool CalculatePromotedPipboyExtent(uint32_t& width, uint32_t& height, uint32_t displayHeight)
+	{
+		if (!width || !height || !displayHeight || height >= displayHeight) {
+			return false;
+		}
+		// Match the physical RT promotion exactly: preserve the INI aspect ratio,
+		// round the width up, and make the height the final display height.
+		const auto scaledWidth = (uint64_t{ width } * displayHeight + height - 1) / height;
+		if (scaledWidth > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+			displayHeight > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+			return false;
+		}
+		width = static_cast<uint32_t>(scaledWidth);
+		height = displayHeight;
+		return true;
+	}
+
 	bool PromotePipboyExtent(uint32_t& width, uint32_t& height)
 	{
 		const auto displayHeight = DX12SwapChain::GetSingleton()->swapChainDesc.Height;
 		if (!enabled || !pipboyAllocationReady || !ENBRenderDomain::Get().Active() ||
-			!width || !height || height >= displayHeight) { return false; }
-		// Keep the INI aspect and logical menu coordinates. Only the physical
-		// color/depth allocation grows; never reduce a user's higher INI setting.
-		const auto scaledWidth = (uint64_t{ width } * displayHeight + height - 1) / height;
-		if (scaledWidth > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
-			displayHeight > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION) { return false; }
-		width = static_cast<uint32_t>(scaledWidth);
-		height = displayHeight;
-		return true;
+			!width || !height || height >= displayHeight) {
+			return false;
+		}
+		return CalculatePromotedPipboyExtent(width, height, displayHeight);
 	}
 
 	struct CreateDepthTarget
@@ -915,33 +927,15 @@ namespace
 	}
 }
 
-void NativeInterfaceUI::ScaleLegacyNGPipboyLogicalSpace(uint32_t a_displayHeight)
+void NativeInterfaceUI::SynchronizePipboyLogicalSpace(uint32_t a_displayHeight)
 {
-	// PromotePipboyExtent grows only the PHYSICAL Pip-Boy colour/depth allocation to
-	// the display height. Three LOGICAL quantities describe that same surface, and if
-	// they do not follow the identical growth they end up describing a small top-left
-	// corner of it:
-	//   * uPipboyTarget{Width,Height} - the offscreen buffer size the engine reports
-	//     through Interface3D::Renderer::Offscreen_GetRenderTarget{Width,Height}.
-	//   * uPipboyConstraint* - where Pip-Boy content is placed inside that buffer.
-	//   * CursorMenu's hard-coded { 0, 0, 1920, 1080 } viewport rect. CursorMenu
-	//     special-cases the "PipboyMenu" renderer and hand-builds its viewport rather
-	//     than going through Interface3D::Renderer::SetViewport like every other
-	//     custom renderer, and Scaleform clips the draw to min(rect, buffer). With a
-	//     promoted target that stranded the mouse cursor sprite inside a
-	//     uPipboyTarget-sized top-left window of the map, and no INI setting can
-	//     reach the 1920x1080 constant.
-	// Scaling all three by one factor leaves the Pip-Boy visually identical while the
-	// cursor both covers and correctly addresses the whole surface.
-	static bool scaled = false;
-	if (!REX::FModule::IsRuntimeNG() || scaled || !a_displayHeight || !ENBRenderDomain::Get().Active()) {
-		return;
-	}
-	// All or nothing: scaling the buffer without the rect would move the clip rather
-	// than remove it, so bail out entirely if the rect cannot be located.
-	auto* cursorRect = FindPipboyCursorViewportRect();
-	if (!cursorRect) {
-		logger::warn("[ENB UI] Pip-Boy cursor viewport rect not found; leaving the Pip-Boy logical space unscaled");
+	// The engine reports uPipboyTarget{Width,Height} to Interface3D while the
+	// physical RT60/61/depth3 hooks can promote those allocations to the display
+	// height. Keep the logical target on the same extent, using the exact same
+	// aspect-preserving ceil rule as the physical allocation hook.
+	static bool synchronized = false;
+	if (synchronized || !a_displayHeight || !ENBRenderDomain::Get().Active() ||
+		!enabled || !pipboyAllocationReady) {
 		return;
 	}
 	auto* targetWidth = RE::GetINISetting("uPipboyTargetWidth:Display");
@@ -951,19 +945,28 @@ void NativeInterfaceUI::ScaleLegacyNGPipboyLogicalSpace(uint32_t a_displayHeight
 	}
 	const auto logicalWidth = targetWidth->GetUInt();
 	const auto logicalHeight = targetHeight->GetUInt();
-	if (!logicalWidth || !logicalHeight || logicalHeight >= a_displayHeight) {
-		return;  // already display-sized: nothing is promoted, so nothing to scale
+	if (!logicalWidth || !logicalHeight) {
+		return;
 	}
-	const auto scale = static_cast<double>(a_displayHeight) / static_cast<double>(logicalHeight);
+	auto promotedWidth = logicalWidth;
+	auto promotedHeight = logicalHeight;
+	if (!CalculatePromotedPipboyExtent(promotedWidth, promotedHeight, a_displayHeight)) {
+		synchronized = true;
+		return;  // already display-sized (or larger), so no promotion is needed
+	}
+	const auto scale = static_cast<double>(promotedHeight) / static_cast<double>(logicalHeight);
 	const auto scaleValue = [scale](uint32_t a_value) {
 		return static_cast<uint32_t>(std::lround(static_cast<double>(a_value) * scale));
 	};
 
-	// Matches PromotePipboyExtent's own aspect-preserving growth, so the engine now
-	// allocates the promoted extent directly and the promotion becomes a no-op.
-	targetWidth->SetUInt(scaleValue(logicalWidth));
-	targetHeight->SetUInt(a_displayHeight);
-
+	// This target synchronization is needed on both OG and AE. The gamepad
+	// constraints are expressed in the same logical Pip-Boy surface as the target,
+	// so keep their proportions when the physical allocation is promoted. Without
+	// this, a controller present during startup enters InitPipboy with the old
+	// high-resolution constraint rectangle while a later keyboard-to-controller
+	// switch leaves constraints cleared, producing the input-order-dependent bug.
+	targetWidth->SetUInt(promotedWidth);
+	targetHeight->SetUInt(promotedHeight);
 	static constexpr const char* constraints[]{
 		"uPipboyConstraintTLX:Pipboy",
 		"uPipboyConstraintTLY:Pipboy",
@@ -979,15 +982,22 @@ void NativeInterfaceUI::ScaleLegacyNGPipboyLogicalSpace(uint32_t a_displayHeight
 			setting->SetUInt(scaleValue(setting->GetUInt()));
 		}
 	}
-
-	// { left, top, width, height }; only the extent grows, the origin stays 0,0.
-	const auto rectWidth = static_cast<std::int32_t>(scaleValue(1920));
-	const auto rectHeight = static_cast<std::int32_t>(scaleValue(1080));
-	REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(cursorRect + 2), rectWidth);
-	REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(cursorRect + 3), rectHeight);
-
-	scaled = true;
-	logger::info("[ENB UI] Scaled Pip-Boy logical space x{:.4f}: target {}x{} -> {}x{}, cursor rect 1920x1080 -> {}x{}",
-		scale, logicalWidth, logicalHeight, targetWidth->GetUInt(), targetHeight->GetUInt(),
-		rectWidth, rectHeight);
+	logger::info("[ENB UI] Pip-Boy cursor constraint domain scaled x{:.4f} for promoted logical target", scale);
+	if (REX::FModule::IsRuntimeNG()) {
+		auto* cursorRect = FindPipboyCursorViewportRect();
+		if (!cursorRect) {
+			logger::warn("[ENB UI] Pip-Boy cursor viewport rect not found; logical target synchronized without NG cursor repair");
+		} else {
+			// { left, top, width, height }; only the extent grows, the origin stays 0,0.
+			const auto rectWidth = static_cast<std::int32_t>(scaleValue(1920));
+			const auto rectHeight = static_cast<std::int32_t>(scaleValue(1080));
+			REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(cursorRect + 2), rectWidth);
+			REL::WriteSafeData(reinterpret_cast<std::uintptr_t>(cursorRect + 3), rectHeight);
+			logger::info("[ENB UI] Scaled Pip-Boy NG constraints x{:.4f}, cursor rect 1920x1080 -> {}x{}",
+				scale, rectWidth, rectHeight);
+		}
+	}
+	synchronized = true;
+	logger::info("[ENB UI] Pip-Boy logical target {}x{} -> {}x{} (RT60/61/depth3 physical extent)",
+		logicalWidth, logicalHeight, promotedWidth, promotedHeight);
 }

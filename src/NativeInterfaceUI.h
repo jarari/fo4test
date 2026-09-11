@@ -4,7 +4,7 @@
 
 namespace NativeInterfaceUI
 {
-	void ScaleLegacyNGPipboyLogicalSpace(uint32_t displayHeight);
+	void SynchronizePipboyLogicalSpace(uint32_t displayHeight);
 	void InstallHooks(bool a_nativeDomains);
 	void ReleaseResources();
 	bool IsRendering();

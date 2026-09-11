@@ -35,8 +35,7 @@ void ENBRenderDomain::Initialize(uint32_t a_displayWidth, uint32_t a_displayHeig
 	active = true;
 	logger::info("[ENB domain] scene={}x{} display={}x{} quality={}; low-resolution ENB -> LDR NR -> SR -> native screen-space UI. Live quality changes resize scene resources only; HWND and real swapchain unchanged",
 		width, height, a_displayWidth, a_displayHeight, quality);
-	// NG has no binary verification for the OG/AE cursor changes.
-	if (REX::FModule::IsRuntimeNG()) NativeInterfaceUI::ScaleLegacyNGPipboyLogicalSpace(a_displayHeight);
+	NativeInterfaceUI::SynchronizePipboyLogicalSpace(a_displayHeight);
 
 }
 
