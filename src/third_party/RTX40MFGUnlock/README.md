@@ -18,7 +18,7 @@ This includes the validated 310.1–310.9 provider profiles, payload/layout chec
 DLSS-G versus DirectSR identity checks, and 1/3/5 generated-frame wrapper limits.
 The v1.2.1 hotfix admits exactly DLSS-G 310.9.1 using the existing verified
 310.9 temporal profile; unknown 310.9.2 remains rejected. The host integration
-and loader adaptation are unchanged from the v1.2 import.
+and loader adaptation are maintained locally for Fallout 4.
 `integration.*` and `loader_discovery.cpp` adapt discovery and fail-closed pattern
 patching from upstream `patcher.cpp` to this Fallout 4 F4SE plugin.
 
@@ -39,11 +39,14 @@ wrapper, rather than an arbitrary patched module. Its compiled maximum also
 caps the advertised state. Inspected plugin/provider DLL references are retained
 for plugin lifetime to prevent cached patch pointers from becoming stale.
 
-Unlike upstream's standalone backend, this host adaptation does not install
-NGX CreateFeature entry/resolver detours or its Vulkan/control-route machinery.
-Provider readiness therefore requires exactly one discovered implementation;
-multiple providers fail closed to 2X, rather than guessing which is active.
-This intentionally does not claim full upstream multi-provider routing support.
+The host adaptation does not import upstream's Vulkan/control-route machinery,
+but it now installs a per-provider D3D12 `NVSDK_NGX_D3D12_CreateFeature` entry
+detour.  The first call for `NVSDK_NGX_Feature_FrameGeneration` selects the
+provider that NGX actually entered, then publishes the Ada midpoint correction
+for that image.  Passive module discovery still patches device capability only;
+it never publishes a midpoint fix for an unconfirmed candidate.  A provider
+change after selection remains fail-closed and requires recreation because the
+midpoint publication is process-global.
 
 `Streamline::Initialize` clears both `eAllowOTA` and `eLoadDownloadedPlugins`.
 Upstream's conditional OTA-enabling and selective-wrapper redirect policies

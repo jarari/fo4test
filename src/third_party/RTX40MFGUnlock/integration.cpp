@@ -8,9 +8,11 @@
 #include "universal_wrapper_profile.h"
 
 #include <TlHelp32.h>
+#include <nvsdk_ngx.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -55,7 +57,30 @@ namespace RTX40MFGUnlock
 			std::uint32_t compiledMaximum = 0;
 			bool ngx = false;
 			bool ngxPatched = false;
+			bool createHookInstalled = false;
+			std::int32_t createHookSlot = -1;
 			bool midpointPatched = false;
+		};
+
+		// NGX can expose the same provider ABI from the game-local DLL and from
+		// an NVIDIA NGX model image with an opaque .bin name.  The old integration
+		// patched the first image found by module enumeration.  Keep a small set of
+		// per-image entry detours instead, so the provider which actually receives
+		// the DLSS-G CreateFeature call can be selected before the call continues.
+		using NgxCreateFeature_t = NVSDK_NGX_Result(NVSDK_CONV*)(
+			ID3D12GraphicsCommandList*,
+			NVSDK_NGX_Feature,
+			NVSDK_NGX_Parameter*,
+			NVSDK_NGX_Handle**);
+		constexpr std::size_t kMaxNgxCreateHooks = 16;
+
+		struct NgxCreateHookSlot
+		{
+			HMODULE module = nullptr;
+			NgxCreateFeature_t original = nullptr;
+			std::uintptr_t target = 0;
+			std::atomic<bool> installing = false;
+			std::atomic<bool> frameGenerationObserved = false;
 		};
 
 		constexpr std::array<std::uint8_t, 10> kWrapperPattern{
@@ -90,7 +115,9 @@ namespace RTX40MFGUnlock
 
 		std::recursive_mutex g_mutex;
 		HMODULE g_activeWrapper = nullptr;
+		HMODULE g_activeNgxProvider = nullptr;
 		std::vector<ModuleRecord> g_modules;
+		std::array<NgxCreateHookSlot, kMaxNgxCreateHooks> g_ngxCreateHooks{};
 		bool g_midpointLogConnected = false;
 
 		std::string Narrow(const wchar_t* a_text)
@@ -284,6 +311,174 @@ namespace RTX40MFGUnlock
 			return { true, true, match };
 		}
 
+		void ObserveActiveNgxProvider(std::size_t a_slotIndex) noexcept
+		{
+			if (a_slotIndex >= g_ngxCreateHooks.size()) {
+				return;
+			}
+
+			auto& slot = g_ngxCreateHooks[a_slotIndex];
+			while (slot.installing.load(std::memory_order_acquire)) {
+				YieldProcessor();
+			}
+			bool expected = false;
+			if (!slot.frameGenerationObserved.compare_exchange_strong(
+					expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+				return;
+			}
+
+			const auto module = slot.module;
+			if (!module || !midpoint_fix::AdapterVerified()) {
+				return;
+			}
+
+			std::lock_guard lock(g_mutex);
+			const auto record = std::find_if(g_modules.begin(), g_modules.end(),
+				[module](const ModuleRecord& a_record) { return a_record.module == module; });
+			if (record == g_modules.end() || !record->ngx || !record->ngxPatched) {
+				logger::warn("[RTX40MFGUnlock] Active NGX provider was not a patched candidate: {}",
+					Narrow(LoadedModulePath(module).c_str()));
+				return;
+			}
+
+			if (g_activeNgxProvider && g_activeNgxProvider != module) {
+				// A provider change after the first FG pipeline cannot be switched
+				// safely because the midpoint publication is process-global.  Keep
+				// the first confirmed route and fail closed until the game recreates.
+				const auto path = LoadedModulePath(module);
+				// Let midpoint_fix record the same transition as a restart-required
+				// failure.  It will reject the second image without touching it.
+				(void)midpoint_fix::PatchProvider(module, path.c_str());
+				logger::warn(
+					"[RTX40MFGUnlock] Active NGX provider changed after selection: active={} observed={}; restart required",
+					Narrow(LoadedModulePath(g_activeNgxProvider).c_str()),
+					Narrow(path.c_str()));
+				return;
+			}
+
+			const auto path = LoadedModulePath(module);
+			if (!midpoint_fix::PatchProvider(module, path.c_str())) {
+				logger::warn("[RTX40MFGUnlock] Active NGX provider midpoint publication failed: {}",
+					Narrow(path.c_str()));
+				return;
+			}
+
+			g_activeNgxProvider = module;
+			record->midpointPatched = true;
+			logger::info("[RTX40MFGUnlock] Active NGX provider selected from DLSS-G CreateFeature: {}",
+				Narrow(path.c_str()));
+		}
+
+		template <std::size_t Index>
+		NVSDK_NGX_Result NVSDK_CONV NgxCreateFeatureHook(
+			ID3D12GraphicsCommandList* a_commandList,
+			NVSDK_NGX_Feature a_feature,
+			NVSDK_NGX_Parameter* a_parameters,
+			NVSDK_NGX_Handle** a_handle) noexcept
+		{
+			static_assert(Index < kMaxNgxCreateHooks);
+			auto& slot = g_ngxCreateHooks[Index];
+			const auto original = slot.original;
+			if (!original) {
+				return NVSDK_NGX_Result_FAIL_NotInitialized;
+			}
+			if (a_feature == NVSDK_NGX_Feature_FrameGeneration) {
+				ObserveActiveNgxProvider(Index);
+			}
+			return original(a_commandList, a_feature, a_parameters, a_handle);
+		}
+
+		using NgxCreateHook_t = NgxCreateFeature_t;
+		constexpr std::array<NgxCreateHook_t, kMaxNgxCreateHooks> kNgxCreateHookFunctions{
+			&NgxCreateFeatureHook<0>,
+			&NgxCreateFeatureHook<1>,
+			&NgxCreateFeatureHook<2>,
+			&NgxCreateFeatureHook<3>,
+			&NgxCreateFeatureHook<4>,
+			&NgxCreateFeatureHook<5>,
+			&NgxCreateFeatureHook<6>,
+			&NgxCreateFeatureHook<7>,
+			&NgxCreateFeatureHook<8>,
+			&NgxCreateFeatureHook<9>,
+			&NgxCreateFeatureHook<10>,
+			&NgxCreateFeatureHook<11>,
+			&NgxCreateFeatureHook<12>,
+			&NgxCreateFeatureHook<13>,
+			&NgxCreateFeatureHook<14>,
+			&NgxCreateFeatureHook<15>
+		};
+
+		bool InstallNgxCreateFeatureHook(ModuleRecord& a_record, const std::wstring& a_path)
+		{
+			if (!a_record.ngx || a_record.createHookInstalled) {
+				return a_record.createHookInstalled;
+			}
+
+			const auto target = reinterpret_cast<std::uintptr_t>(
+				GetProcAddress(a_record.module, "NVSDK_NGX_D3D12_CreateFeature"));
+			if (!target) {
+				logger::warn("[RTX40MFGUnlock] NGX CreateFeature export missing: {}",
+					Narrow(a_path.c_str()));
+				return false;
+			}
+
+			HMODULE owner = nullptr;
+			if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+				reinterpret_cast<LPCWSTR>(target), &owner)) {
+				return false;
+			}
+			const bool ownedByModule = owner == a_record.module;
+			FreeLibrary(owner);
+			if (!ownedByModule) {
+				logger::warn("[RTX40MFGUnlock] NGX CreateFeature export is forwarded: {}",
+					Narrow(a_path.c_str()));
+				return false;
+			}
+
+			std::size_t slotIndex = 0;
+			for (; slotIndex < g_ngxCreateHooks.size(); ++slotIndex) {
+				if (g_ngxCreateHooks[slotIndex].module == a_record.module) {
+					a_record.createHookInstalled = true;
+					a_record.createHookSlot = static_cast<std::int32_t>(slotIndex);
+					return true;
+				}
+				if (!g_ngxCreateHooks[slotIndex].module) {
+					break;
+				}
+			}
+			if (slotIndex == g_ngxCreateHooks.size()) {
+				logger::warn("[RTX40MFGUnlock] Too many NGX providers for CreateFeature routing: {}",
+					Narrow(a_path.c_str()));
+				return false;
+			}
+
+			auto& slot = g_ngxCreateHooks[slotIndex];
+			slot.module = a_record.module;
+			slot.target = target;
+			slot.installing.store(true, std::memory_order_release);
+			const auto trampoline = Detours::X64::DetourFunction(
+				target,
+				reinterpret_cast<std::uintptr_t>(kNgxCreateHookFunctions[slotIndex]),
+				Detours::X64Option::USE_RAX_JUMP);
+			if (!trampoline) {
+				slot.module = nullptr;
+				slot.original = nullptr;
+				slot.target = 0;
+				slot.installing.store(false, std::memory_order_release);
+				slot.frameGenerationObserved.store(false, std::memory_order_release);
+				logger::warn("[RTX40MFGUnlock] NGX CreateFeature detour failed: {}",
+					Narrow(a_path.c_str()));
+				return false;
+			}
+			slot.original = reinterpret_cast<NgxCreateFeature_t>(trampoline);
+			slot.installing.store(false, std::memory_order_release);
+			a_record.createHookInstalled = true;
+			a_record.createHookSlot = static_cast<std::int32_t>(slotIndex);
+			logger::info("[RTX40MFGUnlock] NGX CreateFeature route installed slot={} path={}",
+				slotIndex, Narrow(a_path.c_str()));
+			return true;
+		}
+
 		ModuleRecord InspectModule(HMODULE a_module)
 		{
 			ModuleRecord record{};
@@ -311,7 +506,12 @@ namespace RTX40MFGUnlock
 					logger::warn("[RTX40MFGUnlock] NGX provider signature is unsupported: {}", Narrow(path.c_str()));
 				}
 				if (record.ngxPatched && midpoint_fix::AdapterVerified()) {
-					record.midpointPatched = midpoint_fix::PatchProvider(a_module, path.c_str());
+					// Do not publish the process-global midpoint descriptor while
+					// this is only a passive module candidate.  The provider may be
+					// an inactive game-local DLL while NGX selects the ProgramData
+					// image, or vice versa.  The entry detour below resolves that
+					// choice at the first DLSS-G CreateFeature call.
+					record.createHookInstalled = InstallNgxCreateFeatureHook(record, path);
 				}
 			}
 			return record;
@@ -399,8 +599,9 @@ namespace RTX40MFGUnlock
 						g_modules.push_back(record);
 						retained = nullptr; // Deliberately held for plugin lifetime.
 					}
-				} else if (existing->ngxPatched && !existing->midpointPatched) {
-					existing->midpointPatched = midpoint_fix::PatchProvider(retained, LoadedModulePath(retained).c_str());
+				} else if (existing->ngxPatched && !existing->createHookInstalled) {
+					const auto path = LoadedModulePath(retained);
+					existing->createHookInstalled = InstallNgxCreateFeatureHook(*existing, path);
 				}
 			}
 		} catch (...) {
@@ -431,15 +632,13 @@ namespace RTX40MFGUnlock
 		std::lock_guard lock(g_mutex);
 		const auto wrapper = std::find_if(g_modules.begin(), g_modules.end(),
 			[](const ModuleRecord& record) { return record.module == g_activeWrapper; });
-		// Never combine a patched inactive wrapper with an unrelated provider.
-		// Multiple providers are ambiguous without an observed dispatch route.
-		const auto providers = std::count_if(g_modules.begin(), g_modules.end(),
-			[](const ModuleRecord& record) { return record.ngx; });
 		const auto provider = std::find_if(g_modules.begin(), g_modules.end(),
-			[](const ModuleRecord& record) { return record.ngx; });
-		return midpoint_fix::AdapterVerified() && wrapper != g_modules.end() &&
-			wrapper->wrapperPatched && providers == 1 &&
-			provider->ngxPatched && provider->midpointPatched;
+			[](const ModuleRecord& record) { return record.module == g_activeNgxProvider; });
+		return midpoint_fix::AdapterVerified() && midpoint_fix::Ready() &&
+			wrapper != g_modules.end() &&
+			wrapper->wrapperPatched && provider != g_modules.end() &&
+			provider->ngx && provider->ngxPatched && provider->createHookInstalled &&
+			provider->midpointPatched;
 	}
 
 	std::uint32_t MaximumGeneratedFrames() noexcept

@@ -7,8 +7,9 @@ struct ID3D12Device;
 
 namespace RTX40MFGUnlock
 {
-	// Scans already-loaded Streamline/DLSS-G modules and applies only the
-	// fail-closed wrapper and NGX patches adapted from RTX40MFG-Unlock.
+	// Scans already-loaded Streamline/DLSS-G modules, installs provider entry
+	// observers, and applies the fail-closed wrapper and NGX patches adapted
+	// from RTX40MFG-Unlock.
 	bool PatchLoadedModules() noexcept;
 
 	// Supplies the active D3D12 adapter identity required by the Ada midpoint
