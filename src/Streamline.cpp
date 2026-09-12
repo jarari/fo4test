@@ -1579,24 +1579,6 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		NRDiagnosticCapture::Copy(a_commandList, "input", a_color, lowResExtent.width, lowResExtent.height);
 		NRDiagnosticCapture::Copy(a_commandList, "mv", a_motionVectors, lowResExtent.width, lowResExtent.height);
 		NRDiagnosticCapture::Copy(a_commandList, "depth", a_depth, lowResExtent.width, lowResExtent.height);
-		// ReShade consumes the separate depth snapshot captured from the engine
-		// D3D11 depth target. Capture it beside the NR guides so the raw raster
-		// depth and the jitter-corrected sample can be compared frame by frame.
-		const auto reshadeInfo = Upscaling::GetSingleton()->GetCurrentSharedDepthInfo();
-		NRDiagnosticCapture::Annotate(a_commandList,
-			std::format("\"reshade_depth_available\":{}", reshadeInfo.resource ? "true" : "false"));
-		if (auto* reshadeDepth = reshadeInfo.resource) {
-			const auto reshadeDesc = reshadeDepth->GetDesc();
-			NRDiagnosticCapture::Copy(a_commandList, "reshade_depth", reshadeDepth,
-				static_cast<UINT>(reshadeDesc.Width), static_cast<UINT>(reshadeDesc.Height));
-			NRDiagnosticCapture::Annotate(a_commandList,
-					std::format("\"reshade_depth_physical_source_extent\":[{},{}],\"reshade_depth_sample_extent\":[{},{}],\"reshade_depth_output_extent\":[{},{}],\"reshade_depth_engine_jitter\":[{},{}],\"reshade_depth_streamline_jitter\":[{},{}],\"reshade_depth_sampling\":\"bilinear((id+0.5)*sample_extent/output_extent-engine_jitter)\"",
-					reshadeInfo.physicalSourceWidth, reshadeInfo.physicalSourceHeight,
-					reshadeInfo.sampleWidth, reshadeInfo.sampleHeight,
-					reshadeInfo.outputWidth, reshadeInfo.outputHeight,
-					reshadeInfo.engineJitter.x, reshadeInfo.engineJitter.y,
-					-reshadeInfo.engineJitter.x, -reshadeInfo.engineJitter.y));
-		}
 		if ((a_nrAfterSR || !(featureDLSSNR && slDLSSNRSetOptions)) && a_nrMotionVectors) {
 			NRDiagnosticCapture::Copy(a_commandList, "nr_mv", a_nrMotionVectors, nrExtent.width, nrExtent.height);
 			if (a_nrAfterSR && a_nrDepth) {

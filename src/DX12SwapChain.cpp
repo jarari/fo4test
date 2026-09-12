@@ -19,7 +19,6 @@
 #include "Streamline.h"
 #include "Upscaling.h"
 #include "UpscalingMenu.h"
-#include "ReShadeDepth.h"
 #include "SceneReShade.h"
 #include "third_party/RTX40MFGUnlock/integration.h"
 
@@ -600,7 +599,7 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetHDRMetaData(DXGI_HDR_METADATA_T
 
 void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter, Streamline* a_streamline)
 {
-	DX::ThrowIfFailed(D3D12CreateDevice(a_adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(d3d12Device.put())));
+	DX::ThrowIfFailed(SceneReShade::CreateOutputDevice(a_adapter, D3D_FEATURE_LEVEL_12_0, d3d12Device.put(), reshadeDeviceLifetime.put()));
 	RTX40MFGUnlock::ObserveD3D12Device(d3d12Device.get());
 
 	if (a_streamline && a_streamline->slSetD3DDevice) {
@@ -885,8 +884,6 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	frameSlotFenceValues.fill(0);
 	inputReuseFenceValues.fill(0);
 	queuedReuseFenceValues.fill(0);
-	reshadeDepthReuseFenceValues.fill(0);
-	queuedReShadeDepthFenceValues.fill(0);
 	presentSlotFenceValues.fill(0);
 	inputsUsedAtPresent.fill(false);
 }
@@ -1047,7 +1044,7 @@ HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 	return S_OK;
 }
 
-HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT* a_creationNodeMask)
+HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_width, UINT a_height, DXGI_FORMAT a_format, UINT a_flags, const UINT*)
 {
 	presentPacing.Reset();
 	// ENB's outer wrapper still needs its ResizeBuffers notification, but a
@@ -1097,18 +1094,12 @@ HRESULT DX12SwapChain::ResizeBuffersInternal(bool a_useResizeBuffers1, UINT a_wi
 	if (applicationFrameLatencyWaitable) {
 		resizeFlags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 	}
-	HRESULT result = S_OK;
-	if (a_useResizeBuffers1) {
-		std::array<UINT, kDX12FrameCount> nodeMasks{};
-		std::array<IUnknown*, kDX12FrameCount> presentQueues{};
-		for (std::size_t i = 0; i < presentQueues.size(); ++i) {
-			nodeMasks[i] = a_creationNodeMask ? a_creationNodeMask[0] : 0;
-			presentQueues[i] = commandQueue.get();
-		}
-		result = swapChain->ResizeBuffers1(kDX12FrameCount, a_width, a_height, format, resizeFlags, nodeMasks.data(), presentQueues.data());
-	} else {
-		result = swapChain->ResizeBuffers(kDX12FrameCount, a_width, a_height, format, resizeFlags);
-	}
+	// The D3D11-facing proxy never transfers ownership of this private output
+	// domain to a caller queue/node. Preserve the queue chosen at creation:
+	// DLSS-G may present on its own pacer queue, not our game commandQueue.
+	// Passing the game queue to ResizeBuffers1 reassigns its real backbuffers
+	// and makes subsequent FG pacer submissions fail with ACCESS_DENIED.
+	const auto result = swapChain->ResizeBuffers(kDX12FrameCount, a_width, a_height, format, resizeFlags);
 
 	if (FAILED(result)) {
 		logger::error("[DX12SwapChain] {} failed result=0x{:08X} width={} height={} format={} flags=0x{:X}", operation, static_cast<uint32_t>(result), a_width, a_height, static_cast<uint32_t>(format), resizeFlags);
@@ -1188,22 +1179,6 @@ void DX12SwapChain::CreateInterop()
 	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(commandFence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
 	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(d3d11CommandFence.put())));
 	CloseHandle(sharedFenceHandle);
-	// ReShade DEPTH has its own one-way bridge. The ready fence is signaled by
-	// the D3D11 depth producer and waited by ReShade's D3D12 queue. The read
-	// fence travels in the opposite direction so the D3D11 producer can reuse
-	// a slot after ReShade has finished reading it. Neither fence is shared with
-	// SR, FG or NR command submission.
-	auto createDepthBridgeFence = [&](winrt::com_ptr<ID3D12Fence>& a_fence12, winrt::com_ptr<ID3D11Fence>& a_fence11) {
-		DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(a_fence12.put())));
-		HANDLE handle = nullptr;
-		DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(a_fence12.get(), nullptr, GENERIC_ALL, nullptr, &handle));
-		const auto result = d3d11Device->OpenSharedFence(handle, IID_PPV_ARGS(a_fence11.put()));
-		CloseHandle(handle);
-		DX::ThrowIfFailed(result);
-	};
-	createDepthBridgeFence(reshadeDepthReadyFence, reshadeDepthReadyFence11);
-	createDepthBridgeFence(reshadeDepthReadFence, reshadeDepthReadFence11);
-	reshadeDepthReadyValue = 1;
 	RecreateInteropTextures();
 }
 
@@ -1525,52 +1500,6 @@ bool DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly)
 	return true;
 }
 
-bool DX12SwapChain::WaitForReShadeDepthSlot(UINT a_frameIndex)
-{
-	if (deviceLost || a_frameIndex >= std::size(reshadeDepthReuseFenceValues)) {
-		return false;
-	}
-
-	const auto waitValue = reshadeDepthReuseFenceValues[a_frameIndex];
-	if (waitValue == 0 || waitValue <= queuedReShadeDepthFenceValues[a_frameIndex]) {
-		return true;
-	}
-
-	// Wait only for the ReShade consumer's read fence. This is intentionally
-	// separate from the generic D3D12 command fence used by SR/FG/NR.
-	if (!reshadeDepthReadFence11 || !d3d11Context ||
-		FAILED(d3d11Context->Wait(reshadeDepthReadFence11.get(), waitValue))) {
-		return false;
-	}
-	queuedReShadeDepthFenceValues[a_frameIndex] = waitValue;
-	return true;
-}
-
-bool DX12SwapChain::SignalReShadeDepthReady(UINT64& a_value)
-{
-	if (!d3d11Context || !reshadeDepthReadyFence11 || !reshadeDepthReadyFence || deviceLost) {
-		return false;
-	}
-	a_value = reshadeDepthReadyValue++;
-	if (FAILED(d3d11Context->Signal(reshadeDepthReadyFence11.get(), a_value))) {
-		return false;
-	}
-	// Submit only the depth compute work. Do not wait for it here; ReShade's
-	// D3D12 queue consumes the ready fence asynchronously.
-	d3d11Context->Flush();
-	return true;
-}
-
-void DX12SwapChain::MarkReShadeDepthRead(UINT a_frameIndex, UINT64 a_fenceValue)
-{
-	if (a_frameIndex >= std::size(reshadeDepthReuseFenceValues) ||
-		a_fenceValue == 0 || a_fenceValue == UINT64_MAX) {
-		return;
-	}
-	reshadeDepthReuseFenceValues[a_frameIndex] =
-		std::max(reshadeDepthReuseFenceValues[a_frameIndex], a_fenceValue);
-}
-
 bool DX12SwapChain::GetRetirementFences(uint64_t& a_d3d11, uint64_t& a_d3d12)
 {
 	if (!d3d11Context || !d3d11Fence || !commandFence || deviceLost) { return false; }
@@ -1606,15 +1535,9 @@ bool DX12SwapChain::WaitForGPUIdle()
 	if (!WaitForCommandFence(signalValue)) {
 		return false;
 	}
-	// The queue is now at a clean epoch boundary. ReShade snapshots retain
-	// their old resources until their output callback completes, but no old
-	// publication may be reused for the next epoch.
-	ReShadeDepth::Invalidate();
 	frameSlotFenceValues.fill(0);
 	inputReuseFenceValues.fill(0);
 	queuedReuseFenceValues.fill(0);
-	reshadeDepthReuseFenceValues.fill(0);
-	queuedReShadeDepthFenceValues.fill(0);
 	presentSlotFenceValues.fill(0);
 	inputsUsedAtPresent.fill(false);
 	return true;
@@ -2012,14 +1935,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (Flags & DXGI_PRESENT_TEST) {
 		return swapChain ? swapChain->Present(SyncInterval, Flags) : DXGI_ERROR_INVALID_CALL;
 	}
-	ReShadeDepth::AdvancePresent();
 	if (deviceLost) {
-		ReShadeDepth::Invalidate();
 		presentPacing.Reset();
 		return DXGI_ERROR_DEVICE_REMOVED;
 	}
 	if (!IsReady()) {
-		ReShadeDepth::Invalidate();
 		presentPacing.Reset();
 		return DXGI_ERROR_INVALID_CALL;
 	}
@@ -2036,7 +1956,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	streamline->ApplyPendingDLSSGDisable();
 	if (IsWindowUnavailable()) {
-		ReShadeDepth::Invalidate();
 		presentPacing.Reset();
 		presentOverrideFinalColor = nullptr;
 		const auto presentedFrameIndex = frameIndex;
@@ -2094,7 +2013,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// Repeated Presents without world rendering must never recycle old depth.
 	upscaling->dlssDepthCaptureFrames[presentedFrameIndex] = 0;
 	upscaling->fsrDepthCaptureFrames[presentedFrameIndex] = 0;
-	upscaling->reshadeDepthCaptureFrames[presentedFrameIndex] = 0;
 	auto copySource = presentStaging->resource12.get();
 	commandContext.retainedPresentOverride = std::move(presentOverrideFinalColor);
 	// The menu's D3D11 background filter has already consumed the resolved scene.
