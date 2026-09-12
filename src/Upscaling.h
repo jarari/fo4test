@@ -90,7 +90,7 @@ public:
 		uint reflexMode = 1;                                        ///< Reflex mode: 0=Off, 1=On, 2=On + Boost
 		uint dlssModelPreset = 0;                                   ///< DLSS model preset: 0=Recommended, 1=Default, 2=K, 3=M, 4=L
 		uint dlssNRPosition = 0;                                    ///< 0: Before SR, 1: After SR
-		uint dlssNREnabled = 1;                                     ///< Enable optional NR at the selected SR stage
+		uint dlssNREnabled = 0;                                     ///< Enable optional NR at the selected SR stage
 		uint dlssNRPassCount = 1;                                   ///< Direct-NGX NR histories evaluated in sequence (1..3)
 		uint vsyncMode = 0;                                        ///< 0=game, 1=off, 2=on
 		uint outputFPSLimit = 0;                                   ///< FG-inclusive target, 0=unlimited, otherwise 10..500

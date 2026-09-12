@@ -1889,7 +1889,7 @@ void Upscaling::LoadSettings()
 	settings.dynamicMFGTargetFPS = static_cast<uint>(ini.GetLongValue("Settings", "iDynamicMFGTargetFPS", 300));
 	settings.reflexMode = static_cast<uint>(ini.GetLongValue("Settings", "iReflexMode", 1));
 	settings.dlssModelPreset = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iDLSSModelPreset", 0), 0, 4));
-	settings.dlssNREnabled = static_cast<uint>(ini.GetLongValue("DLSSNR", "bEnabled", 1) == 1);
+	settings.dlssNREnabled = static_cast<uint>(ini.GetLongValue("DLSSNR", "bEnabled", 0) == 1);
 	settings.dlssNRPosition = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPosition", 0), 0, 1));
 	settings.dlssNRPassCount = static_cast<uint>(std::clamp<long>(ini.GetLongValue("DLSSNR", "iPassCount", 1), 1, 3));
 	settings.vsyncMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Presentation", "iVSyncMode", 0), 0, 2));
