@@ -2419,4 +2419,5 @@ void DX12SwapChain::RefreshBackBuffers()
 	for (auto i = 0; i < std::size(swapChainBuffers); ++i) {
 		DX::ThrowIfFailed(swapChain->GetBuffer(i, IID_PPV_ARGS(swapChainBuffers[i].put())));
 	}
+	Upscaling::GetSingleton()->UpdateTextureMemoryUpgradeReserve();
 }

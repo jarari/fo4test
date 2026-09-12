@@ -47,6 +47,8 @@ public:
 	 * Registers event sinks and loads initial settings from INI file
 	 */
 	void OnDataLoaded();
+	// Refresh output-pixel headroom after real swapchain creation/resize.
+	void UpdateTextureMemoryUpgradeReserve();
 
 	/**
 	 * @brief Install all game engine hooks required for upscaling

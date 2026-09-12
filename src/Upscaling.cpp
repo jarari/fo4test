@@ -10,6 +10,7 @@
 #include <d3dcompiler.h>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <memory>
 #include <Psapi.h>
 #include <SimpleIni.h>
@@ -22,6 +23,7 @@
 #include "Screenshot.h"
 #include "SceneReShade.h"
 #include "PipboyTemporalMask.h"
+#include "TextureMemoryReserve.h"
 
 extern bool enbLoaded;
 
@@ -300,11 +302,14 @@ namespace
 	constexpr uint32_t kDLSSGResumeStableFrames = 2;
 	constexpr uint64_t kFeatureRetryGameFrames = 5;
 	constexpr uint32_t kFeatureFailuresBeforeRetryBlock = 3;
-	constexpr uint64_t kTextureMemoryUpgradeReserveBytes = 512ull * 1024ull * 1024ull;
 	FILETIME g_lastSettingsWriteTime{};
 	bool g_hasLastSettingsWriteTime = false;
 	bool g_lastSettingsFileExists = false;
 	bool g_textureMemoryReserveApplied = false;
+	bool g_textureMemoryReserveEnabled = false;
+	uint64_t g_textureMemoryOriginalLimit = 0;
+	uint64_t g_textureMemoryRequestedReserve = 0;
+	std::mutex g_textureMemoryReserveMutex;
 	constexpr std::size_t kHFPFAELoadingLoopTrampolineSize = 64;
 	REL::Trampoline g_hfpfAELoadingLoopTrampoline{ "HFPF AE Loading Loop"sv };
 	constexpr std::ptrdiff_t kDynamicWidthRatioOffsetOG = 0xF88;
@@ -645,25 +650,42 @@ namespace
 		return limit.get();
 	}
 
-	void ApplyTextureMemoryUpgradeReserve()
+	void ApplyTextureMemoryUpgradeReserve(bool a_enable = false)
 	{
+		const std::scoped_lock lock(g_textureMemoryReserveMutex);
+		g_textureMemoryReserveEnabled |= a_enable;
+		if (!g_textureMemoryReserveEnabled) {
+			return;  // The engine initializes its limit before DataLoaded.
+		}
+		const auto* swap = DX12SwapChain::GetSingleton();
+		DXGI_SWAP_CHAIN_DESC1 desc{};
+		if (!swap->swapChain || FAILED(swap->swapChain->GetDesc1(&desc))) {
+			return;
+		}
+		const auto reserve = TextureMemoryReserve::EstimateBytes(desc.Width, desc.Height);
 		auto* limit = GetTextureMemoryUpgradeLimit();
-		if (!limit || g_textureMemoryReserveApplied) {
+		if (!limit || !*limit || !reserve ||
+			(g_textureMemoryReserveApplied && reserve == g_textureMemoryRequestedReserve)) {
 			return;
 		}
 
-		const auto originalLimit = *limit;
-		const auto reservedLimit = originalLimit > kTextureMemoryUpgradeReserveBytes ?
-			originalLimit - kTextureMemoryUpgradeReserveBytes :
-			originalLimit / 2;
+		if (!g_textureMemoryReserveApplied) {
+			g_textureMemoryOriginalLimit = *limit;
+		}
+		// Recompute from the unmodified limit on resize, never subtract twice.
+		const auto originalLimit = g_textureMemoryOriginalLimit;
+		const auto reservedLimit = TextureMemoryReserve::UpgradeLimit(originalLimit, reserve);
 
 		*limit = reservedLimit;
 		g_textureMemoryReserveApplied = true;
+		g_textureMemoryRequestedReserve = reserve;
 		logger::info(
-			"[Upscaling] Lowered engine texture memory upgrade limit from {} MiB to {} MiB (reserved {} MiB)",
+			"[Upscaling] Texture memory upgrade limit {} -> {} MiB; output={}x{} ({} pixels), requested reserve={} MiB, applied={} MiB",
 			originalLimit / (1024ull * 1024ull),
 			reservedLimit / (1024ull * 1024ull),
-			kTextureMemoryUpgradeReserveBytes / (1024ull * 1024ull));
+			desc.Width, desc.Height, uint64_t{ desc.Width } * desc.Height,
+			reserve / TextureMemoryReserve::MiB,
+			(originalLimit - reservedLimit) / TextureMemoryReserve::MiB);
 	}
 
 	float Halton(uint32_t a_index, uint32_t a_base)
@@ -2024,8 +2046,13 @@ void Upscaling::OnDataLoaded()
 {
 	RE::UI::GetSingleton()->RegisterSink<RE::MenuOpenCloseEvent>(this);
 	LoadSettings();
-	ApplyTextureMemoryUpgradeReserve();
+	ApplyTextureMemoryUpgradeReserve(true);
 	UpdateGameSettings();
+}
+
+void Upscaling::UpdateTextureMemoryUpgradeReserve()
+{
+	ApplyTextureMemoryUpgradeReserve();
 }
 
 RE::BSEventNotifyControl Upscaling::ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*)
