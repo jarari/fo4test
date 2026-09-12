@@ -157,7 +157,10 @@ public:
 	 */
 	void UpdateReflex(uint a_reflexMode, bool a_forceEnabled);
 	void BeginRenderFrame(uint32_t a_frameIndex);
-	bool SupportsDLSSGVSync() const { return dlssgVSyncSupported; }
+	// Dynamic MFG owns its target-rate policy; its maximum capability is not
+	// a promise to generate that many frames for every application Present.
+	bool UsesDynamicDLSSGPacing() const { return dlssgActive && currentDLSSGMode == sl::DLSSGMode::eDynamic; }
+	bool SupportsDLSSGVSync() const { return dlssgVSyncSupported && !UsesDynamicDLSSGPacing(); }
 	uint32_t GetDLSSGPacingMultiplier() const;
 	bool BeginSimulationFrame(uint32_t a_frameIndex);
 	void EndSimulationFrame(uint32_t a_frameIndex);

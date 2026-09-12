@@ -601,10 +601,10 @@ void Streamline::RequestTemporalReset()
 
 uint32_t Streamline::GetDLSSGPacingMultiplier() const
 {
-	if (!dlssgActive) { return 1; }
-	// ActuallyPresented accumulates across state queries, not a per-frame multiplier.
-	const auto generated = currentDLSSGMode == sl::DLSSGMode::eDynamic ? maxFramesToGenerate : currentDLSSGGeneratedFrames;
-	return 1u + std::clamp(generated, 1u, 5u);
+	// The host limiter is disabled in Dynamic mode. Do not substitute the
+	// maximum capability or a GetState interval's presentation count here.
+	if (!dlssgActive || UsesDynamicDLSSGPacing()) { return 1; }
+	return 1u + std::clamp(currentDLSSGGeneratedFrames, 1u, 5u);
 }
 
 bool Streamline::ValidateConstantsForFrame(sl::FrameToken* a_frameToken)
@@ -778,6 +778,18 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		}
 	}
 
+	// Runtime VSync capability applies to fixed MFG, not Dynamic MFG.
+	// Preserve an explicit VSync On request by selecting fixed MFG instead.
+	const bool dynamicVSyncFallback = mode == sl::DLSSGMode::eDynamic &&
+		Upscaling::GetSingleton()->settings.vsyncMode == 2;
+	static bool loggedDynamicVSyncFallback = false;
+	if (dynamicVSyncFallback) {
+		if (!loggedDynamicVSyncFallback) {
+			logger::warn("[Presentation] Dynamic MFG does not support VSync; using fixed MFG while VSync On is selected");
+		}
+		mode = sl::DLSSGMode::eOn;
+	}
+	loggedDynamicVSyncFallback = dynamicVSyncFallback;
 	if (mode == sl::DLSSGMode::eDynamic && !dynamicMFGSupported) {
 		if (!loggedDynamicMFGUnsupported) {
 			logger::warn("[Streamline] Dynamic MFG requested but runtime reports unsupported; falling back to DLSS-G Auto mode");

@@ -758,7 +758,7 @@ namespace
 		std::unique_ptr<Texture2D>& a_texture,
 		winrt::com_ptr<ID3D12Resource>& a_d3d12Resource,
 		bool a_createUAV,
-		bool a_immediateRelease = false)
+		bool a_nrOnly = false)
 	{
 		a_desc.Usage = D3D11_USAGE_DEFAULT;
 		a_desc.CPUAccessFlags = 0;
@@ -768,17 +768,11 @@ namespace
 			return;
 		}
 
-		if (a_immediateRelease) {
-			// NR guides are never parked for a Present-count grace period.
-			// Drain both APIs only when replacing an existing allocation.
-			if ((a_texture || a_d3d12Resource) && !DX12SwapChain::GetSingleton()->WaitForInteropIdle()) {
-				DX::ThrowIfFailed(DXGI_ERROR_DEVICE_REMOVED);
-			}
-			a_d3d12Resource = nullptr;
-			a_texture.reset();
-		} else {
-			a_upscaling->RetireSharedD3D12Texture(a_texture, a_d3d12Resource);
-		}
+		// NR-only motion/depth guides are not tagged to a frame-generation SDK.
+		// Keep their old allocations until both submitted API fences complete,
+		// rather than draining the entire interop pipeline once per descriptor.
+		// NGX feature recreation and resize teardown retain their explicit drains.
+		a_upscaling->RetireSharedD3D12Texture(a_texture, a_d3d12Resource, !a_nrOnly);
 		a_texture = std::make_unique<Texture2D>(a_desc);
 
 		if (a_createUAV) {
@@ -2601,7 +2595,8 @@ void Upscaling::RetireD3D11Texture(std::unique_ptr<Texture2D>& a_texture)
 
 void Upscaling::RetireSharedD3D12Texture(
 	std::unique_ptr<Texture2D>& a_texture,
-	winrt::com_ptr<ID3D12Resource>& a_d3d12Resource)
+	winrt::com_ptr<ID3D12Resource>& a_d3d12Resource,
+	bool a_requiresPresentGrace)
 {
 	if (!a_texture && !a_d3d12Resource) {
 		return;
@@ -2612,7 +2607,7 @@ void Upscaling::RetireSharedD3D12Texture(
 		std::move(a_texture),
 		std::move(a_d3d12Resource),
 		0,
-		completedPresentCount + kDeferredResourceReleasePresents });
+		completedPresentCount + (a_requiresPresentGrace ? kDeferredResourceReleasePresents : 0) });
 }
 
 void Upscaling::RetireD3D12Resource(winrt::com_ptr<ID3D12Resource>& a_resource)
@@ -2640,11 +2635,16 @@ void Upscaling::AdvanceDeferredResourceReleases()
 			}
 		}
 	}
-	while (!deferredResourceReleases.empty() && deferredResourceReleases.front().d3d11Fence != 0 &&
-		deferredResourceReleases.front().releasePresent <= completedPresentCount &&
-		swap->AreRetirementFencesComplete(deferredResourceReleases.front().d3d11Fence,
-			deferredResourceReleases.front().d3d12Fence)) {
-		deferredResourceReleases.pop_front();
+	// NR guides can become eligible before older SDK-tagged resources.
+	// Do not let a 16-Present entry at the front pin those guides in VRAM.
+	// Unstamped entries remain ineligible, even when their grace period is zero.
+	for (auto it = deferredResourceReleases.begin(); it != deferredResourceReleases.end();) {
+		if (it->d3d11Fence != 0 && it->releasePresent <= completedPresentCount &&
+			swap->AreRetirementFencesComplete(it->d3d11Fence, it->d3d12Fence)) {
+			it = deferredResourceReleases.erase(it);
+		} else {
+			++it;
+		}
 	}
 }
 

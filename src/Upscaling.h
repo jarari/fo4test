@@ -180,11 +180,10 @@ public:
 	void TagDLSSGInputs(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
 	void OnD3D12TemporalSuspend();
 
-	// DLSS-G/Streamline can retain tagged resources past the Present that
-	// submitted them. Keep replaced shared resources alive for a fixed number
-	// of completed Presents before releasing their COM references.
+	// Preserve the existing SDK grace period for tagged resources, in addition
+	// to both API fences. Only private NR guide textures may omit that grace.
 	void RetireD3D11Texture(std::unique_ptr<Texture2D>& a_texture);
-	void RetireSharedD3D12Texture(std::unique_ptr<Texture2D>& a_texture, winrt::com_ptr<ID3D12Resource>& a_d3d12Resource);
+	void RetireSharedD3D12Texture(std::unique_ptr<Texture2D>& a_texture, winrt::com_ptr<ID3D12Resource>& a_d3d12Resource, bool a_requiresPresentGrace = true);
 	void RetireD3D12Resource(winrt::com_ptr<ID3D12Resource>& a_resource);
 	void AdvanceDeferredResourceReleases();
 	void FlushDeferredResourceReleases();

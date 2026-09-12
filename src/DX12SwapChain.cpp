@@ -1329,9 +1329,13 @@ void DX12SwapChain::ConfigureFrameLatency()
 		logger::info("[Presentation] No application DXGI waitable requested; presenter owns queue pacing; retaining pre-input FPS limiter and fence pacing");
 		return;
 	}
-	const auto result = swapChain->SetMaximumFrameLatency(1);
+	// Optional throughput policy for a native, application-owned swapchain.
+	// One extra queued frame permits CPU/GPU overlap. Do not change FSR's
+	// outer-SDK policy; the Streamline-owned path already returned above.
+	const UINT frameLatency = FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive() ? 1u : 2u;
+	const auto result = swapChain->SetMaximumFrameLatency(frameLatency);
 	if (FAILED(result)) {
-		logger::warn("[Presentation] SetMaximumFrameLatency(1) failed hr=0x{:08X}; retaining fence pacing", static_cast<uint32_t>(result));
+		logger::warn("[Presentation] SetMaximumFrameLatency({}) failed hr=0x{:08X}; retaining fence pacing", frameLatency, static_cast<uint32_t>(result));
 		return;
 	}
 	// Use the outer SDK's event, not an unwrapped DXGI event. FSR owns its
@@ -1343,7 +1347,7 @@ void DX12SwapChain::ConfigureFrameLatency()
 		return;
 	}
 	frameLatencyEvent.attach(duplicate);
-	logger::info("[Presentation] DXGI frame latency=1; wait before input via outer swapchain");
+	logger::info("[Presentation] DXGI frame latency={}; wait before input via outer swapchain", frameLatency);
 }
 
 void DX12SwapChain::WaitForPresentationCapacity(uint32_t frame)
@@ -1377,7 +1381,12 @@ void DX12SwapChain::PaceFrameStart(uint32_t frame)
 		(FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u);
 	// Main::OnIdle is the pre-input entry; Renderer::Begin handles standalone
 	// loading/movie draws. The same frame reaching both must only wait once.
-	presentPacing.WaitForFrame(frame, Upscaling::GetSingleton()->settings.outputFPSLimit, multiplier, hwnd);
+	// UpdateDLSSG already passes the user's output target to Dynamic MFG.
+	// Dividing it by the hardware maximum unnecessarily throttles real frames.
+	// A dynamic SDK target is not a strict host-side output FPS ceiling.
+	const auto hostOutputLimit = streamline->UsesDynamicDLSSGPacing() ? 0u :
+		Upscaling::GetSingleton()->settings.outputFPSLimit;
+	presentPacing.WaitForFrame(frame, hostOutputLimit, multiplier, hwnd);
 	WaitForPresentationCapacity(frame);
 }
 
@@ -2200,16 +2209,21 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// Diagnostic only: pacing happens before simulation/input, never here.
 	const auto pacingMultiplier = streamline->dlssgActive ? streamline->GetDLSSGPacingMultiplier() :
 		(FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u);
+	const bool sdkDynamicPacing = streamline->UsesDynamicDLSSGPacing();
 	static uint32_t loggedMode = UINT32_MAX, loggedCap = UINT32_MAX, loggedMultiplier = 0, loggedSync = UINT32_MAX;
+	static bool loggedDynamicPacing = false;
 	if (loggedMode != vsyncMode || loggedCap != upscaling->settings.outputFPSLimit ||
-		loggedMultiplier != pacingMultiplier || loggedSync != presentSyncInterval) {
-		logger::info("[Presentation] vsyncMode={} sync={} outputLimit={} multiplier={} applicationLimit={:.2f} Reflex-independent",
+		loggedMultiplier != pacingMultiplier || loggedSync != presentSyncInterval ||
+		loggedDynamicPacing != sdkDynamicPacing) {
+		logger::info("[Presentation] vsyncMode={} sync={} outputLimit={} multiplier={} applicationLimit={:.2f} sdkDynamic={} (applicationLimit=0 disables the host limiter)",
 			vsyncMode, presentSyncInterval, upscaling->settings.outputFPSLimit, pacingMultiplier,
-			static_cast<double>(upscaling->settings.outputFPSLimit) / pacingMultiplier);
+			sdkDynamicPacing ? 0.0 : static_cast<double>(upscaling->settings.outputFPSLimit) / pacingMultiplier,
+			sdkDynamicPacing);
 		loggedMode = vsyncMode;
 		loggedCap = upscaling->settings.outputFPSLimit;
 		loggedMultiplier = pacingMultiplier;
 		loggedSync = presentSyncInterval;
+		loggedDynamicPacing = sdkDynamicPacing;
 	}
 	const auto emitPresentMarkers = streamline->NeedsPresentMarkers();
 	if (emitPresentMarkers) {
