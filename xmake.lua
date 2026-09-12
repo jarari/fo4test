@@ -5,7 +5,7 @@ includes("lib/commonlibf4")
 
 -- set project constants
 set_project("Upscaling")
-set_version("1.6.3")
+set_version("1.6.4")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
