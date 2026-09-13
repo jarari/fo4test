@@ -9,9 +9,55 @@
 #include "DX12SwapChain.h"
 #include "Util.h"
 #include "PipboyTemporalMask.h"
+#include "ReShadeDepth.h"
 
 namespace
 {
+	D3D12_RESOURCE_STATES PresentResourceState(uint32_t state)
+	{
+		D3D12_RESOURCE_STATES result = D3D12_RESOURCE_STATE_COMMON;
+		if (state & FFX_API_RESOURCE_STATE_UNORDERED_ACCESS) result |= D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+		if (state & FFX_API_RESOURCE_STATE_COMPUTE_READ) result |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		if (state & FFX_API_RESOURCE_STATE_PIXEL_READ) result |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		if (state & FFX_API_RESOURCE_STATE_COPY_SRC) result |= D3D12_RESOURCE_STATE_COPY_SOURCE;
+		if (state & FFX_API_RESOURCE_STATE_COPY_DEST) result |= D3D12_RESOURCE_STATE_COPY_DEST;
+		if (state & FFX_API_RESOURCE_STATE_INDIRECT_ARGUMENT) result |= D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+		if (state & FFX_API_RESOURCE_STATE_RENDER_TARGET) result |= D3D12_RESOURCE_STATE_RENDER_TARGET;
+		if (state & FFX_API_RESOURCE_STATE_DEPTH_ATTACHMENT) result |= D3D12_RESOURCE_STATE_DEPTH_WRITE;
+		return result;
+	}
+
+	ffxReturnCode_t PresentWithDepthFrame(ffxCallbackDescFrameGenerationPresent* params, void*)
+	{
+		// Same no-UI copy as the SDK default compositor. Host composition already
+		// included UI. Do not select this callback when a separate UI is registered.
+		if (!params || !params->commandList || !params->currentBackBuffer.resource ||
+			!params->outputSwapChainBuffer.resource || params->currentUI.resource)
+			return FFX_API_RETURN_ERROR_PARAMETER;
+		auto* commands = static_cast<ID3D12GraphicsCommandList*>(params->commandList);
+		auto* source = static_cast<ID3D12Resource*>(params->currentBackBuffer.resource);
+		auto* output = static_cast<ID3D12Resource*>(params->outputSwapChainBuffer.resource);
+		if (source != output) {
+			D3D12_RESOURCE_BARRIER barriers[2]{};
+			UINT count = 0;
+			const auto transition = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+				if (before == after) return;
+				auto& barrier = barriers[count++];
+				barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barrier.Transition = { resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after };
+			};
+			transition(source, PresentResourceState(params->currentBackBuffer.state), D3D12_RESOURCE_STATE_COPY_SOURCE);
+			transition(output, PresentResourceState(params->outputSwapChainBuffer.state), D3D12_RESOURCE_STATE_COPY_DEST);
+			if (count) commands->ResourceBarrier(count, barriers);
+			commands->CopyResource(output, source);
+			for (UINT i = 0; i < count; ++i)
+				std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
+			if (count) commands->ResourceBarrier(count, barriers);
+		}
+		ReShadeDepth::TagFSRPresent(params->frameID, output, params->isGeneratedFrame);
+		return FFX_API_RETURN_OK;
+	}
+
 	bool LoadFidelityFXRuntime()
 	{
 		static bool loaded = false;
@@ -415,6 +461,10 @@ bool FidelityFX::ConfigureFrameGeneration(
 		return ffxDispatch(reinterpret_cast<ffxContext*>(pUserCtx), &params->header);
 	};
 	config.frameGenerationCallbackUserContext = &frameGenContext;
+	if (a_enabled && ReShadeDepth::IsActive() && !a_uiColorAlpha) {
+		config.presentCallback = PresentWithDepthFrame;
+		ReShadeDepth::TagFSRFrame(a_frameID, static_cast<uint64_t>(Util::State_GetSingleton()->frameCount));
+	}
 
 	if (const auto result = ffx::Configure(frameGenContext, config); result != ffx::ReturnCode::Ok) {
 		logger::warn("[FidelityFX] Configure(frame generation) failed: {}", static_cast<uint32_t>(result));

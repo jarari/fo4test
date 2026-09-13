@@ -105,7 +105,9 @@ public:
 	ID3D12Resource* GetPresentBufferForDiagnostics(UINT a_index) const { return a_index < kDX12FrameCount ? swapChainBuffers[a_index].get() : nullptr; }
 	void WaitForFrameStart();
 	ID3D12Device* GetD3D12Device() const { return d3d12Device.get(); }
+	ID3D12Fence* GetInteropReadyFence() const { return d3d12Fence.get(); }
 	bool WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly = false);
+	bool IsFrameSlotComplete(UINT slot) const;
 	// Retirement is stamped after this frame's recorded work is submitted.
 	bool GetRetirementFences(uint64_t& a_d3d11, uint64_t& a_d3d12);
 	bool AreRetirementFencesComplete(uint64_t a_d3d11, uint64_t a_d3d12) const;
@@ -148,8 +150,7 @@ public:
 	void InstallWndProcHook(HWND a_hwnd);
 	LRESULT CallOriginalWndProc(HWND a_hwnd, UINT a_msg, WPARAM a_wParam, LPARAM a_lParam) const;
 
-	// Lifecycle only: keeps ReShade add-ons alive; no output/FG work uses this wrapper.
-	winrt::com_ptr<ID3D12Device> reshadeDeviceLifetime;
+	// Preserve the automatic ReShade device/queue wrappers for final presentation.
 	winrt::com_ptr<ID3D12Device> d3d12Device;
 	winrt::com_ptr<ID3D12CommandQueue> commandQueue;
 	winrt::com_ptr<IDXGISwapChain4> swapChain;

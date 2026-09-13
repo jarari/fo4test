@@ -112,7 +112,7 @@ namespace NRDiagnosticCapture
 			meta.close();
 			if (frame.number == 0) {
 				std::ofstream readme(frame.directory / "README.txt");
-				readme << "NR diagnostic capture: 32 consecutive engine frames, after scene ReShade and before UI/FG.\n"
+				readme << "NR diagnostic capture: 32 consecutive engine frames, before final D3D12 ReShade and UI/FG.\n"
 					"Each JSON describes the accompanying raw little-endian .bin images.\n"
 					"Rows are tightly packed (row_bytes), top-left origin, no D3D12 pitch padding.\n"
 					"DXGI formats: 28=RGBA8 UNORM; 34=RG16 FLOAT (motion); 41=R32 FLOAT (depth).\n"

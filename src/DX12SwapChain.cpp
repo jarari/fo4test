@@ -19,7 +19,7 @@
 #include "Streamline.h"
 #include "Upscaling.h"
 #include "UpscalingMenu.h"
-#include "SceneReShade.h"
+#include "ReShadeDepth.h"
 #include "third_party/RTX40MFGUnlock/integration.h"
 
 extern bool enbLoaded;
@@ -599,7 +599,7 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetHDRMetaData(DXGI_HDR_METADATA_T
 
 void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter, Streamline* a_streamline)
 {
-	DX::ThrowIfFailed(SceneReShade::CreateOutputDevice(a_adapter, D3D_FEATURE_LEVEL_12_0, d3d12Device.put(), reshadeDeviceLifetime.put()));
+	DX::ThrowIfFailed(D3D12CreateDevice(a_adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(d3d12Device.put())));
 	RTX40MFGUnlock::ObserveD3D12Device(d3d12Device.get());
 
 	if (a_streamline && a_streamline->slSetD3DDevice) {
@@ -644,6 +644,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 {
 	presentPacing.Reset();
 	hwnd = a_swapChainDesc.OutputWindow;
+	ReShadeDepth::SetOutputWindow(hwnd);
 	BOOL allowTearing = FALSE;
 	std::ignore = a_dxgiFactory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing));
 
@@ -861,7 +862,7 @@ void DX12SwapChain::ProcessWindowStateTransition()
 
 void DX12SwapChain::ReleaseResizeDependentResources()
 {
-	SceneReShade::Reset();
+	ReShadeDepth::ResetAfterIdle();
 	EndNativeUI();
 	NativeInterfaceUI::ReleaseResources();
 	nativeUITexture = nullptr;
@@ -1477,6 +1478,13 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 		// Consume a stale wakeup, then keep waiting for this request within the
 		// original timeout. Do not register another event or restart the budget.
 	}
+}
+
+bool DX12SwapChain::IsFrameSlotComplete(UINT slot) const
+{
+	if (slot >= frameSlotFenceValues.size() || !commandFence || deviceLost) return false;
+	const auto completed = commandFence->GetCompletedValue();
+	return completed != UINT64_MAX && completed >= frameSlotFenceValues[slot];
 }
 
 bool DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly)
@@ -2147,6 +2155,8 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (emitPresentMarkers) {
 		streamline->OnPresentStart();
 	}
+	const auto depthPresentFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount);
+	ReShadeDepth::PublishPresent(presentedFrameIndex, depthPresentFrame, destination);
 	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
 	if (result != S_OK) { presentPacing.Reset(); }
 	if (emitPresentMarkers) {
@@ -2273,7 +2283,8 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 	auto& commandContext = AcquireCommandContext();
 	auto* commandList = commandContext.list.get();
 
-	// Scene ReShade runs on the D3D11 side before this evaluation submission.
+	// The raw ReShade depth snapshot is recorded on D3D11 before this submission;
+	// ReShade itself runs automatically on the final D3D12 swapchain at Present.
 	auto* upscaling = Upscaling::GetSingleton();
 
 	result = EvaluateD3D12WorkOnCommandList(commandList, evaluationFrameIndex, a_evaluateDLSS, a_evaluateFSR, a_evaluateFSRFrameGeneration);

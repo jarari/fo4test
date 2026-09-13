@@ -21,7 +21,7 @@
 #include "ENBRenderDomain.h"
 #include "NativeInterfaceUI.h"
 #include "Screenshot.h"
-#include "SceneReShade.h"
+#include "ReShadeDepth.h"
 #include "PipboyTemporalMask.h"
 #include "TextureMemoryReserve.h"
 
@@ -171,15 +171,6 @@ struct UI_ScreenSpace_RenderMenus_Native
 		auto* swap = DX12SwapChain::GetSingleton();
 		g_nativeScreenSpaceUI = domain.Active() && swap->BeginNativeUI();
 		func(a_ui);
-		// ReShade's menu belongs to the same SDR D3D11 layer as game menus,
-		// after world/NR/SR. ENB has already aliased RT0 to its native UI surface.
-		// Preserve/accumulate alpha here so D3D12's existing UI composite sees it.
-		if (auto* renderer = SceneReShade::IsAvailable() ? RE::BSGraphics::GetRendererData() : nullptr) {
-			// Non-ENB RT0.texture is intentionally null: Renderer::Begin copies
-			// the window's views only. Do not make UI/runtime creation depend on it.
-			SceneReShade::RenderUI(reinterpret_cast<ID3D11RenderTargetView*>(renderer->renderTargets[0].rtView),
-				reinterpret_cast<HWND>(renderer->renderWindow[0].hwnd), static_cast<std::uint64_t>(Util::State_GetSingleton()->frameCount));
-		}
 		swap->PublishNativeUIForOverlays();
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
@@ -1269,6 +1260,37 @@ struct DrawWorld_Imagespace_RenderEffectRange
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
+// Snapshot the same raw world depth as before; color is owned by the final D3D12 runtime.
+static void CaptureReShadeDepthBeforeUpscale(uint targetIndex)
+{
+	if (!ReShadeDepth::IsActive()) return;
+	const auto frame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount);
+	auto* renderer = RE::BSGraphics::GetRendererData();
+	if (!renderer || targetIndex >= std::size(renderer->renderTargets)) {
+		ReShadeDepth::DiscardCapture(frame); return;
+	}
+	auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(renderer->renderTargets[targetIndex].srView);
+	if (!srv) { ReShadeDepth::DiscardCapture(frame); return; }
+	winrt::com_ptr<ID3D11Resource> resource;
+	srv->GetResource(resource.put());
+	auto color = resource.try_as<ID3D11Texture2D>();
+	if (!color) { ReShadeDepth::DiscardCapture(frame); return; }
+	D3D11_TEXTURE2D_DESC desc{};
+	color->GetDesc(&desc);
+	UINT width = desc.Width, height = desc.Height;
+	if (!ENBRenderDomain::Get().Active()) {
+		const auto& display = DX12SwapChain::GetSingleton()->swapChainDesc;
+		if (width == display.Width && height == display.Height) {
+			width = static_cast<UINT>(width * originalDynamicWidthRatio);
+			height = static_cast<UINT>(height * originalDynamicHeightRatio);
+		}
+	}
+	const auto depthIndex = Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain);
+	auto* depth = depthIndex < std::size(renderer->depthStencilTargets) ?
+		reinterpret_cast<ID3D11ShaderResourceView*>(renderer->depthStencilTargets[depthIndex].srViewDepth) : nullptr;
+	ReShadeDepth::Capture(depth, width, height, frame);
+}
+
 /** @brief Hook to add alternative scaling method */
 struct DrawWorld_Imagespace_LateRenderEffectRange
 {
@@ -1299,17 +1321,20 @@ struct DrawWorld_Imagespace_LateRenderEffectRange
 			upscaling->ResetDepth();
 			upscaling->ResetRenderTargets({ static_cast<int>(a5) });
 			SetDynamicResolutionRatio(renderTargetManager, originalDynamicWidthRatio, originalDynamicHeightRatio);
+			CaptureReShadeDepthBeforeUpscale(a5);
 			upscaling->Upscale(static_cast<int>(a5));
 			return;
 		}
 
 		if (upscaling->upscaleMethod != Upscaling::UpscaleMethod::kDisabled) {
 			func(This, a2, a3, a4, a5);
+			CaptureReShadeDepthBeforeUpscale(a5);
 			upscaling->Upscale(static_cast<int>(a5));
 			return;
 		}
 
 		func(This, a2, a3, a4, a5);
+		CaptureReShadeDepthBeforeUpscale(a5);
 		upscaling->CaptureDLSSGInputs(static_cast<int>(a5));
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
@@ -1646,67 +1671,11 @@ namespace
 		logger::warn("[ENB UI] Unsupported overlay layout; ENB menu native coordinates unavailable");
 	}
 }
-/** @brief Run scene ReShade on the current HDR input before engine tonemapping. */
-struct ImageSpaceEffectHDR_Render
-{
-	static void thunk(RE::ImageSpaceEffectHDR* This, RE::BSTriShape* a_shape, RE::ImageSpaceEffectParam* a_params)
-	{
-		if (!SceneReShade::ShouldRenderHDR()) {
-			func(This, a_shape, a_params);
-			return;
-		}
-		auto* renderer = RE::BSGraphics::GetRendererData();
-		auto* manager = Util::RenderTargetManager_GetSingleton();
-		if (renderer && manager && This && This->textures.size() > 1 && This->textures[1]) {
-			const auto* input = This->textures[1];
-			const auto logical = input->renderTarget;
-			const auto count = REX::FModule::IsRuntimeOG() ? 100u : 103u;
-			if (!input->texture && logical >= 0 && static_cast<std::uint32_t>(logical) < count) {
-				// IDA: GetDimensions indexes properties by logical ID; the renderer
-				// maps through RenderTargetIdA before accessing the physical texture.
-				const auto physical = GetPhysicalRenderTargetIndex(manager, static_cast<std::uint32_t>(logical));
-				if (physical < std::size(renderer->renderTargets)) {
-					auto* color = reinterpret_cast<ID3D11Texture2D*>(renderer->renderTargets[physical].texture);
-					if (color) {
-						D3D11_TEXTURE2D_DESC desc{};
-						color->GetDesc(&desc);
-						if (desc.Format == DXGI_FORMAT_R11G11B10_FLOAT || desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-							// Both inspected runtimes have 0x20-byte properties at offset zero.
-							const auto* properties = reinterpret_cast<const RE::BSGraphics::RenderTargetProperties*>(manager);
-							UINT width = properties[logical].width, height = properties[logical].height;
-							const auto& display = DX12SwapChain::GetSingleton()->swapChainDesc;
-							// ENB/proxy targets already have render-sized properties.
-							if (!ENBRenderDomain::Get().Active() && width == display.Width && height == display.Height) {
-								width = static_cast<UINT>(width * originalDynamicWidthRatio);
-								height = static_cast<UINT>(height * originalDynamicHeightRatio);
-							}
-							if (width && height && width <= desc.Width && height <= desc.Height) {
-								const auto depthIndex = Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain);
-								auto* depth = depthIndex < std::size(renderer->depthStencilTargets) ?
-									reinterpret_cast<ID3D11ShaderResourceView*>(renderer->depthStencilTargets[depthIndex].srViewDepth) : nullptr;
-								// No depthOverrideTexture: existence/size is not a freshness test.
-								const RECT depthRect{ 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
-								SceneReShade::RenderHDR(color, depth, reinterpret_cast<HWND>(renderer->renderWindow[0].hwnd),
-									width, height, &depthRect, static_cast<std::uint64_t>(Util::State_GetSingleton()->frameCount));
-							}
-						}
-					}
-				}
-			}
-		}
-		func(This, a_shape, a_params);
-	}
-	static inline REL::Relocation<decltype(thunk)> func;
-};
-
 void Upscaling::InstallHooks()
 {
 	Screenshot::InstallHooks();
 	// Disable TAA shader if using alternative scaling method
 	stl::write_vfunc<0x8, ImageSpaceEffectTemporalAA_IsActive>(RE::VTABLE::ImageSpaceEffectTemporalAA[0]);
-	if (SceneReShade::IsAvailable()) {
-		stl::write_vfunc<0x1, ImageSpaceEffectHDR_Render>(RE::VTABLE::ImageSpaceEffectHDR[0]);
-	}
 	// Fixed Fallout 4 entry points use explicit gateway prologues. These lengths
 	// are instruction-boundary sizes verified in both OG 1.10.163 and AE 1.11.221.
 	stl::detour_thunk_gateway<Interface3D_Renderer_Create>(
@@ -1930,9 +1899,6 @@ void Upscaling::LoadSettings()
 
 	auto streamline = Streamline::GetSingleton();
 	const auto currentUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
-	if (currentUpscaleMethodPreference == UpscaleMethod::kDisabled) {
-		SceneReShade::Reset();
-	}
 	if (ENBRenderDomain::Get().Active() && previousQualityMode != settings.qualityMode) {
 		logger::info("[ENB domain] Requested quality {}; active quality {} ({}x{}); scene-only resize queued, HWND/display unchanged",
 			settings.qualityMode, ENBRenderDomain::Get().Quality(), ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height());
