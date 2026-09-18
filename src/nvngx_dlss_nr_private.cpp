@@ -64,7 +64,9 @@ namespace
 	void NVSDK_CONV ReleaseNRResource(IUnknown* a_resource)
 	{
 		// Feature teardown already drains GPU use. Preserve immediate NR release.
-		if (a_resource) { a_resource->Release(); }
+		if (a_resource) {
+			a_resource->Release();
+		}
 	}
 
 	DWORD WINAPI NVSDK_NGX_GetModuleFileNameW_Proxy(HMODULE a_module, LPWSTR a_filename, DWORD a_size)

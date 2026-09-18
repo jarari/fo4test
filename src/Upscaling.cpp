@@ -653,7 +653,54 @@ namespace
 		if (!swap->swapChain || FAILED(swap->swapChain->GetDesc1(&desc))) {
 			return;
 		}
-		const auto reserve = TextureMemoryReserve::EstimateBytes(desc.Width, desc.Height);
+		auto* upscaling = Upscaling::GetSingleton();
+		const auto& settings = upscaling->settings;
+		const auto& domain = ENBRenderDomain::Get();
+		// Ignore temporary menu/occlusion suppression: those paths retain caches.
+		auto method = static_cast<Upscaling::UpscaleMethod>(settings.upscaleMethodPreference);
+		if (method == Upscaling::UpscaleMethod::kDLSS && !Streamline::GetSingleton()->featureDLSS) {
+			method = Upscaling::UpscaleMethod::kFSR;
+		}
+		TextureMemoryReserve::Configuration config;
+		config.width = desc.Width;
+		config.height = desc.Height;
+		config.renderWidth = desc.Width;
+		config.renderHeight = desc.Height;
+		config.slots = kDX12FrameCount;
+		config.backbuffers = desc.BufferCount;
+		config.enb = domain.Active();
+		if (config.enb) {
+			config.renderWidth = domain.Width();
+			config.renderHeight = domain.Height();
+		} else if (method != Upscaling::UpscaleMethod::kDisabled) {
+			const auto ratio = GetUpscaleRatioFromQualityMode(settings.qualityMode);
+			config.renderWidth = std::max(1u, static_cast<uint32_t>(desc.Width / ratio));
+			config.renderHeight = std::max(1u, static_cast<uint32_t>(desc.Height / ratio));
+		}
+		switch (desc.Format) {
+		case DXGI_FORMAT_R16G16B16A16_FLOAT:
+		case DXGI_FORMAT_R16G16B16A16_UNORM:
+		case DXGI_FORMAT_R16G16B16A16_TYPELESS: config.colorBytes = 8; break;
+		case DXGI_FORMAT_R32G32B32A32_FLOAT: config.colorBytes = 16; break;
+		default: config.colorBytes = 4; break; // RGBA8/BGRA8/RGB10A2
+		}
+		if (method == Upscaling::UpscaleMethod::kDLSS) config.sr = TextureMemoryReserve::SR::DLSS;
+		if (method == Upscaling::UpscaleMethod::kFSR) config.sr = TextureMemoryReserve::SR::FSR;
+		if (method != Upscaling::UpscaleMethod::kDisabled) {
+			if (upscaling->ShouldUseFSRFrameGeneration(false)) config.fg = TextureMemoryReserve::FG::FSR;
+			else if (upscaling->ShouldUseFrameGeneration(false)) config.fg = TextureMemoryReserve::FG::DLSS;
+		}
+		config.generatedFrames = (settings.dynamicMFGEnabled || settings.frameGenerationMode == 3) ?
+			5u : std::min(settings.dlssgGeneratedFrames, 4u) + 1;
+		config.nrPasses = config.sr == TextureMemoryReserve::SR::DLSS && settings.dlssNREnabled ?
+			std::clamp(settings.dlssNRPassCount, 1u, 3u) : 0;
+		config.nrAfterSR = settings.dlssNRPosition == 1;
+		config.sharpen = settings.sharpness > 0.0f;
+		config.reshadeDepth = ReShadeDepth::IsActive();
+		const auto estimate = TextureMemoryReserve::Calculate(config);
+		const auto reserve = estimate.reserve;
+		static uint64_t pendingDecrease = 0, pendingSince = 0;
+		if (reserve >= g_textureMemoryRequestedReserve) pendingDecrease = 0;
 		auto* limit = GetTextureMemoryUpgradeLimit();
 		if (!limit || !*limit || !reserve ||
 			(g_textureMemoryReserveApplied && reserve == g_textureMemoryRequestedReserve)) {
@@ -663,7 +710,18 @@ namespace
 		if (!g_textureMemoryReserveApplied) {
 			g_textureMemoryOriginalLimit = *limit;
 		}
-		// Recompute from the unmodified limit on resize, never subtract twice.
+		// Raise headroom immediately; don't return budget during resource retirement
+		// or rapid option toggles. This is hysteresis, not a GPU lifetime guarantee.
+		if (g_textureMemoryReserveApplied && reserve < g_textureMemoryRequestedReserve) {
+			const auto now = GetTickCount64();
+			if (pendingDecrease != reserve || !upscaling->deferredResourceReleases.empty()) {
+				pendingDecrease = reserve;
+				pendingSince = now;
+			}
+			if (now - pendingSince < 5000) return;
+		}
+		pendingDecrease = 0;
+		// Recompute from the unmodified engine limit, never subtract twice.
 		const auto originalLimit = g_textureMemoryOriginalLimit;
 		const auto reservedLimit = TextureMemoryReserve::UpgradeLimit(originalLimit, reserve);
 
@@ -671,12 +729,15 @@ namespace
 		g_textureMemoryReserveApplied = true;
 		g_textureMemoryRequestedReserve = reserve;
 		logger::info(
-			"[Upscaling] Texture memory upgrade limit {} -> {} MiB; output={}x{} ({} pixels), requested reserve={} MiB, applied={} MiB",
+			"[Upscaling] Texture memory upgrade limit {} -> {} MiB; output={}x{} render={}x{} format={} reserve={} MiB applied={} MiB; estimates resident/SR/FG/NR/UI/depth={}/{}/{}/{}/{}/{} MiB (cap=2048)",
 			originalLimit / (1024ull * 1024ull),
 			reservedLimit / (1024ull * 1024ull),
-			desc.Width, desc.Height, uint64_t{ desc.Width } * desc.Height,
+			desc.Width, desc.Height, config.renderWidth, config.renderHeight, static_cast<uint32_t>(desc.Format),
 			reserve / TextureMemoryReserve::MiB,
-			(originalLimit - reservedLimit) / TextureMemoryReserve::MiB);
+			(originalLimit - reservedLimit) / TextureMemoryReserve::MiB,
+			estimate.resident / TextureMemoryReserve::MiB, estimate.sr / TextureMemoryReserve::MiB,
+			estimate.fg / TextureMemoryReserve::MiB, estimate.nr / TextureMemoryReserve::MiB,
+			estimate.ui / TextureMemoryReserve::MiB, estimate.depth / TextureMemoryReserve::MiB);
 	}
 
 	float Halton(uint32_t a_index, uint32_t a_base)
@@ -1288,7 +1349,15 @@ static void CaptureReShadeDepthBeforeUpscale(uint targetIndex)
 	const auto depthIndex = Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain);
 	auto* depth = depthIndex < std::size(renderer->depthStencilTargets) ?
 		reinterpret_cast<ID3D11ShaderResourceView*>(renderer->depthStencilTargets[depthIndex].srViewDepth) : nullptr;
-	ReShadeDepth::Capture(depth, width, height, frame);
+	const auto* upscaling = Upscaling::GetSingleton();
+	float jitterU = 0.0f, jitterV = 0.0f;
+	// Normalize by the resolution that generated jitter, not output pixels.
+	// The depth CS maps this UV offset onto the source grid exactly once.
+	if (upscaling->osdRenderSize.x > 0.0f && upscaling->osdRenderSize.y > 0.0f) {
+		jitterU = upscaling->jitter.x / upscaling->osdRenderSize.x;
+		jitterV = upscaling->jitter.y / upscaling->osdRenderSize.y;
+	}
+	ReShadeDepth::Capture(depth, width, height, jitterU, jitterV, frame);
 }
 
 /** @brief Hook to add alternative scaling method */
@@ -3571,6 +3640,9 @@ void Upscaling::UpdateUpscaling()
 	if (!menuBlocksUpscaling) {
 		UpdateSamplerStates(currentMipBias);
 	}
+	// Re-evaluate options/backend/extent before allocating this frame's resources.
+	// Unchanged estimates do not write or log; menu transitions don't drop budgets.
+	UpdateTextureMemoryUpgradeReserve();
 	UpdateRenderTargets(virtualENB ? 1.0f : resolutionScale, virtualENB ? 1.0f : resolutionScale);
 	UpdateGameSettings();
 

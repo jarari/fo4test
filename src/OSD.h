@@ -73,7 +73,8 @@ private:
 	double renderFPS = 0.0;
 	double frameTimeMs = 0.0;
 	double generatedFPS = 0.0;
-	uint64_t vramUsageMB = 0;
+	std::string gpuMemoryTotalText = "N/A";
+	std::string gpuMemoryDetailText = "N/A";
 	float reflexLatencyMs = 0.0f;
 	std::string cachedText;
 	uint32_t cachedMode = 0;

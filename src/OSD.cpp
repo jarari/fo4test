@@ -477,11 +477,21 @@ void OSD::UpdateStats()
 		generatedFPS = (renderedFrames + generatedFrames) / elapsedSeconds;
 	}
 
+	// DXGI reports this process's usage on the rendering adapter. Shared
+	// D3D11/D3D12 resources are already accounted for; do not add SDK totals.
+	gpuMemoryTotalText = "N/A";
+	gpuMemoryDetailText = "N/A";
 	if (adapter) {
-		DXGI_QUERY_VIDEO_MEMORY_INFO memoryInfo{};
-		if (SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memoryInfo))) {
-			vramUsageMB = memoryInfo.CurrentUsage / (1024ull * 1024ull);
+		DXGI_QUERY_VIDEO_MEMORY_INFO local{}, nonlocal{};
+		const bool localValid = SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local));
+		const bool nonlocalValid = SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal));
+		constexpr double MiB = 1024.0 * 1024.0;
+		const auto localText = localValid ? std::format("{:.1f} MiB", local.CurrentUsage / MiB) : "N/A";
+		const auto nonlocalText = nonlocalValid ? std::format("{:.1f} MiB", nonlocal.CurrentUsage / MiB) : "N/A";
+		if (localValid && nonlocalValid) {
+			gpuMemoryTotalText = std::format("{:.1f} MiB", local.CurrentUsage / MiB + nonlocal.CurrentUsage / MiB);
 		}
+		gpuMemoryDetailText = std::format("{} (local {})\nNon-local: {}", gpuMemoryTotalText, localText, nonlocalText);
 	}
 
 	reflexLatencyMs = streamline->GetReflexLatencyMs();
@@ -514,17 +524,22 @@ std::string OSD::BuildCompactText() const
 		std::snprintf(latency, sizeof(latency), "N/A");
 	}
 
+	// Preserve the compact layout's original label and unit width.
+	auto memoryText = gpuMemoryTotalText;
+	if (memoryText.ends_with(" MiB")) {
+		memoryText.replace(memoryText.size() - 4, 4, "MB");
+	}
 	char line[192]{};
 	std::snprintf(
 		line,
 		sizeof(line),
-		"%s %.1f\t%s %.1f\tLatency %s\tVRAM %.1fMB",
+		"%s %.1f\t%s %.1f\tLatency %s\tVRAM %s",
 		UpscalerMethodName(upscaling->upscaleMethod),
 		renderFPS,
 		FGMethodName(),
 		fgFPS,
 		latency,
-		static_cast<double>(vramUsageMB));
+		memoryText.c_str());
 	return line;
 }
 
@@ -547,8 +562,7 @@ std::string OSD::BuildDetailedText() const
 		std::snprintf(line, sizeof(line), "Generated FPS: %.1f\n", generatedFPS);
 		text += line;
 	}
-	std::snprintf(line, sizeof(line), "VRAM: %llu MB\n", static_cast<unsigned long long>(vramUsageMB));
-	text += line;
+	text += "GPU Mem: " + gpuMemoryDetailText + "\n";
 	if (reflexLatencyMs > 0.0f) {
 		std::snprintf(line, sizeof(line), "PC Latency: %.2f ms\n", reflexLatencyMs);
 	} else if (!streamline->IsPCLLatencyReportAvailable()) {
