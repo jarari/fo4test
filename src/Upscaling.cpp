@@ -1260,7 +1260,7 @@ struct DrawWorld_Imagespace_RenderEffectRange
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
-// Snapshot the same raw world depth as before; color is owned by the final D3D12 runtime.
+// Capture world depth before SR with resolution-correct engine jitter removal.
 static void CaptureReShadeDepthBeforeUpscale(uint targetIndex)
 {
 	if (!ReShadeDepth::IsActive()) return;
@@ -4871,7 +4871,8 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		}
 		const auto dlssgInputSize = float2(static_cast<float>(sharedMotionVectorDesc.Width), static_cast<float>(sharedMotionVectorDesc.Height));
 		if (useDLSSGThisFrame) {
-			if (!streamline->UpdateDLSSG(true, settings.frameGenerationMode, settings.dlssgGeneratedFrames + 1, settings.dynamicMFGEnabled != 0, settings.dynamicMFGTargetFPS, dlssgInputSize, a_displaySize, frameBufferDesc.Format, sharedMotionVectorDesc.Format, sharedDepthDesc.Format, DXGI_FORMAT_UNKNOWN)) {
+			const auto hudlessFormat = dlssgHUDLessD3D12[frameIndex] ? dlssgHUDLessD3D12[frameIndex]->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+			if (!streamline->UpdateDLSSG(true, settings.frameGenerationMode, settings.dlssgGeneratedFrames + 1, settings.dynamicMFGEnabled != 0, settings.dynamicMFGTargetFPS, dlssgInputSize, a_displaySize, hudlessFormat, sharedMotionVectorDesc.Format, sharedDepthDesc.Format, DXGI_FORMAT_UNKNOWN)) {
 				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, "DLSS-G options");
 				useDLSSGThisFrame = false;
 				if (!useD3D12DLSS) {

@@ -96,6 +96,11 @@ public:
 	void SetD3D11DeviceContext(ID3D11DeviceContext* a_d3d11Context);
 
 	DXGISwapChainProxy* GetSwapChainProxy() const { return swapChainProxy; }
+	DXGI_FORMAT GetBackBufferFormat() const
+	{
+		return frameIndex < kDX12FrameCount && swapChainBuffers[frameIndex] ?
+			swapChainBuffers[frameIndex]->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
+	}
 	bool IsReady() const { return swapChainProxy && swapChain && interopReady; }
 	void PaceFrameStart(uint32_t frame);
 	bool IsWindowMinimized() const { return windowMinimized.load(std::memory_order_acquire) || (hwnd && IsIconic(hwnd)); }

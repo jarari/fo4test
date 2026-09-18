@@ -2,6 +2,7 @@
 #ifdef UPSCALING_NR_CAPTURE
 #include "NRDiagnosticCapture.h"
 #endif
+#include "SwapChainCreationObserver.h"
 #include "ENBRenderDomain.h"
 #include "ENBTiledLighting.h"
 #include "NativeInterfaceUI.h"
@@ -681,67 +682,148 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		logger::info("[DX12SwapChain] FidelityFX frame generation swapchain will be created during swapchain initialization");
 	}
 
-	if (!swapChain) {
-		if (fidelityFXFrameGenerationSwapChainAllowed) {
-			DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreenDesc{};
-			fullscreenDesc.RefreshRate = a_swapChainDesc.BufferDesc.RefreshRate;
-			fullscreenDesc.ScanlineOrdering = a_swapChainDesc.BufferDesc.ScanlineOrdering;
-			fullscreenDesc.Scaling = a_swapChainDesc.BufferDesc.Scaling;
-			fullscreenDesc.Windowed = a_swapChainDesc.Windowed;
+	// Negotiate before exposing any game-facing buffers/views. Every retry must
+	// re-enter the same SDK creation path, not just wrap an already-created chain.
+	for (UINT attempt = 0; attempt < 3; ++attempt) {
+		SwapChainCreationObserver::Scope observation(hwnd);
+		const auto requestedFormat = swapChainDesc.Format;
+		if (!swapChain) {
+			if (fidelityFXFrameGenerationSwapChainAllowed) {
+				DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreenDesc{};
+				fullscreenDesc.RefreshRate = a_swapChainDesc.BufferDesc.RefreshRate;
+				fullscreenDesc.ScanlineOrdering = a_swapChainDesc.BufferDesc.ScanlineOrdering;
+				fullscreenDesc.Scaling = a_swapChainDesc.BufferDesc.Scaling;
+				fullscreenDesc.Windowed = a_swapChainDesc.Windowed;
 
-			IDXGISwapChain4* fidelityFXSwapChain = nullptr;
-			// FSR exposes its own application waitable object. Keep this request
-			// separate so a failed FSR creation cannot change the SL fallback.
-			auto fidelityFXDesc = swapChainDesc;
-			fidelityFXDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-			if (FidelityFX::GetSingleton()->CreateFrameGenerationSwapChainForHwnd(
-					upgradedFactory.get(),
-					a_swapChainDesc.OutputWindow,
-					&fidelityFXDesc,
-					&fullscreenDesc,
-					commandQueue.get(),
-					&fidelityFXSwapChain) &&
-				fidelityFXSwapChain) {
-				swapChain.attach(fidelityFXSwapChain);
-				applicationFrameLatencyWaitable = true;
-				swapChainDesc = fidelityFXDesc;
-				logger::info("[DX12SwapChain] FidelityFX frame generation swapchain created for hwnd: swapchain={}", static_cast<void*>(swapChain.get()));
-			} else {
-				if (fidelityFXSwapChain) {
-					fidelityFXSwapChain->Release();
+				IDXGISwapChain4* fidelityFXSwapChain = nullptr;
+				// FSR exposes its own application waitable object. Keep this request
+				// separate so a failed FSR creation cannot change the SL fallback.
+				auto fidelityFXDesc = swapChainDesc;
+				fidelityFXDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+				if (FidelityFX::GetSingleton()->CreateFrameGenerationSwapChainForHwnd(
+						upgradedFactory.get(),
+						a_swapChainDesc.OutputWindow,
+						&fidelityFXDesc,
+						&fullscreenDesc,
+						commandQueue.get(),
+						&fidelityFXSwapChain) &&
+					fidelityFXSwapChain) {
+					swapChain.attach(fidelityFXSwapChain);
+					applicationFrameLatencyWaitable = true;
+					swapChainDesc = fidelityFXDesc;
+					logger::info("[DX12SwapChain] FidelityFX frame generation swapchain created for hwnd: swapchain={}", static_cast<void*>(swapChain.get()));
+				} else {
+					if (fidelityFXSwapChain) {
+						fidelityFXSwapChain->Release();
+					}
+					fidelityFXFrameGenerationSwapChainAllowed = false;
+					logger::warn("[DX12SwapChain] FidelityFX frame generation swapchain creation failed; falling back to a regular D3D12 swapchain");
 				}
-				fidelityFXFrameGenerationSwapChainAllowed = false;
-				logger::warn("[DX12SwapChain] FidelityFX frame generation swapchain creation failed; falling back to a regular D3D12 swapchain");
+			}
+
+			if (!swapChain) {
+				winrt::com_ptr<IDXGISwapChain1> swapChain1;
+				DX::ThrowIfFailed(upgradedFactory->CreateSwapChainForHwnd(commandQueue.get(), a_swapChainDesc.OutputWindow, &swapChainDesc, nullptr, nullptr, swapChain1.put()));
+				DX::ThrowIfFailed(swapChain1->QueryInterface(IID_PPV_ARGS(swapChain.put())));
 			}
 		}
 
-		if (!swapChain) {
-			winrt::com_ptr<IDXGISwapChain1> swapChain1;
-			DX::ThrowIfFailed(upgradedFactory->CreateSwapChainForHwnd(commandQueue.get(), a_swapChainDesc.OutputWindow, &swapChainDesc, nullptr, nullptr, swapChain1.put()));
-			DX::ThrowIfFailed(swapChain1->QueryInterface(IID_PPV_ARGS(swapChain.put())));
+		logger::info("[DX12SwapChain] Swapchain created via {} factory: swapchain={}", upgradedFactory.get() == a_dxgiFactory ? "native" : "Streamline proxy", static_cast<void*>(swapChain.get()));
+		LogStreamlineProxy(a_streamline, "dxgiFactory", a_dxgiFactory);
+		LogStreamlineProxy(a_streamline, "factoryForSwapChain", upgradedFactory.get());
+		auto swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain", swapChain.get());
+		if (!swapChainIsStreamlineProxy && a_streamline && a_streamline->slUpgradeInterface) {
+			IDXGISwapChain* upgradedSwapChain = swapChain.get();
+			if (SL_FAILED(result, a_streamline->slUpgradeInterface(reinterpret_cast<void**>(&upgradedSwapChain)))) {
+				logger::warn("[DX12SwapChain] Could not upgrade swapchain for Streamline: {}", magic_enum::enum_name(result));
+			} else if (upgradedSwapChain && upgradedSwapChain != swapChain.get()) {
+				winrt::com_ptr<IDXGISwapChain> upgradedSwapChainOwner;
+				upgradedSwapChainOwner.attach(upgradedSwapChain);
+				winrt::com_ptr<IDXGISwapChain4> upgradedSwapChain4;
+				DX::ThrowIfFailed(upgradedSwapChainOwner->QueryInterface(IID_PPV_ARGS(upgradedSwapChain4.put())));
+				swapChain = upgradedSwapChain4;
+				logger::info("[DX12SwapChain] Swapchain explicitly upgraded for Streamline: swapchain={}", static_cast<void*>(swapChain.get()));
+				swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain.afterUpgrade", swapChain.get());
+			}
 		}
-	}
-
-	logger::info("[DX12SwapChain] Swapchain created via {} factory: swapchain={}", upgradedFactory.get() == a_dxgiFactory ? "native" : "Streamline proxy", static_cast<void*>(swapChain.get()));
-	LogStreamlineProxy(a_streamline, "dxgiFactory", a_dxgiFactory);
-	LogStreamlineProxy(a_streamline, "factoryForSwapChain", upgradedFactory.get());
-	auto swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain", swapChain.get());
-	if (!swapChainIsStreamlineProxy && a_streamline && a_streamline->slUpgradeInterface) {
-		IDXGISwapChain* upgradedSwapChain = swapChain.get();
-		if (SL_FAILED(result, a_streamline->slUpgradeInterface(reinterpret_cast<void**>(&upgradedSwapChain)))) {
-			logger::warn("[DX12SwapChain] Could not upgrade swapchain for Streamline: {}", magic_enum::enum_name(result));
-		} else if (upgradedSwapChain && upgradedSwapChain != swapChain.get()) {
-			winrt::com_ptr<IDXGISwapChain> upgradedSwapChainOwner;
-			upgradedSwapChainOwner.attach(upgradedSwapChain);
-			winrt::com_ptr<IDXGISwapChain4> upgradedSwapChain4;
-			DX::ThrowIfFailed(upgradedSwapChainOwner->QueryInterface(IID_PPV_ARGS(upgradedSwapChain4.put())));
-			swapChain = upgradedSwapChain4;
-			logger::info("[DX12SwapChain] Swapchain explicitly upgraded for Streamline: swapchain={}", static_cast<void*>(swapChain.get()));
-			swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain.afterUpgrade", swapChain.get());
+		if (!swapChainIsStreamlineProxy) {
+			logger::warn("[DX12SwapChain] D3D12 swapchain is not a Streamline proxy; DLSS-G Present interception may not run on this swapchain");
 		}
-	}
-	if (!swapChainIsStreamlineProxy) {
-		logger::warn("[DX12SwapChain] D3D12 swapchain is not a Streamline proxy; DLSS-G Present interception may not run on this swapchain");
+		DXGI_SWAP_CHAIN_DESC1 actual{};
+		DX::ThrowIfFailed(swapChain->GetDesc1(&actual));
+		const auto observed = observation.Result();
+		if (observed) {
+			actual = *observed;
+		} else if (a_streamline && a_streamline->slGetNativeInterface) {
+			void* raw = nullptr;
+			if (a_streamline->slGetNativeInterface(swapChain.get(), &raw) == sl::Result::eOk && raw) {
+				winrt::com_ptr<IUnknown> owner;
+				owner.attach(static_cast<IUnknown*>(raw));
+				winrt::com_ptr<IDXGISwapChain1> native;
+				if (SUCCEEDED(owner->QueryInterface(IID_PPV_ARGS(native.put())))) {
+					DX::ThrowIfFailed(native->GetDesc1(&actual));
+					winrt::com_ptr<ID3D12Resource> buffer;
+					DX::ThrowIfFailed(native->GetBuffer(0, IID_PPV_ARGS(buffer.put())));
+					actual.Format = buffer->GetDesc().Format;
+				}
+			}
+		}
+		DXGI_FORMAT applicationFormat;
+		{
+			winrt::com_ptr<ID3D12Resource> buffer;
+			DX::ThrowIfFailed(swapChain->GetBuffer(0, IID_PPV_ARGS(buffer.put())));
+			applicationFormat = buffer->GetDesc().Format;
+		}
+		logger::info("[DX12SwapChain] Creation validation attempt={} requested={} application={} output={} observedByReShade={}",
+			attempt + 1, static_cast<uint32_t>(requestedFormat), static_cast<uint32_t>(applicationFormat),
+			static_cast<uint32_t>(actual.Format), observed.has_value());
+		const bool switchToFidelityFX = actual.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+			a_streamline && !a_streamline->dlssgBlockedByFP16Output;
+		if (requestedFormat == actual.Format && applicationFormat == actual.Format && !switchToFidelityFX) {
+			break;
+		}
+		// No Present or application work has used this chain yet. Destroy the FSR
+		// owner too; keeping its context would bypass creation on the next attempt.
+		if (FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive()) {
+			FidelityFX::GetSingleton()->DestroyFrameGenerationResources();
+		}
+		auto* discardedChain = swapChain.detach();
+		const auto remainingReferences = discardedChain->Release();
+		if (switchToFidelityFX) {
+			// Destroy the SL-owned chain while its Destroyed hook is still installed.
+			// Only then remove DLSS-G hooks, before the next factory call. This is
+			// initialization, with no application Present/FG work in flight.
+			if (streamlinePacing) {
+				if (remainingReferences != 0 || !a_streamline->slSetFeatureLoaded ||
+					a_streamline->slSetFeatureLoaded(sl::kFeatureDLSS_G, false) != sl::Result::eOk) {
+					logger::error("[DX12SwapChain] Cannot safely disable DLSS-G hooks for FP16 FidelityFX fallback");
+					DX::ThrowIfFailed(DXGI_ERROR_UNSUPPORTED);
+				}
+			}
+			a_streamline->dlssgBlockedByFP16Output = true;
+			a_streamline->featureDLSSG = false;
+			a_streamline->dlssgActive = false;
+			streamlinePacing = false;
+			applicationFrameLatencyWaitable = true;
+			fidelityFXFrameGenerationSwapChainAllowed = true;
+			logger::info("[DX12SwapChain] R16G16B16A16_FLOAT output (format=10): DLSS FG unavailable; recreating with FidelityFX FG instead. DLSS SR and Reflex remain available.");
+		}
+		if (attempt == 2 || actual.Format == DXGI_FORMAT_UNKNOWN) {
+			logger::error("[DX12SwapChain] Output format did not converge; refusing incompatible interop buffers");
+			DX::ThrowIfFailed(DXGI_ERROR_UNSUPPORTED);
+		}
+		// Carry the resulting surface settings back into the SDK's initial request.
+		// BufferCount and Flags belong to the outer application pacing contract:
+		// copying the SDK's expanded physical count/flags would expand them again.
+		const auto applicationBufferCount = swapChainDesc.BufferCount;
+		const auto applicationFlags = swapChainDesc.Flags;
+		swapChainDesc = actual;
+		swapChainDesc.BufferCount = applicationBufferCount;
+		swapChainDesc.Flags = applicationFlags;
+		if (switchToFidelityFX) {
+			swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+		}
+		logger::info("[DX12SwapChain] Recreating through SDK with negotiated format={}", static_cast<uint32_t>(swapChainDesc.Format));
 	}
 	ConfigureFrameLatency();
 	RefreshBackBuffers();
@@ -1996,18 +2078,20 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		return DXGI_ERROR_INVALID_CALL;
 	}
 
+	ID3D11Texture2D* captureSource = nullptr;
 	if (ENBRenderDomain::Get().Active()) {
 		if (!BeginNativeUI()) {
 			return E_FAIL;
 		}
 		// AcquireCommandContext has completed the prior D3D12 use of this
 		// snapshot. Copy on D3D11 before signaling this frame's UI-ready fence.
-		d3d11Context->CopyResource(presentStaging->resource11.get(), nativeUITexture->resource.get());
+		captureSource = nativeUITexture->resource.get();
 	} else if (swapChainBufferProxyENB) {
-		d3d11Context->CopyResource(presentStaging->resource11.get(), swapChainBufferProxyENB->resource11.get());
+		captureSource = swapChainBufferProxyENB->resource11.get();
 	} else {
-		d3d11Context->CopyResource(presentStaging->resource11.get(), swapChainBufferProxy->resource.get());
+		captureSource = swapChainBufferProxy->resource.get();
 	}
+	d3d11Context->CopyResource(presentStaging->resource11.get(), captureSource);
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	// Publish the complete D3D11 UI batch before the consumer queue waits.
 	// Flush submits work; it does not wait for GPU completion on the CPU.
@@ -2218,7 +2302,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	const auto nextFrameIndex = swapChain->GetCurrentBackBufferIndex();
 
 	if (dlssgPresentSafety || upscaling->IsFrameGenerationActive()) {
-		streamline->QueryDLSSGState("post-wait");
+		streamline->QueryDLSSGState();
 	}
 
 	static bool loggedPresentAdjustment = false;

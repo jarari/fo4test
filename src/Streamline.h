@@ -192,7 +192,7 @@ public:
 	 */
 	void OnPresentStart();
 	void OnPresentEnd(HRESULT a_result, bool a_queryState = true);
-	void QueryDLSSGState(std::string_view a_phase);
+	void QueryDLSSGState();
 	sl::ReflexMode GetCurrentReflexMode() const { return currentReflexMode; }
 	// Latest completed simulation-start -> GPU-end duration; 0 means unavailable.
 	float GetReflexLatencyMs();
@@ -225,6 +225,7 @@ public:
 	bool featureDLSS = false;  ///< True if DLSS is available on current GPU
 	bool featureDLSSNR = false; ///< True if DLSS Neural Rendering uplift is available
 	bool featureDLSSG = false; ///< True if DLSS Frame Generation is available
+	bool dlssgBlockedByFP16Output = false; ///< Output-format fallback; does not disable DLSS SR or Reflex.
 	bool featureNIS = false; ///< True if NVIDIA Image Scaling is available
 	bool featureReflex = false; ///< True if NVIDIA Reflex is available
 	bool featurePCL = false; ///< True if PCL markers are available
@@ -314,8 +315,6 @@ private:
 	uint32_t reflexSleepFrame = std::numeric_limits<uint32_t>::max();
 	uint32_t simulationMarkerFrame = std::numeric_limits<uint32_t>::max();
 	uint32_t renderMarkerFrame = std::numeric_limits<uint32_t>::max();
-	uint32_t lastDLSSGStatus = std::numeric_limits<uint32_t>::max();
-	uint32_t lastDLSSGPresentedFrames = std::numeric_limits<uint32_t>::max();
 	uint32_t lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();
 	double lastDLSSGPresentMultiplier = 1.0;
 	uint32_t maxFramesToGenerate = 1;

@@ -339,7 +339,7 @@ namespace
 		const auto streamline = Streamline::GetSingleton();
 		if (streamline->initialized) {
 			ImGuiMCP::TextDisabled(
-				"Runtime: DLSS %s | DLSS-NR %s | Frame Generation %s | Reflex %s",
+				"Runtime: DLSS %s | DLSS-NR %s | DLSS Frame Generation %s | Reflex %s",
 				streamline->featureDLSS ? "available" : "unavailable",
 				streamline->featureDLSSNR ? "available" : "direct path",
 				streamline->featureDLSSG ? "available" : "unavailable",
@@ -379,6 +379,10 @@ namespace
 		}
 
 		ImGuiMCP::SeparatorText("Frame Generation");
+		if (streamline->dlssgBlockedByFP16Output) {
+			ImGuiMCP::TextWrapped("DLSS Frame Generation is unavailable with R16G16B16A16_FLOAT (FP16, format 10) swapchain output.");
+			ImGuiMCP::TextWrapped("When RenoDX or another color-format modification uses R16G16B16A16_FLOAT, FidelityFX Frame Generation is used instead when FG is enabled. DLSS upscaling remains available. DLSS multi-frame and Dynamic MFG settings do not apply.");
+		}
 		const bool upscalingDisabled = settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDisabled);
 		ImGuiMCP::BeginDisabled(upscalingDisabled);
 		static constexpr std::array frameGenerationModes{ "Disabled", "On", "Auto" };
@@ -386,11 +390,11 @@ namespace
 			"Frame Generation",
 			settings.frameGenerationMode,
 			frameGenerationModes,
-			"Uses the selected vendor's frame generation path when supported.");
+			"Uses DLSS Frame Generation when available, otherwise FidelityFX Frame Generation (including FP16 output).");
 		ImGuiMCP::EndDisabled();
 
 		const bool frameGenerationDisabled = upscalingDisabled || settings.frameGenerationMode == 0;
-		ImGuiMCP::BeginDisabled(frameGenerationDisabled || !dlssSelected);
+		ImGuiMCP::BeginDisabled(frameGenerationDisabled || !dlssSelected || !streamline->featureDLSSG);
 		static constexpr std::array generatedFrameCounts{ "1 (2x)", "2 (3x)", "3 (4x)", "4 (5x)", "5 (6x)" };
 		changed |= ComboSetting(
 			"Generated Frames",

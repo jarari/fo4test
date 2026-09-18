@@ -8,8 +8,9 @@ namespace ReShadeDepth
 	void Initialize();
 	void SetOutputWindow(HWND window);
 	bool IsActive();
-	// Same raw, top-left render rectangle as the former D3D11 scene path.
-	void Capture(ID3D11ShaderResourceView* depth, UINT width, UINT height, uint64_t frame);
+	// Jitter is normalized by its generating render resolution. Reconstruct
+	// onto the display grid with the negative engine-jitter offset.
+	void Capture(ID3D11ShaderResourceView* depth, UINT width, UINT height, float jitterU, float jitterV, uint64_t frame);
 	// Publish color provenance before entering either vendor's asynchronous Present.
 	void PublishPresent(UINT slot, uint64_t frame, ID3D12Resource* backbuffer);
 	// Invalidate a pending snapshot when this frame's inputs cannot be captured.

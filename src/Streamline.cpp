@@ -108,30 +108,6 @@ namespace
 			a_lhs.performanceMode == a_rhs.performanceMode;
 	}
 
-	std::string DLSSGStatusFlags(sl::DLSSGStatus a_status)
-	{
-		if (a_status == sl::DLSSGStatus::eOk) {
-			return "eOk";
-		}
-
-		std::string flags;
-		const auto append = [&](sl::DLSSGStatus a_flag, std::string_view a_name) {
-			if (a_status & a_flag) {
-				if (!flags.empty()) {
-					flags += '|';
-				}
-				flags += a_name;
-			}
-		};
-
-		append(sl::DLSSGStatus::eFailResolutionTooLow, "ResolutionTooLow");
-		append(sl::DLSSGStatus::eFailReflexNotDetectedAtRuntime, "ReflexNotDetected");
-		append(sl::DLSSGStatus::eFailHDRFormatNotSupported, "HDRFormatNotSupported");
-		append(sl::DLSSGStatus::eFailCommonConstantsInvalid, "CommonConstantsInvalid");
-		append(sl::DLSSGStatus::eFailGetCurrentBackBufferIndexNotCalled, "GetCurrentBackBufferIndexNotCalled");
-		append(sl::DLSSGStatus::eReserved5, "Reserved5");
-		return flags.empty() ? "unknown" : flags;
-	}
 
 	sl::float4x4 ToSLMatrix(const DirectX::XMMATRIX& a_matrix)
 	{
@@ -324,8 +300,6 @@ void Streamline::Shutdown()
 	reflexSleepFrame = std::numeric_limits<uint32_t>::max();
 	simulationMarkerFrame = std::numeric_limits<uint32_t>::max();
 	renderMarkerFrame = std::numeric_limits<uint32_t>::max();
-	lastDLSSGStatus = std::numeric_limits<uint32_t>::max();
-	lastDLSSGPresentedFrames = std::numeric_limits<uint32_t>::max();
 	lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();
 	lastDLSSGPresentMultiplier = 1.0;
 	maxFramesToGenerate = 1;
@@ -812,6 +786,7 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	static uint32_t currentDisplayWidth = 0;
 	static uint32_t currentDisplayHeight = 0;
 	static DXGI_FORMAT currentColorFormat = DXGI_FORMAT_UNKNOWN;
+	static DXGI_FORMAT currentBackBufferFormat = DXGI_FORMAT_UNKNOWN;
 	static DXGI_FORMAT currentMotionVectorFormat = DXGI_FORMAT_UNKNOWN;
 	static DXGI_FORMAT currentDepthFormat = DXGI_FORMAT_UNKNOWN;
 	static DXGI_FORMAT currentUIFormat = DXGI_FORMAT_UNKNOWN;
@@ -819,6 +794,14 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	if (mode == sl::DLSSGMode::eOff) {
 		RequestDLSSGDisable();
 		return true;
+	}
+
+	// a_colorFormat describes the tagged HUD-less resource, not the swapchain.
+	// HDR add-ons can make the final backbuffer FP16 while world color is RGBA8.
+	const auto backBufferFormat = UsesD3D12() ? DX12SwapChain::GetSingleton()->GetBackBufferFormat() : swapChainDesc.BufferDesc.Format;
+	if (backBufferFormat == DXGI_FORMAT_UNKNOWN || a_colorFormat == DXGI_FORMAT_UNKNOWN) {
+		logger::warn("[DLSS-G] Cannot configure unknown backbuffer/HUD-less formats");
+		return false;
 	}
 
 	pendingDLSSGDisable = false;
@@ -832,6 +815,7 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		currentDisplayWidth == displayWidth &&
 		currentDisplayHeight == displayHeight &&
 		currentColorFormat == a_colorFormat &&
+		currentBackBufferFormat == backBufferFormat &&
 		currentMotionVectorFormat == a_motionVectorFormat &&
 		currentDepthFormat == a_depthFormat &&
 		currentUIFormat == a_uiFormat) {
@@ -853,7 +837,7 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	options.mvecDepthHeight = renderHeight;
 	options.colorWidth = displayWidth;
 	options.colorHeight = displayHeight;
-	options.colorBufferFormat = static_cast<uint32_t>(a_colorFormat);
+	options.colorBufferFormat = static_cast<uint32_t>(backBufferFormat);
 	options.mvecBufferFormat = static_cast<uint32_t>(a_motionVectorFormat);
 	options.depthBufferFormat = static_cast<uint32_t>(a_depthFormat);
 	options.hudLessBufferFormat = static_cast<uint32_t>(a_colorFormat);
@@ -877,6 +861,7 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	currentDisplayWidth = displayWidth;
 	currentDisplayHeight = displayHeight;
 	currentColorFormat = a_colorFormat;
+	currentBackBufferFormat = backBufferFormat;
 	currentMotionVectorFormat = a_motionVectorFormat;
 	currentDepthFormat = a_depthFormat;
 	currentUIFormat = a_uiFormat;
@@ -885,9 +870,9 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		lastDLSSGPresentMultiplier = 1.0;
 	}
 	dlssgActive = mode != sl::DLSSGMode::eOff;
-	logger::info("[DLSS-G] options mode={} generated={} dynamicTarget={} render={}x{} output={}x{} uiInput={} uiRecomposition={}",
+	logger::info("[DLSS-G] options mode={} generated={} dynamicTarget={} render={}x{} output={}x{} uiInput={} uiRecomposition={} backbufferFormat={} hudlessFormat={}",
 		static_cast<uint32_t>(mode), generatedFrames, dynamicTargetFPS, renderWidth, renderHeight, displayWidth, displayHeight,
-		hasUIBuffer, options.enableUserInterfaceRecomposition == sl::Boolean::eTrue);
+		hasUIBuffer, options.enableUserInterfaceRecomposition == sl::Boolean::eTrue, options.colorBufferFormat, options.hudLessBufferFormat);
 	if (hadConfiguredOptions && lastTemporalResetFrameIndex != constantsFrameIndex) {
 		RequestTemporalReset();
 	}
@@ -1088,14 +1073,14 @@ void Streamline::OnPresentEnd(HRESULT, bool a_queryState)
 	SetPCLMarker(sl::PCLMarker::ePresentEnd, markerFrameToken);
 
 	if (a_queryState) {
-		QueryDLSSGState("post-present");
+		QueryDLSSGState();
 	}
 
 	presentFrameToken = nullptr;
 	presentFrameTokenIndex = std::numeric_limits<uint32_t>::max();
 }
 
-void Streamline::QueryDLSSGState(std::string_view a_phase)
+void Streamline::QueryDLSSGState()
 {
 	if (!featureDLSSG || !slDLSSGGetState) {
 		return;
@@ -1126,20 +1111,6 @@ void Streamline::QueryDLSSGState(std::string_view a_phase)
 	dlssgStateKnown = true;
 
 	const auto status = static_cast<uint32_t>(state.status);
-	if (lastDLSSGStatus != status || lastDLSSGPresentedFrames != state.numFramesActuallyPresented) {
-		logger::debug(
-			"[Streamline] DLSS-G state phase={} status={}({}) requested={} actuallyPresented={} max={} dynamicMFG={} active={}",
-			a_phase,
-			status,
-			DLSSGStatusFlags(state.status),
-			currentDLSSGGeneratedFrames,
-			state.numFramesActuallyPresented,
-			state.numFramesToGenerateMax,
-			state.bIsDynamicMFGSupported == sl::Boolean::eTrue,
-			dlssgActive);
-		lastDLSSGStatus = status;
-		lastDLSSGPresentedFrames = state.numFramesActuallyPresented;
-	}
 	if (dlssgActive && state.status != sl::DLSSGStatus::eOk && slDLSSGSetOptions) {
 		logger::warn("[Streamline] DLSS-G disable requested due to runtime status {}", status);
 		RequestDLSSGDisable();

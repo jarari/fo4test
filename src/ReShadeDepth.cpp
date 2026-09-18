@@ -1,4 +1,5 @@
 #include "ReShadeDepth.h"
+#include "SwapChainCreationObserver.h"
 #include "ReShadeDepthFrameGraph.h"
 #include "ReShadeDepthDeviceIdentity.h"
 #include "DX12SwapChain.h"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -129,17 +131,37 @@ namespace
 		if (FAILED(hr)) throw std::runtime_error(std::format("D3D failure 0x{:08X}", static_cast<uint32_t>(hr)));
 	}
 
-	// Output extent equals the cropped input extent: the old point-sampled blit
-	// selected exactly this texel. No jitter correction, linearization or dilation.
+	struct DepthConstants
+	{
+		UINT sourceWidth, sourceHeight, outputWidth, outputHeight;
+		float jitterU, jitterV;
+		float padding[2]{};
+	};
+	static_assert(sizeof(DepthConstants) == 32);
+	// Zero offset and equal extents preserve exact texels.
 	constexpr char depthShader[] = R"hlsl(
-cbuffer Constants : register(b0) { uint2 Extent; uint2 Padding; };
+cbuffer Constants : register(b0) { uint2 SourceExtent; uint2 OutputExtent; float2 JitterUV; float2 Padding; };
 Texture2D<float> Input : register(t0);
 RWTexture2D<float> Output : register(u0);
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-    if (any(id.xy >= Extent)) return;
-    Output[id.xy] = Input.Load(int3(id.xy, 0));
+    if (any(id.xy >= OutputExtent)) return;
+    if (all(SourceExtent == OutputExtent) && all(JitterUV == 0.0)) {
+        Output[id.xy] = Input.Load(int3(id.xy, 0));
+        return;
+    }
+    float2 position = (float2(id.xy) + 0.5) * float2(SourceExtent) / float2(OutputExtent)
+                    - JitterUV * float2(SourceExtent) - 0.5;
+    position = clamp(position, 0.0, float2(SourceExtent) - 1.0);
+    int2 p0 = int2(floor(position));
+    int2 p1 = min(p0 + 1, int2(SourceExtent) - 1);
+    float2 f = position - float2(p0);
+    float d00 = Input.Load(int3(p0, 0));
+    float d10 = Input.Load(int3(p1.x, p0.y, 0));
+    float d01 = Input.Load(int3(p0.x, p1.y, 0));
+    float d11 = Input.Load(int3(p1, 0));
+    Output[id.xy] = lerp(lerp(d00, d10, f.x), lerp(d01, d11, f.x), f.y);
 }
 )hlsl";
 
@@ -158,7 +180,7 @@ void main(uint3 id : SV_DispatchThreadID)
 		Check(D3DCompile(depthShader, sizeof(depthShader) - 1, "ReShadeDepth", nullptr, nullptr, "main", "cs_5_0",
 			D3DCOMPILE_ENABLE_STRICTNESS, 0, code.put(), errors.put()));
 		Check(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, next.shader.put()));
-		D3D11_BUFFER_DESC desc{}; desc.ByteWidth = 16; desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		D3D11_BUFFER_DESC desc{}; desc.ByteWidth = sizeof(DepthConstants); desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		Check(device->CreateBuffer(&desc, nullptr, next.constants.put()));
 		producer = std::move(next);
 	}
@@ -561,6 +583,7 @@ void ReShadeDepth::Initialize()
 		reinterpret_cast<LPCWSTR>(&Initialize), &module);
 	if (!reshade::register_addon(module)) return;
 	initialized.store(true, std::memory_order_release);
+	SwapChainCreationObserver::Initialize();
 	reshade::register_event<reshade::addon_event::init_effect_runtime>(InitRuntime);
 	reshade::register_event<reshade::addon_event::destroy_effect_runtime>(DestroyRuntime);
 	reshade::register_event<reshade::addon_event::reshade_present>(RuntimePresent);
@@ -596,7 +619,7 @@ void ReShadeDepth::DiscardCapture(uint64_t frame)
 	for (auto& slot : pending) if (slot && slot->frame == frame) slot.reset();
 }
 
-void ReShadeDepth::Capture(ID3D11ShaderResourceView* depth, UINT width, UINT height, uint64_t frame)
+void ReShadeDepth::Capture(ID3D11ShaderResourceView* depth, UINT sourceWidth, UINT sourceHeight, float jitterU, float jitterV, uint64_t frame)
 {
 	if (!IsActive()) return;
 	std::lock_guard lock(mutex);
@@ -606,7 +629,8 @@ void ReShadeDepth::Capture(ID3D11ShaderResourceView* depth, UINT width, UINT hei
 	if (pending[index] && pending[index]->frame == frame) return;
 	pending[index].reset();
 	try {
-		if (!depth || !width || !height) { DiscardCapture(frame); return; }
+		const UINT width = swap->swapChainDesc.Width, height = swap->swapChainDesc.Height;
+		if (!depth || !sourceWidth || !sourceHeight || !width || !height || !std::isfinite(jitterU) || !std::isfinite(jitterV)) { DiscardCapture(frame); return; }
 		D3D11_SHADER_RESOURCE_VIEW_DESC view{}; depth->GetDesc(&view);
 		if (view.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || view.Texture2D.MostDetailedMip != 0) { DiscardCapture(frame); return; }
 		switch (view.Format) {
@@ -617,7 +641,7 @@ void ReShadeDepth::Capture(ID3D11ShaderResourceView* depth, UINT width, UINT hei
 		com_ptr<ID3D11Resource> source; depth->GetResource(source.put());
 		const auto texture = source.as<ID3D11Texture2D>();
 		D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
-		if (desc.SampleDesc.Count != 1 || width > desc.Width || height > desc.Height) { DiscardCapture(frame); return; }
+		if (desc.SampleDesc.Count != 1 || sourceWidth > desc.Width || sourceHeight > desc.Height) { DiscardCapture(frame); return; }
 		com_ptr<ID3D11Device> device; texture->GetDevice(device.put());
 		if (!producer.device) CreateProducer(device.get());
 		if (producer.device.get() != device.get()) { DiscardCapture(frame); return; }
@@ -661,8 +685,8 @@ void ReShadeDepth::Capture(ID3D11ShaderResourceView* depth, UINT width, UINT hei
 			~Restore() { context->SwapDeviceContextState(previous.get(), nullptr); }
 		} restore{ producer.context.get(), previous };
 		producer.context->ClearState();
-		const UINT extent[4]{ width, height, 0, 0 };
-		producer.context->UpdateSubresource(producer.constants.get(), 0, nullptr, extent, 0, 0);
+		const DepthConstants parameters{ sourceWidth, sourceHeight, width, height, jitterU, jitterV };
+		producer.context->UpdateSubresource(producer.constants.get(), 0, nullptr, &parameters, 0, 0);
 		auto* constants = producer.constants.get(); auto* uav = slot->uav.get();
 		producer.context->CSSetShader(producer.shader.get(), nullptr, 0);
 		producer.context->CSSetConstantBuffers(0, 1, &constants);
