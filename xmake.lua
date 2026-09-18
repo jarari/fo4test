@@ -5,7 +5,7 @@ includes("lib/commonlibf4")
 
 -- set project constants
 set_project("Upscaling")
-set_version("1.6.4")
+set_version("1.6.5")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
@@ -62,6 +62,7 @@ target("Upscaling")
     set_pcxxheader("include/PCH.h")
 
     add_links("d3d11", "d3d12", "d3dcompiler", "gdi32", "bcrypt", "version")
+    add_links("runtimeobject", "oleaut32")
 
     add_linkdirs("include/detours/Release", { public = false })
     add_links("detours")
