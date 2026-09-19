@@ -452,12 +452,11 @@ void OSD::UpdateStats()
 	++renderedFrames;
 
 	auto streamline = Streamline::GetSingleton();
-	if (!streamline->dlssgActive && Upscaling::GetSingleton()->ShouldUseFSRFrameGeneration(true)) {
-		generatedFrames += 1;
-	}
+	const auto fsrGeneratedFrameCount = FidelityFX::GetSingleton()->GetGeneratedFrameCount();
 
 	if (sampleStart.time_since_epoch().count() == 0) {
 		sampleStart = now;
+		lastFSRGeneratedFrameCount = fsrGeneratedFrameCount;
 		cachedText = BuildText();
 		textureDirty = true;
 		return;
@@ -474,8 +473,12 @@ void OSD::UpdateStats()
 	if (streamline->dlssgActive) {
 		generatedFPS = renderFPS * static_cast<double>(streamline->GetDLSSGPresentedFrameMultiplier());
 	} else {
-		generatedFPS = (renderedFrames + generatedFrames) / elapsedSeconds;
+		// Count successful SDK interpolation dispatches. Skipped/failed dispatches
+		// contribute zero; the SDK does not expose a presented-frame getter.
+		const auto interpolated = fsrGeneratedFrameCount - lastFSRGeneratedFrameCount;
+		generatedFPS = (renderedFrames + interpolated) / elapsedSeconds;
 	}
+	lastFSRGeneratedFrameCount = fsrGeneratedFrameCount;
 
 	// DXGI reports this process's usage on the rendering adapter. Shared
 	// D3D11/D3D12 resources are already accounted for; do not add SDK totals.
@@ -504,7 +507,6 @@ void OSD::UpdateStats()
 
 	sampleStart = now;
 	renderedFrames = 0;
-	generatedFrames = 0;
 	frameTimeAccumMs = 0.0;
 }
 
@@ -725,7 +727,7 @@ void OSD::Reset()
 	sampleStart = {};
 	frameTimeAccumMs = 0.0;
 	renderedFrames = 0;
-	generatedFrames = 0;
+	lastFSRGeneratedFrameCount = FidelityFX::GetSingleton()->GetGeneratedFrameCount();
 	renderFPS = 0.0;
 	frameTimeMs = 0.0;
 	generatedFPS = 0.0;

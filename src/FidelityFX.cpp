@@ -458,7 +458,11 @@ bool FidelityFX::ConfigureFrameGeneration(
 	};
 	config.HUDLessColor = a_hudlessColor ? ffxApiGetResourceDX12(a_hudlessColor, FFX_API_RESOURCE_STATE_COMPUTE_READ) : ffxApiGetResourceDX12(nullptr, FFX_API_RESOURCE_STATE_COMPUTE_READ);
 	config.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params, void* pUserCtx) -> ffxReturnCode_t {
-		return ffxDispatch(reinterpret_cast<ffxContext*>(pUserCtx), &params->header);
+		const auto result = ffxDispatch(reinterpret_cast<ffxContext*>(pUserCtx), &params->header);
+		if (result == FFX_API_RETURN_OK && params->numGeneratedFrames != 0) {
+			FidelityFX::GetSingleton()->RecordGeneratedFrames(params->numGeneratedFrames);
+		}
+		return result;
 	};
 	config.frameGenerationCallbackUserContext = &frameGenContext;
 	if (a_enabled && ReShadeDepth::IsActive() && !a_uiColorAlpha) {

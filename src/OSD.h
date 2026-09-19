@@ -69,7 +69,7 @@ private:
 	std::chrono::steady_clock::time_point sampleStart{};
 	double frameTimeAccumMs = 0.0;
 	uint32_t renderedFrames = 0;
-	uint32_t generatedFrames = 0;
+	uint64_t lastFSRGeneratedFrameCount = 0;
 	double renderFPS = 0.0;
 	double frameTimeMs = 0.0;
 	double generatedFPS = 0.0;

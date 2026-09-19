@@ -4,6 +4,7 @@
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <atomic>
 #include <ffx_api.hpp>
 #include <ffx_upscale.hpp>
 #include <ffx_framegeneration.hpp>
@@ -131,6 +132,8 @@ public:
 		DXGI_FORMAT a_backBufferFormat);
 	bool IsFrameGenerationSwapChainActive() const { return frameGenSwapChainContext != nullptr; }
 	bool IsFrameGenerationEnabled() const { return frameGenerationEnabled; }
+	uint64_t GetGeneratedFrameCount() const { return generatedFrameCount.load(std::memory_order_relaxed); }
+	void RecordGeneratedFrames(uint32_t a_count) { generatedFrameCount.fetch_add(a_count, std::memory_order_relaxed); }
 
 	// ========================================
 	// Resources
@@ -155,4 +158,5 @@ private:
 	DXGI_FORMAT frameGenBackBufferFormat = DXGI_FORMAT_UNKNOWN;
 	bool frameGenerationConfigured = false;
 	bool frameGenerationEnabled = false;
+	std::atomic<uint64_t> generatedFrameCount{ 0 };
 };
