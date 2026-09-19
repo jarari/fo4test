@@ -16,7 +16,7 @@ public:
     bool Upscale(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* output,
         ID3D12Resource* motion, ID3D12Resource* depth, float2 jitter, float2 renderSize);
     void DestroySR(); // Caller drains GPU first.
-    void RequestReset() { resetSerial.fetch_add(1, std::memory_order_relaxed); }
+    void RequestReset();
     bool CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12CommandQueue* queue,
         HWND window, const DXGI_SWAP_CHAIN_DESC1& desc, IDXGISwapChain4** chain);
     bool DestroyFG(); // Release application proxy references first; XeFG drains its own pacer.

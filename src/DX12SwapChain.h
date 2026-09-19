@@ -103,6 +103,10 @@ public:
 	}
 	bool IsReady() const { return swapChainProxy && swapChain && interopReady; }
 	void PaceFrameStart(uint32_t frame);
+	void NotifyLoadingScreen(bool active);
+	void BeginLoadingFrame();
+	bool IsLoadingScreen() const { return (loadingState.load(std::memory_order_acquire) & 1u) != 0; }
+	bool IsLoadingRecoveryPending() const { return IsLoadingScreen() || loadingResumeFrames.load(std::memory_order_acquire) != 0 || loadingState.load(std::memory_order_acquire) != appliedLoadingState.load(std::memory_order_acquire); }
 	bool IsWindowMinimized() const { return windowMinimized.load(std::memory_order_acquire) || (hwnd && IsIconic(hwnd)); }
 	bool IsWindowUnavailable() const { return IsWindowMinimized(); }
 	bool AreTemporalFeaturesSuspended() const { return temporalFeaturesSuspended; }
@@ -241,6 +245,10 @@ private:
 	void ConfigureFrameLatency();
 	void WaitForPresentationCapacity(uint32_t frame);
 	std::mutex frameLatencyMutex;
+	std::atomic<uint64_t> loadingState{0};
+	std::atomic<uint64_t> appliedLoadingState{0};
+	std::atomic<unsigned> loadingResumeFrames{0};
+	ULONGLONG frameLatencyRetryAfter = 0;
 	winrt::handle frameLatencyEvent;
 	uint32_t frameLatencyFrame = 0;
 	bool frameLatencyFrameValid = false;

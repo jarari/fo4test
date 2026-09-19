@@ -150,8 +150,8 @@ public:
 	bool ShouldBlockTemporalFeatures() const;
 	bool ShouldUseFrameGeneration(bool a_checkMenu);
 	bool ShouldUseExternalFrameGeneration(bool a_checkMenu);
-	bool IsFrameGenerationActive() const { return frameGenerationActive; }
-	bool IsExternalFrameGenerationActive() const { return externalFrameGenerationActive; }
+	bool IsFrameGenerationActive() const;
+	bool IsExternalFrameGenerationActive() const;
 	bool WantsFrameGenerationInputsThisFrame() const { return frameGenerationInputsWanted; }
 	bool IsD3D12DLSSActive() const { return d3d12DLSSActive; }
 

@@ -52,6 +52,7 @@ public:
 	void RequestSRReset() { srResetSerial.fetch_add(1, std::memory_order_relaxed); }
 	std::atomic<uint64_t> srResetSerial{1};
 	uint64_t srAppliedResetSerial = 0;
+	uint64_t fgAppliedResetSerial = 0;
 
 	/**
 	 * @brief Destroy FSR3 context and release resources

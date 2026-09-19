@@ -120,6 +120,7 @@ struct Renderer_Begin_ENBDomains
 	static void thunk(RE::BSGraphics::Renderer* a_renderer, uint32_t a_window)
 	{
 		if (a_window == 0) {
+			DX12SwapChain::GetSingleton()->BeginLoadingFrame();
 			// OG and AE increment State::frameCount inside Begin. Acquire that
 			// upcoming token before rendering; late constants reuse it without Sleep.
 			Streamline::GetSingleton()->BeginRenderFrame(Util::State_GetSingleton()->frameCount + 1);
@@ -171,6 +172,13 @@ struct UI_ScreenSpace_RenderMenus_Native
 		auto& domain = ENBRenderDomain::Get();
 		auto* swap = DX12SwapChain::GetSingleton();
 		g_nativeScreenSpaceUI = domain.Active() && swap->BeginNativeUI();
+		// LevelUpMenu's Scaleform art has persistent partial alpha and multiply
+		// blends. Give it the actual scene destination, as the native D3D11
+		// swapchain would, instead of rendering it onto transparent black.
+		static const RE::BSFixedString levelUpMenuName{ "LevelUpMenu" };
+		if (const auto* ui = RE::UI::GetSingleton(); ui && ui->GetMenuOpen(levelUpMenuName)) {
+			swap->PrepareNativeUIForEngineComposition();
+		}
 		func(a_ui);
 		swap->PublishNativeUIForOverlays();
 	}
@@ -2105,6 +2113,9 @@ void Upscaling::UpdateTextureMemoryUpgradeReserve()
 RE::BSEventNotifyControl Upscaling::ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*)
 {
 	auto singleton = GetSingleton();
+	if (a_event.menuName == "LoadingMenu") {
+		DX12SwapChain::GetSingleton()->NotifyLoadingScreen(a_event.opening);
+	}
 
 	// Preserve the existing pause-menu close path for settings written by
 	// external tools or older MCM installations.
@@ -3050,6 +3061,16 @@ void Upscaling::CopyFrameGenerationBuffers()
 	frameGenerationBuffersReady = true;
 }
 
+bool Upscaling::IsFrameGenerationActive() const
+{
+	return frameGenerationActive && !DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending();
+}
+
+bool Upscaling::IsExternalFrameGenerationActive() const
+{
+	return externalFrameGenerationActive && !DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending();
+}
+
 bool Upscaling::ShouldBlockTemporalFeatures() const
 {
 	const auto* dx12SwapChain = DX12SwapChain::GetSingleton();
@@ -3599,12 +3620,14 @@ void Upscaling::UpdateUpscaling()
 	}
 
 	const bool dlssgAllowed = activeFGProvider == FGProvider::DLSSG && frameGenerationSettingEnabled &&
+		!DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending() &&
 		streamline->featureDLSSG &&
 		!customRenderingMenu &&
 		!IsFeatureRequestBlocked(FeatureRequest::kDLSSG) &&
 		(!menuBlocksTemporal || dlssgHeldThroughMenu) &&
 		(dlssgHeldThroughMenu || dlssgMenuResumeReady);
 	externalFrameGenerationActive =
+		!DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending() &&
 		static_cast<UpscaleMethod>(settings.upscaleMethodPreference) != UpscaleMethod::kDisabled &&
 		frameGenerationSettingEnabled &&
 		dx12Ready &&
@@ -5341,6 +5364,10 @@ bool Upscaling::DispatchSharedTemporalSR(ID3D12GraphicsCommandList* a_commandLis
 
 bool Upscaling::EvaluateExternalFrameGeneration(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex)
 {
+	if (DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) {
+		if (a_frameIndex < externalFrameGenerationInputsReady.size()) externalFrameGenerationInputsReady[a_frameIndex] = false;
+		return false;
+	}
 	if (a_frameIndex >= externalFrameGenerationInputsReady.size() || !externalFrameGenerationInputsReady[a_frameIndex]) {
 		return false;
 	}
@@ -5406,6 +5433,11 @@ bool Upscaling::EvaluateExternalFrameGeneration(ID3D12GraphicsCommandList* a_com
 
 void Upscaling::TagDLSSGInputs(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex)
 {
+	if (DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) {
+		if (a_frameIndex < dlssgInputsReady.size()) dlssgInputsReady[a_frameIndex] = false;
+		Streamline::GetSingleton()->ClearDLSSGResourceTags(a_commandList);
+		return;
+	}
 	if (a_frameIndex >= dlssgInputsReady.size() || !dlssgInputsReady[a_frameIndex]) {
 		auto streamline = Streamline::GetSingleton();
 		if (streamline->NeedsDLSSGPresentSafety()) {

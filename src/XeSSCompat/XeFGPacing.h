@@ -307,6 +307,10 @@ inline std::atomic<int64_t> g_renderTimeNs{0};
 // pacing report is where it needs to be visible, next to the period it came
 // out of - that pairing is the entire point of the change.
 inline std::atomic<double> g_fedFrameTimeMs{0.0};
+// Requests may originate on the render thread. Consume only at a new burst
+// on the present thread; never rewrite its timing state concurrently.
+inline std::atomic<bool> g_resetTiming{false};
+inline void RequestTimingReset() { g_resetTiming.store(true, std::memory_order_release); }
 
 constexpr int32_t SchedLogLimit = 12;
 
@@ -479,6 +483,18 @@ inline void NoteFrame(uint64_t index, uint64_t count, int64_t nowQpc)
     if (index > 1)
         return;
 
+    if (g_resetTiming.exchange(false, std::memory_order_acq_rel)) {
+        g_lastBurstQpc = 0;
+        g_periodNs = g_intervalQpc = g_targetQpc = 0;
+        g_sampleCount = g_samplePos = 0;
+        g_burstBlockQpc = 0;
+        g_renderTimeNs.store(0, std::memory_order_relaxed);
+        g_nextDeadlineNs = g_burstStepNs = 0;
+        g_lastTsIndex = g_lastTsCountPlus1 = 0;
+        g_lastPacedQpc = 0;
+        ResetStats(nowQpc);
+    }
+
     if (g_lastBurstQpc != 0)
         PushPeriod(NsFromQpc(nowQpc - g_lastBurstQpc));
 
@@ -517,7 +533,7 @@ inline void NoteFrame(uint64_t index, uint64_t count, int64_t nowQpc)
 // Milliseconds of frame the game actually got to render, i.e. the measured
 // period with this burst's blocking taken back out. Zero until a burst has
 // been measured, which is the caller's signal to keep its own fallback.
-inline double RenderTimeMs() { const auto ns = g_renderTimeNs.load(std::memory_order_relaxed); return ns > 0 ? ns / 1000000.0 : 0.0; }
+inline double RenderTimeMs() { if (g_resetTiming.load(std::memory_order_acquire)) return 0.0; const auto ns = g_renderTimeNs.load(std::memory_order_relaxed); return ns > 0 ? ns / 1000000.0 : 0.0; }
 
 inline void NoteFedFrameTime(double ms) { g_fedFrameTimeMs = ms; }
 

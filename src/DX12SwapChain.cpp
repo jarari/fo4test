@@ -1434,6 +1434,7 @@ void DX12SwapChain::ConfigureFrameLatency()
 	std::scoped_lock lock(frameLatencyMutex);
 	frameLatencyEvent.close();
 	frameLatencyFrameValid = false;
+	frameLatencyRetryAfter = 0;
 	if (!swapChain) { return; }
 	if (!applicationFrameLatencyWaitable) {
 		// No app flag at creation: never consume or reconfigure SL's waitable.
@@ -1468,6 +1469,14 @@ void DX12SwapChain::WaitForPresentationCapacity(uint32_t frame)
 	if (!frameLatencyEvent || (frameLatencyFrameValid && frameLatencyFrame == frame)) { return; }
 	frameLatencyFrame = frame;
 	frameLatencyFrameValid = true;
+	// A loading gap is not a broken handle. Poll during cooldown so a transient
+	// timeout neither permanently removes pacing nor costs 100 ms every frame.
+	if (GetTickCount64() < frameLatencyRetryAfter) {
+		if (WaitForSingleObjectEx(frameLatencyEvent.get(), 0, FALSE) == WAIT_OBJECT_0) {
+			frameLatencyRetryAfter = 0;
+		}
+		return;
+	}
 	// Bound the wait for minimized/occluded windows and broken SDK events.
 	// Do not pump messages here: that could reenter renderer/resize hooks.
 	DWORD result = WAIT_TIMEOUT;
@@ -1476,14 +1485,46 @@ void DX12SwapChain::WaitForPresentationCapacity(uint32_t frame)
 		result = WaitForSingleObjectEx(frameLatencyEvent.get(), 10, FALSE);
 		if (result != WAIT_TIMEOUT) { break; }
 	}
-	if (result != WAIT_OBJECT_0) {
+	if (result == WAIT_TIMEOUT) {
+		frameLatencyRetryAfter = GetTickCount64() + 1000;
+	} else if (result != WAIT_OBJECT_0) {
 		logger::warn("[Presentation] Frame-latency wait result={}; disabled until swapchain reconfiguration", result);
 		frameLatencyEvent.close();
 	}
 }
 
+void DX12SwapChain::NotifyLoadingScreen(bool active)
+{
+	// Menu callbacks only publish state. Never touch GPU/SDK state here.
+	auto previous = loadingState.load(std::memory_order_relaxed);
+	while ((previous & 1u) != static_cast<uint64_t>(active)) {
+		const auto next = ((previous + 2) & ~uint64_t{1}) | static_cast<uint64_t>(active);
+		if (loadingState.compare_exchange_weak(previous, next, std::memory_order_release, std::memory_order_relaxed)) break;
+	}
+}
+
+void DX12SwapChain::BeginLoadingFrame()
+{
+	const auto state = loadingState.load(std::memory_order_acquire);
+	if (state == appliedLoadingState.load(std::memory_order_relaxed)) return;
+	// Renderer::Begin owns the transition, including open+close with no draws.
+	loadingResumeFrames.store(2, std::memory_order_release);
+	presentPacing.Reset();
+	{
+		std::scoped_lock lock(frameLatencyMutex);
+		frameLatencyFrameValid = false;
+		frameLatencyRetryAfter = 0;
+	}
+	Streamline::GetSingleton()->RequestTemporalReset();
+	appliedLoadingState.store(state, std::memory_order_release);
+}
+
 void DX12SwapChain::PaceFrameStart(uint32_t frame)
 {
+	if (IsLoadingRecoveryPending()) {
+		presentPacing.Reset();
+		return;
+	}
 	if (!IsReady() || deviceLost || IsWindowUnavailable()) {
 		presentPacing.Reset();
 		return;
@@ -2255,7 +2296,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		auto afterCopy = CD3DX12_RESOURCE_BARRIER::Transition(destination, destinationState, D3D12_RESOURCE_STATE_PRESENT);
 		commandList->ResourceBarrier(1, &afterCopy);
 	}
-
 	ExecuteCommandContext(commandContext);
 
 	const auto vsyncMode = upscaling->settings.vsyncMode;
@@ -2314,6 +2354,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		upscaling->AdvanceDeferredResourceReleases();
 		if (result == S_OK) {
 			upscaling->OnNRPresentComplete(presentedFrameIndex);
+			if (!IsLoadingScreen() && loadingState.load(std::memory_order_acquire) == appliedLoadingState.load(std::memory_order_acquire)) {
+				const auto remaining = loadingResumeFrames.load(std::memory_order_relaxed);
+				if (remaining != 0) loadingResumeFrames.store(remaining - 1, std::memory_order_release);
+			}
 		}
 	}
 	if (FAILED(result)) {

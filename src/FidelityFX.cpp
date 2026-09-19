@@ -449,6 +449,8 @@ bool FidelityFX::ConfigureFrameGeneration(
 	const auto frameTimeMs = std::chrono::duration<float, std::milli>(currentFrameTime - lastFrameTime).count();
 	lastFrameTime = currentFrameTime;
 
+	const auto resetSerial = srResetSerial.load(std::memory_order_relaxed);
+	const bool resetHistory = fgAppliedResetSerial != resetSerial || !frameGenerationEnabled || recreateFrameGenerationContext;
 	ffx::ConfigureDescFrameGeneration config{};
 	config.swapChain = a_swapChain;
 	config.frameGenerationEnabled = a_enabled;
@@ -503,7 +505,7 @@ bool FidelityFX::ConfigureFrameGeneration(
 	prepare.motionVectors = ffxApiGetResourceDX12(a_motionVectors, FFX_API_RESOURCE_STATE_COMPUTE_READ);
 	prepare.jitterOffset = { -a_jitter.x, -a_jitter.y };
 	prepare.motionVectorScale = { a_renderSize.x, a_renderSize.y };
-	prepare.frameTimeDelta = std::max(frameTimeMs, 0.0f);
+	prepare.frameTimeDelta = resetHistory ? 1000.0f / 60.0f : std::clamp(frameTimeMs, 0.1f, 250.0f);
 	prepare.renderSize = { static_cast<uint32_t>(a_renderSize.x), static_cast<uint32_t>(a_renderSize.y) };
 	prepare.cameraNear = *reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
 	prepare.cameraFar = *reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
@@ -520,7 +522,7 @@ bool FidelityFX::ConfigureFrameGeneration(
 	prepare.cameraFovAngleVertical = cameraProjection.cameraFOV;
 	prepare.viewSpaceToMetersFactor = 0.01428222656f;
 	prepare.frameID = a_frameID;
-	prepare.reset = false;
+	prepare.reset = resetHistory;
 
 	Util::CameraBasis cameraBasis{};
 	if (!Util::TryGetCameraBasis(cameraState->camViewData, cameraBasis)) {
@@ -545,6 +547,7 @@ bool FidelityFX::ConfigureFrameGeneration(
 		logger::warn("[FidelityFX] Dispatch(frame generation prepare) failed: {}", static_cast<uint32_t>(result));
 		return false;
 	}
+	fgAppliedResetSerial = resetSerial;
 
 	return true;
 }
@@ -676,6 +679,7 @@ bool FidelityFX::UpscaleD3D12(
 	dispatch.preExposure = 1.0f;
 	const auto resetSerial = srResetSerial.load(std::memory_order_relaxed);
 	dispatch.reset = srAppliedResetSerial != resetSerial;
+	if (dispatch.reset) dispatch.frameTimeDelta = 1000.0f / 60.0f;
 	dispatch.cameraNear = *reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
 	dispatch.cameraFar = *reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
 	// Match the original D3D11 FSR path: SR does not need the camera matrices

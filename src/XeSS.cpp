@@ -205,6 +205,9 @@ bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, 
     const auto appTime = std::chrono::duration<float, std::milli>(now - lastTagTime).count();
     const auto pacedTime = static_cast<float>(XeFGPacing::RenderTimeMs());
     constants.frameRenderTime = std::clamp(pacedTime > 0.0f ? pacedTime : appTime, 0.1f, 250.0f);
+    // A resumed/reset history must not use the loading gap or a pre-load
+    // pacing sample as this frame's render duration.
+    if (constants.resetHistory) constants.frameRenderTime = 1000.0f / 60.0f;
     lastTagTime = now;
     XeFGPacing::NoteFedFrameTime(constants.frameRenderTime);
     if (!FGResult(p_xefgSwapChainTagFrameConstants(fg, presentId, &constants), "TagConstants")) { DisableFG(); return false; }
@@ -223,6 +226,12 @@ bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, 
     }
     generatedFrames = generated; fgEnabled = true; fgReset = serial; taggedId = presentId;
     return true;
+}
+
+void XeSS::RequestReset()
+{
+    resetSerial.fetch_add(1, std::memory_order_relaxed);
+    XeFGPacing::RequestTimingReset();
 }
 
 void XeSS::Sleep(uint32_t engineFrame)
