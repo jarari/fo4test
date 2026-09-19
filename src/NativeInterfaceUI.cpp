@@ -736,6 +736,33 @@ namespace
 	{
 		static void thunk(uint32_t a_target, bool a_postAA)
 		{
+			if (a_postAA && a_target == 0) {
+				// The Pip-Boy was promoted to this pass for native-resolution UI.
+				// In power armor it must still precede HUDGlass, as it did when
+				// the vanilla pre-AA Pip-Boy pass ran before the post-AA HUD.
+				static REL::Relocation<RE::BSTArray<RE::Interface3D::Renderer*>*> renderers{
+					REL::ID{ 996993, 2696455, 4803746 } };
+				static REL::Relocation<RE::BSReadWriteLock*> renderersLock{
+					REL::ID{ 778095, 2696454, 4803745 } };
+				const auto* ui = RE::UI::GetSingleton();
+				const bool pipboyOpen = ui && ui->GetMenuOpen<RE::PipboyMenu>();
+				RE::BSAutoWriteLock lock(*renderersLock);
+				RE::Interface3D::Renderer* pipboy = nullptr;
+				bool powerArmorHUD = false;
+				for (auto* renderer : *renderers) {
+					if (!renderer) continue;
+					if (renderer->name == "PipboyMenu") pipboy = renderer;
+					else if (renderer->name == "PowerArmorRenderer" && renderer->enabled &&
+						(renderer->postfx.get() == RE::Interface3D::PostEffect::kHUDGlass ||
+						 renderer->postfx.get() == RE::Interface3D::PostEffect::kHUDGlassWithMod)) {
+						powerArmorHUD = true;
+					}
+				}
+				if (pipboy) {
+					pipboy->depth = pipboyOpen && powerArmorHUD ?
+						RE::UI_DEPTH_PRIORITY::kScope : RE::UI_DEPTH_PRIORITY::kPipboy;
+				}
+			}
 			// Capture before RenderScope can borrow the native depth slot; restore
 			// after all models and their screen meshes, including early returns.
 			WorldGuides::WorldGuideScope worldGuides(enabled && !a_postAA);
