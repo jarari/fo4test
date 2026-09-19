@@ -473,10 +473,28 @@ void OSD::UpdateStats()
 	if (streamline->dlssgActive) {
 		generatedFPS = renderFPS * static_cast<double>(streamline->GetDLSSGPresentedFrameMultiplier());
 	} else {
-		// Count successful SDK interpolation dispatches. Skipped/failed dispatches
-		// contribute zero; the SDK does not expose a presented-frame getter.
+		// Fall back to successful SDK dispatches only when DXGI statistics are
+		// unavailable. A dispatch alone does not prove the frame was presented.
 		const auto interpolated = fsrGeneratedFrameCount - lastFSRGeneratedFrameCount;
 		generatedFPS = (renderedFrames + interpolated) / elapsedSeconds;
+	}
+	if (FidelityFX::GetSingleton()->IsFrameGenerationEnabled()) {
+		auto* chain = DX12SwapChain::GetSingleton()->swapChain.get();
+		UINT count = 0;
+		const bool valid = chain && SUCCEEDED(chain->GetLastPresentCount(&count));
+		const auto delta = static_cast<UINT>(count - lastFSRPresentCount);
+		// FSR's wrapper forwards this to the native swapchain, including BOTH
+		// generated and real submissions. It does not measure unique motion or
+		// guarantee scan-out (the compositor may still drop a submitted frame).
+		if (valid && fsrPresentCountValid && fsrPresentCountChain == chain && delta < 100000) {
+			generatedFPS = delta / elapsedSeconds;
+		}
+		fsrPresentCountChain = chain;
+		fsrPresentCountValid = valid;
+		lastFSRPresentCount = count;
+	} else {
+		fsrPresentCountValid = false;
+		fsrPresentCountChain = nullptr;
 	}
 	lastFSRGeneratedFrameCount = fsrGeneratedFrameCount;
 
@@ -723,6 +741,8 @@ void OSD::Render(
 
 void OSD::Reset()
 {
+	fsrPresentCountValid = false;
+	fsrPresentCountChain = nullptr;
 	lastFrameTime = {};
 	sampleStart = {};
 	frameTimeAccumMs = 0.0;

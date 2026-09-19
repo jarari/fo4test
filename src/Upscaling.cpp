@@ -5213,6 +5213,12 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 	}
 
 	auto* color = dlssgHUDLessD3D12[a_frameIndex].get();
+	// Match the scene that Present will compose with UI. Comparing the raw SR
+	// output against the sharpened/NR result makes FSR classify scene changes
+	// as UI and copy the real frame over its interpolated pixels.
+	if (dlssD3D12Sharpened[a_frameIndex] && dlssSharpenedD3D12[a_frameIndex]) {
+		color = dlssSharpenedD3D12[a_frameIndex].get();
+	}
 	auto* motionVectors = dlssgMotionVectorD3D12[a_frameIndex].get();
 	auto* depth = dlssgDepthD3D12[a_frameIndex].get();
 	if (!color || !motionVectors || !depth || !a_commandList) {

@@ -1,4 +1,5 @@
 #include "ReShadeDepth.h"
+#include "RenoDXCompatibility.h"
 #include "SwapChainCreationObserver.h"
 #include "ReShadeDepthFrameGraph.h"
 #include "ReShadeDepthDeviceIdentity.h"
@@ -583,6 +584,7 @@ void ReShadeDepth::Initialize()
 		reinterpret_cast<LPCWSTR>(&Initialize), &module);
 	if (!reshade::register_addon(module)) return;
 	initialized.store(true, std::memory_order_release);
+	RenoDXCompatibility::Initialize();
 	SwapChainCreationObserver::Initialize();
 	reshade::register_event<reshade::addon_event::init_effect_runtime>(InitRuntime);
 	reshade::register_event<reshade::addon_event::destroy_effect_runtime>(DestroyRuntime);

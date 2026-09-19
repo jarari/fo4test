@@ -294,7 +294,7 @@ private:
 	bool PaceFrame(uint32_t a_frameIndex);
 	bool ApplyNISSharpen(ID3D11Resource* a_inputColor, ID3D11Resource* a_outputColor, ID3D11DeviceContext* a_context, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resource* a_outputColor, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
-	bool EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint a_dlssModelPreset);
+	bool EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint a_dlssModelPreset, bool a_hdr);
 	bool EnsureD3D12DLSSNROptions(const sl::DLSSNROptions& a_options);
 	void PrepareDirectDLSSNR();
 	bool EnsureNISOptions(float a_sharpness, std::string_view a_logContext);
@@ -334,6 +334,7 @@ private:
 	uint currentDLSSQualityMode = 1;
 	uint currentDLSSModelPreset = 0;
 	bool currentD3D12DLSSOptionsValid = false;
+	bool currentD3D12DLSSHDR = false;
 	sl::DLSSMode currentD3D12DLSSMode = sl::DLSSMode::eOff;
 	uint32_t currentD3D12DLSSOutputWidth = 0;
 	uint32_t currentD3D12DLSSOutputHeight = 0;

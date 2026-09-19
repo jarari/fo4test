@@ -11,6 +11,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "DX12SwapChain.h"
+#include "ColorRange.h"
 #include "ENBRenderDomain.h"
 #include "Util.h"
 
@@ -1167,13 +1168,14 @@ void Streamline::ResetOptionCaches()
 	currentNISSharpness = -1.0f;
 }
 
-bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint a_dlssModelPreset)
+bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint a_dlssModelPreset, bool a_hdr)
 {
 	if (currentD3D12DLSSOptionsValid &&
 		currentD3D12DLSSMode == a_mode &&
 		currentD3D12DLSSOutputWidth == a_outputWidth &&
 		currentD3D12DLSSOutputHeight == a_outputHeight &&
-		currentD3D12DLSSModelPreset == a_dlssModelPreset) {
+		currentD3D12DLSSModelPreset == a_dlssModelPreset &&
+		currentD3D12DLSSHDR == a_hdr) {
 		return true;
 	}
 
@@ -1182,8 +1184,9 @@ bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWi
 	dlssOptions.mode = a_mode;
 	dlssOptions.outputWidth = a_outputWidth;
 	dlssOptions.outputHeight = a_outputHeight;
-	dlssOptions.colorBuffersHDR = sl::Boolean::eFalse;
-	// Color is post-imagespace LDR, not the engine's pre-tonemap HDR buffer.
+	// Post-imagespace is not necessarily SDR: HDR add-ons can retain values
+	// above 1 in this buffer. Do not bound those values using the SDR model.
+	dlssOptions.colorBuffersHDR = a_hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	dlssOptions.preExposure = 1.0f;
 	dlssOptions.exposureScale = 1.0f;
 	dlssOptions.useAutoExposure = sl::Boolean::eTrue;
@@ -1199,6 +1202,8 @@ bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWi
 	currentD3D12DLSSOutputWidth = a_outputWidth;
 	currentD3D12DLSSOutputHeight = a_outputHeight;
 	currentD3D12DLSSModelPreset = a_dlssModelPreset;
+	currentD3D12DLSSHDR = a_hdr;
+	logger::info("[Streamline] DLSS color range={} output={}x{}", a_hdr ? "extended" : "SDR", a_outputWidth, a_outputHeight);
 	if (hadValidOptions && lastTemporalResetFrameIndex != constantsFrameIndex) {
 		RequestTemporalReset();
 	}
@@ -1422,7 +1427,7 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 				return false;
 			}
 		} else {
-			if (!EnsureD3D12DLSSOptions(dlssMode, fullExtent.width, fullExtent.height, a_dlssModelPreset)) {
+			if (!EnsureD3D12DLSSOptions(dlssMode, fullExtent.width, fullExtent.height, a_dlssModelPreset, ColorRange::IsExtended(a_featureColor->GetDesc().Format))) {
 				return false;
 			}
 		}

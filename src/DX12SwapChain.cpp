@@ -397,6 +397,26 @@ namespace
 		return isProxy;
 	}
 
+	template <class T>
+	winrt::com_ptr<T> WithoutStreamlineProxy(Streamline* streamline, T* object)
+	{
+		winrt::com_ptr<T> result;
+		result.copy_from(object);
+		if (!object || !streamline || !streamline->slGetNativeInterface) return result;
+		void* raw = nullptr;
+		const auto status = streamline->slGetNativeInterface(object, &raw);
+		if (status != sl::Result::eOk || !raw) {
+			logger::error("[DX12SwapChain] Cannot obtain base interface for FidelityFX: {}", magic_enum::enum_name(status));
+			DX::ThrowIfFailed(E_NOINTERFACE);
+		}
+		winrt::com_ptr<IUnknown> owner;
+		owner.attach(static_cast<IUnknown*>(raw));
+		result = owner.as<T>();
+		// Only remove SL's layer. ReShade's device/queue/factory wrappers must
+		// remain, so its add-ons still run on the SDK's physical Present chain.
+		return result;
+	}
+
 	DXGI_SWAP_CHAIN_DESC1 MakeSwapChainDescFromWindow(const DXGI_SWAP_CHAIN_DESC& a_swapChainDesc, BOOL a_allowTearing, bool a_applicationWaitable)
 	{
 		DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -696,16 +716,21 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 				fullscreenDesc.Windowed = a_swapChainDesc.Windowed;
 
 				IDXGISwapChain4* fidelityFXSwapChain = nullptr;
+				// FSR owns presentation. Passing an SL factory AND upgrading FSR's
+				// returned chain creates SL(FSR(SL(ReShade(DXGI)))); both SL chains
+				// then compete for its single-chain Present tracker and tag lifetime.
+				auto fidelityFXFactory = WithoutStreamlineProxy(a_streamline, a_dxgiFactory);
+				auto fidelityFXQueue = WithoutStreamlineProxy(a_streamline, commandQueue.get());
 				// FSR exposes its own application waitable object. Keep this request
 				// separate so a failed FSR creation cannot change the SL fallback.
 				auto fidelityFXDesc = swapChainDesc;
 				fidelityFXDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 				if (FidelityFX::GetSingleton()->CreateFrameGenerationSwapChainForHwnd(
-						upgradedFactory.get(),
+						fidelityFXFactory.get(),
 						a_swapChainDesc.OutputWindow,
 						&fidelityFXDesc,
 						&fullscreenDesc,
-						commandQueue.get(),
+						fidelityFXQueue.get(),
 						&fidelityFXSwapChain) &&
 					fidelityFXSwapChain) {
 					swapChain.attach(fidelityFXSwapChain);
@@ -728,11 +753,12 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 			}
 		}
 
-		logger::info("[DX12SwapChain] Swapchain created via {} factory: swapchain={}", upgradedFactory.get() == a_dxgiFactory ? "native" : "Streamline proxy", static_cast<void*>(swapChain.get()));
+		const bool fidelityFXOwnsPresent = FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive();
+		logger::info("[DX12SwapChain] Swapchain presentation owner={} swapchain={}", fidelityFXOwnsPresent ? "FidelityFX (no Streamline swapchain wrapper)" : "Streamline", static_cast<void*>(swapChain.get()));
 		LogStreamlineProxy(a_streamline, "dxgiFactory", a_dxgiFactory);
-		LogStreamlineProxy(a_streamline, "factoryForSwapChain", upgradedFactory.get());
+		LogStreamlineProxy(a_streamline, "factoryForSwapChain", fidelityFXOwnsPresent ? a_dxgiFactory : upgradedFactory.get());
 		auto swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain", swapChain.get());
-		if (!swapChainIsStreamlineProxy && a_streamline && a_streamline->slUpgradeInterface) {
+		if (!fidelityFXOwnsPresent && !swapChainIsStreamlineProxy && a_streamline && a_streamline->slUpgradeInterface) {
 			IDXGISwapChain* upgradedSwapChain = swapChain.get();
 			if (SL_FAILED(result, a_streamline->slUpgradeInterface(reinterpret_cast<void**>(&upgradedSwapChain)))) {
 				logger::warn("[DX12SwapChain] Could not upgrade swapchain for Streamline: {}", magic_enum::enum_name(result));
@@ -746,7 +772,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 				swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain.afterUpgrade", swapChain.get());
 			}
 		}
-		if (!swapChainIsStreamlineProxy) {
+		if (!fidelityFXOwnsPresent && !swapChainIsStreamlineProxy) {
 			logger::warn("[DX12SwapChain] D3D12 swapchain is not a Streamline proxy; DLSS-G Present interception may not run on this swapchain");
 		}
 		DXGI_SWAP_CHAIN_DESC1 actual{};
@@ -839,7 +865,8 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 	}
 
 	logger::info(
-		"[DX12SwapChain] Created D3D12 Streamline swapchain {}x{} format={} buffers={} flags={} desktopRefreshHz={:.3f}",
+		"[DX12SwapChain] Created D3D12 {} swapchain {}x{} format={} buffers={} flags={} desktopRefreshHz={:.3f}",
+		FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive() ? "FidelityFX" : "Streamline",
 		swapChainDesc.Width,
 		swapChainDesc.Height,
 		static_cast<uint32_t>(swapChainDesc.Format),

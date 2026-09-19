@@ -70,6 +70,9 @@ private:
 	double frameTimeAccumMs = 0.0;
 	uint32_t renderedFrames = 0;
 	uint64_t lastFSRGeneratedFrameCount = 0;
+	IDXGISwapChain4* fsrPresentCountChain = nullptr; // Identity only; not retained.
+	UINT lastFSRPresentCount = 0;
+	bool fsrPresentCountValid = false;
 	double renderFPS = 0.0;
 	double frameTimeMs = 0.0;
 	double generatedFPS = 0.0;

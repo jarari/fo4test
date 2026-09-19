@@ -7,6 +7,7 @@
 #include <dx12/ffx_api_dx12.hpp>
 
 #include "DX12SwapChain.h"
+#include "ColorRange.h"
 #include "Util.h"
 #include "PipboyTemporalMask.h"
 #include "ReShadeDepth.h"
@@ -141,6 +142,7 @@ void FidelityFX::DestroyFSRResources()
 	contextRenderSize = { 0.0f, 0.0f };
 	contextDisplaySize = { 0.0f, 0.0f };
 	contextConsumesReactiveMask = true;
+	contextHDR = false;
 }
 
 void FidelityFX::DestroyFrameGenerationResources()
@@ -212,7 +214,7 @@ void FidelityFX::GenerateReactiveMask()
 	// The DX12 path generates the mask immediately before dispatching FSR.
 }
 
-bool FidelityFX::EnsureContext(ID3D12Device* a_device, float2 a_renderSize, float2 a_displaySize)
+bool FidelityFX::EnsureContext(ID3D12Device* a_device, float2 a_renderSize, float2 a_displaySize, bool a_hdr)
 {
 	if (!a_device || a_renderSize.x <= 0.0f || a_renderSize.y <= 0.0f || a_displaySize.x <= 0.0f || a_displaySize.y <= 0.0f) {
 		return false;
@@ -232,7 +234,8 @@ bool FidelityFX::EnsureContext(ID3D12Device* a_device, float2 a_renderSize, floa
 		static_cast<uint32_t>(contextRenderSize.x) == renderWidth &&
 		static_cast<uint32_t>(contextRenderSize.y) == renderHeight &&
 		static_cast<uint32_t>(contextDisplaySize.x) == displayWidth &&
-		static_cast<uint32_t>(contextDisplaySize.y) == displayHeight) {
+		static_cast<uint32_t>(contextDisplaySize.y) == displayHeight &&
+		contextHDR == a_hdr) {
 		return true;
 	}
 
@@ -246,6 +249,7 @@ bool FidelityFX::EnsureContext(ID3D12Device* a_device, float2 a_renderSize, floa
 	createDesc.maxUpscaleSize = { displayWidth, displayHeight };
 	createDesc.flags =
 		FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+	if (a_hdr) createDesc.flags |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
 	createDesc.fpMessage = FidelityFXMessage;
 
 	ffx::CreateContextDescUpscaleVersion versionDesc{};
@@ -262,13 +266,14 @@ bool FidelityFX::EnsureContext(ID3D12Device* a_device, float2 a_renderSize, floa
 	contextRenderSize = { static_cast<float>(renderWidth), static_cast<float>(renderHeight) };
 	contextDisplaySize = { static_cast<float>(displayWidth), static_cast<float>(displayHeight) };
 	contextConsumesReactiveMask = QueryConsumesReactiveMask(context);
+	contextHDR = a_hdr;
 	logger::info(
-		"[FidelityFX] Created DX12 upscaler context render={}x{} display={}x{} reactiveMask={}",
+		"[FidelityFX] Created DX12 upscaler context render={}x{} display={}x{} reactiveMask={} hdr={}",
 		renderWidth,
 		renderHeight,
 		displayWidth,
 		displayHeight,
-		contextConsumesReactiveMask ? "enabled" : "ignored");
+		contextConsumesReactiveMask ? "enabled" : "ignored", a_hdr);
 	return true;
 }
 
@@ -380,7 +385,7 @@ bool FidelityFX::EnsureFrameGenerationContext(ID3D12Device* a_device, float2 a_d
 	ffx::CreateContextDescFrameGeneration createDesc{};
 	createDesc.displaySize = { displayWidth, displayHeight };
 	createDesc.maxRenderSize = { displayWidth, displayHeight };
-	createDesc.flags = 0;
+	createDesc.flags = ColorRange::IsExtended(a_backBufferFormat) ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0;
 	createDesc.backBufferFormat = ffxApiGetSurfaceFormatDX12(a_backBufferFormat);
 
 	ffx::CreateContextDescFrameGenerationVersion versionDesc{};
@@ -396,7 +401,7 @@ bool FidelityFX::EnsureFrameGenerationContext(ID3D12Device* a_device, float2 a_d
 	frameGenDevice = a_device;
 	frameGenDisplaySize = { static_cast<float>(displayWidth), static_cast<float>(displayHeight) };
 	frameGenBackBufferFormat = a_backBufferFormat;
-	logger::info("[FidelityFX] Created frame generation context display={}x{} format={}", displayWidth, displayHeight, static_cast<uint32_t>(a_backBufferFormat));
+	logger::info("[FidelityFX] Created frame generation context display={}x{} format={} hdr={}", displayWidth, displayHeight, static_cast<uint32_t>(a_backBufferFormat), ColorRange::IsExtended(a_backBufferFormat));
 	return true;
 }
 
@@ -592,17 +597,19 @@ bool FidelityFX::UpscaleD3D12(
 	const auto renderHeight = static_cast<uint32_t>(std::ceil(a_renderSize.y));
 	const auto displayWidth = static_cast<uint32_t>(std::ceil(a_displaySize.x));
 	const auto displayHeight = static_cast<uint32_t>(std::ceil(a_displaySize.y));
+	const bool hdr = ColorRange::IsExtended(a_color->GetDesc().Format);
 	const bool recreateUpscaleContext =
 		context &&
 		(contextDevice != a_device ||
 			static_cast<uint32_t>(contextRenderSize.x) != renderWidth ||
 			static_cast<uint32_t>(contextRenderSize.y) != renderHeight ||
 			static_cast<uint32_t>(contextDisplaySize.x) != displayWidth ||
-			static_cast<uint32_t>(contextDisplaySize.y) != displayHeight);
+			static_cast<uint32_t>(contextDisplaySize.y) != displayHeight ||
+			contextHDR != hdr);
 	if (recreateUpscaleContext && !DX12SwapChain::GetSingleton()->WaitForGPUIdle()) {
 		return false;
 	}
-	if (!EnsureContext(a_device, a_renderSize, a_displaySize)) {
+	if (!EnsureContext(a_device, a_renderSize, a_displaySize, hdr)) {
 		return false;
 	}
 

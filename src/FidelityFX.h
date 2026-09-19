@@ -143,7 +143,7 @@ public:
 	std::unique_ptr<Texture2D> reactiveMaskTexture;     ///< Generated reactive mask for FSR3
 
 private:
-	bool EnsureContext(ID3D12Device* a_device, float2 a_renderSize, float2 a_displaySize);
+	bool EnsureContext(ID3D12Device* a_device, float2 a_renderSize, float2 a_displaySize, bool a_hdr);
 	bool EnsureFrameGenerationContext(ID3D12Device* a_device, float2 a_displaySize, DXGI_FORMAT a_backBufferFormat);
 
 	ffx::Context context = nullptr;
@@ -154,6 +154,7 @@ private:
 	float2 contextRenderSize = { 0.0f, 0.0f };
 	float2 contextDisplaySize = { 0.0f, 0.0f };
 	bool contextConsumesReactiveMask = true;
+	bool contextHDR = false;
 	float2 frameGenDisplaySize = { 0.0f, 0.0f };
 	DXGI_FORMAT frameGenBackBufferFormat = DXGI_FORMAT_UNKNOWN;
 	bool frameGenerationConfigured = false;
