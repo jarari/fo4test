@@ -118,6 +118,7 @@ namespace nvngx::dlss_nr
 
 		void SetRuntimeDirectory(const std::filesystem::path& a_runtimeDirectory);
 		bool Prepare(ID3D12Device* a_device);
+		bool IsSupported() const { return initialized_ && supported_; }
 		bool NeedsFeatureRecreation(const D3D12EvaluationParameters& a_parameters) const;
 		bool NeedsFeaturePreparation(const D3D12EvaluationParameters& a_parameters) const;
 		// Caller drains submitted work before this lifecycle-only recording step.
@@ -181,6 +182,7 @@ namespace nvngx::dlss_nr
 		ID3D12Device* device_ = nullptr;
 		bool initializationAttempted_ = false;
 		bool initialized_ = false;
+		bool supported_ = false;
 		static constexpr std::uint32_t kMaxPassCount = 3;
 		std::array<FeatureState, kMaxPassCount> features_{};
 		std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kMaxPassCount - 1> intermediateResources_{};

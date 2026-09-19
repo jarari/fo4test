@@ -1,3 +1,4 @@
+#include "XeSS.h"
 #include "Upscaling.h"
 
 #include <algorithm>
@@ -614,11 +615,11 @@ namespace
 		case Upscaling::FeatureRequest::kDLSS:
 			return "DLSS";
 		case Upscaling::FeatureRequest::kFSR:
-			return "FSR";
+			return Upscaling::GetSingleton()->settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kXeSS) ? "XeSS SR" : "FSR";
 		case Upscaling::FeatureRequest::kDLSSG:
 			return "DLSS-G";
 		case Upscaling::FeatureRequest::kFSRFrameGeneration:
-			return "FSR frame generation";
+			return Upscaling::GetSingleton()->GetFGProviderName();
 		default:
 			return "unknown";
 		}
@@ -686,13 +687,14 @@ namespace
 		}
 		if (method == Upscaling::UpscaleMethod::kDLSS) config.sr = TextureMemoryReserve::SR::DLSS;
 		if (method == Upscaling::UpscaleMethod::kFSR) config.sr = TextureMemoryReserve::SR::FSR;
+		if (method == Upscaling::UpscaleMethod::kXeSS) config.sr = TextureMemoryReserve::SR::XeSS;
 		if (method != Upscaling::UpscaleMethod::kDisabled) {
-			if (upscaling->ShouldUseFSRFrameGeneration(false)) config.fg = TextureMemoryReserve::FG::FSR;
+			if (upscaling->ShouldUseExternalFrameGeneration(false)) config.fg = upscaling->GetFGProvider() == Upscaling::FGProvider::XeSS ? TextureMemoryReserve::FG::XeSS : TextureMemoryReserve::FG::FSR;
 			else if (upscaling->ShouldUseFrameGeneration(false)) config.fg = TextureMemoryReserve::FG::DLSS;
 		}
-		config.generatedFrames = (settings.dynamicMFGEnabled || settings.frameGenerationMode == 3) ?
+		config.generatedFrames = config.fg == TextureMemoryReserve::FG::XeSS ? XeSS::GetSingleton()->MaxGeneratedFrames() : (settings.dynamicMFGEnabled || settings.frameGenerationMode == 3) ?
 			5u : std::min(settings.dlssgGeneratedFrames, 4u) + 1;
-		config.nrPasses = config.sr == TextureMemoryReserve::SR::DLSS && settings.dlssNREnabled ?
+		config.nrPasses = config.sr != TextureMemoryReserve::SR::None && settings.dlssNREnabled && upscaling->IsNRSupported() ?
 			std::clamp(settings.dlssNRPassCount, 1u, 3u) : 0;
 		config.nrAfterSR = settings.dlssNRPosition == 1;
 		config.sharpen = settings.sharpness > 0.0f;
@@ -1947,6 +1949,8 @@ void Upscaling::LoadSettings()
 	settings.upscaleMethodPreference = static_cast<uint>(ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2));
 	settings.qualityMode = static_cast<uint>(ini.GetLongValue("Settings", "iQualityMode", 1));
 	settings.frameGenerationMode = static_cast<uint>(ini.GetLongValue("Settings", "iFrameGenerationMode", 0));
+	settings.frameGenerationProvider = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iFrameGenerationProvider", 0), 0, 2));
+	settings.xessGeneratedFrames = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iXeSSGeneratedFrames", 0), 0, 6));
 	settings.dlssgGeneratedFrames = static_cast<uint>(ini.GetLongValue("Settings", "iDLSSGGeneratedFrames", 0));
 	settings.dynamicMFGEnabled = static_cast<uint>(ini.GetLongValue("Settings", "bDynamicMFGEnabled", 0));
 	settings.dynamicMFGTargetFPS = static_cast<uint>(ini.GetLongValue("Settings", "iDynamicMFGTargetFPS", 300));
@@ -1972,6 +1976,7 @@ void Upscaling::LoadSettings()
 
 	auto streamline = Streamline::GetSingleton();
 	const auto currentUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
+	if (previousUpscaleMethodPreference != currentUpscaleMethodPreference) ClearFeatureRequestFailure(FeatureRequest::kFSR);
 	if (ENBRenderDomain::Get().Active() && previousQualityMode != settings.qualityMode) {
 		logger::info("[ENB domain] Requested quality {}; active quality {} ({}x{}); scene-only resize queued, HWND/display unchanged",
 			settings.qualityMode, ENBRenderDomain::Get().Quality(), ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height());
@@ -1996,22 +2001,22 @@ void Upscaling::LoadSettings()
 		streamline->RequestTemporalReset();
 	}
 	const auto switchedBetweenD3D12Upscalers =
-		(previousUpscaleMethodPreference == UpscaleMethod::kFSR && currentUpscaleMethodPreference == UpscaleMethod::kDLSS) ||
-		(previousUpscaleMethodPreference == UpscaleMethod::kDLSS && currentUpscaleMethodPreference == UpscaleMethod::kFSR);
+		previousUpscaleMethodPreference != currentUpscaleMethodPreference &&
+		previousUpscaleMethodPreference != UpscaleMethod::kDisabled;
 	const auto switchedToD3D12Upscaler =
 		previousUpscaleMethodPreference != currentUpscaleMethodPreference &&
-		(currentUpscaleMethodPreference == UpscaleMethod::kFSR || currentUpscaleMethodPreference == UpscaleMethod::kDLSS);
+		(IsSharedTemporalSR(currentUpscaleMethodPreference) || currentUpscaleMethodPreference == UpscaleMethod::kDLSS);
 
 	if (switchedToD3D12Upscaler) {
 		if (!DX12SwapChain::GetSingleton()->IsReady()) {
 			logger::warn("[Upscaling] {} requires the D3D12 proxy swapchain. D3D11 SR upscaling is deprecated; native rendering will remain active.",
-				currentUpscaleMethodPreference == UpscaleMethod::kDLSS ? "DLSS" : "FSR");
+				magic_enum::enum_name(currentUpscaleMethodPreference));
 		} else if (currentUpscaleMethodPreference == UpscaleMethod::kDLSS && !streamline->featureDLSS) {
 			logger::warn("[Upscaling] DLSS was selected but Streamline DLSS is unavailable; FSR will remain active.");
 		} else if (switchedBetweenD3D12Upscalers) {
 			logger::info("[Upscaling] Runtime upscaler switch requested: {} -> {}",
-				previousUpscaleMethodPreference == UpscaleMethod::kFSR ? "FSR" : "DLSS",
-				currentUpscaleMethodPreference == UpscaleMethod::kFSR ? "FSR" : "DLSS");
+				magic_enum::enum_name(previousUpscaleMethodPreference),
+				magic_enum::enum_name(currentUpscaleMethodPreference));
 		}
 	}
 
@@ -2038,6 +2043,8 @@ bool Upscaling::SaveSettings(const Settings& a_settings)
 	ini.SetLongValue("Settings", "iQualityMode", static_cast<long>(a_settings.qualityMode));
 	ini.SetDoubleValue("Settings", "fSharpness", a_settings.sharpness);
 	ini.SetLongValue("Settings", "iFrameGenerationMode", static_cast<long>(a_settings.frameGenerationMode));
+	ini.SetLongValue("Settings", "iFrameGenerationProvider", static_cast<long>(std::min(a_settings.frameGenerationProvider, 2u)));
+	ini.SetLongValue("Settings", "iXeSSGeneratedFrames", static_cast<long>(std::min(a_settings.xessGeneratedFrames, 6u)));
 	ini.SetLongValue("Settings", "iDLSSGGeneratedFrames", static_cast<long>(a_settings.dlssgGeneratedFrames));
 	ini.SetLongValue("Settings", "bDynamicMFGEnabled", static_cast<long>(a_settings.dynamicMFGEnabled));
 	ini.SetLongValue("Settings", "iDynamicMFGTargetFPS", static_cast<long>(a_settings.dynamicMFGTargetFPS));
@@ -2327,7 +2334,7 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 	// recreate GPU resources.
 	for (std::size_t i = 0; i < dlssgInputsReady.size(); ++i) {
 		dlssgInputsReady[i] = false;
-		fsrFrameGenerationInputsReady[i] = false;
+		externalFrameGenerationInputsReady[i] = false;
 		fsrD3D12InputsReady[i] = false;
 		dlssD3D12InputsReady[i] = false;
 		dlssD3D12Sharpened[i] = false;
@@ -2335,8 +2342,8 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 		dlssgInputFrameTokenIndices[i] = std::numeric_limits<uint32_t>::max();
 		dlssgInputRenderSizes[i] = { 0.0f, 0.0f };
 		dlssgInputDisplaySizes[i] = { 0.0f, 0.0f };
-		fsrFrameGenerationColorFormats[i] = DXGI_FORMAT_UNKNOWN;
-		fsrFrameGenerationFrameIDs[i] = 0;
+		externalFrameGenerationColorFormats[i] = DXGI_FORMAT_UNKNOWN;
+		externalFrameGenerationFrameIDs[i] = 0;
 		fsrInputJitters[i] = { 0.0f, 0.0f };
 		fsrInputRenderSizes[i] = { 0.0f, 0.0f };
 		fsrInputDisplaySizes[i] = { 0.0f, 0.0f };
@@ -3064,7 +3071,7 @@ void Upscaling::OnD3D12TemporalSuspend()
 {
 	for (std::size_t i = 0; i < dlssgInputsReady.size(); ++i) {
 		dlssgInputsReady[i] = false;
-		fsrFrameGenerationInputsReady[i] = false;
+		externalFrameGenerationInputsReady[i] = false;
 		fsrD3D12InputsReady[i] = false;
 		dlssD3D12InputsReady[i] = false;
 		dlssD3D12Sharpened[i] = false;
@@ -3076,7 +3083,7 @@ void Upscaling::OnD3D12TemporalSuspend()
 	}
 	frameGenerationBuffersReady = false;
 	frameGenerationActive = false;
-	fsrFrameGenerationActive = false;
+	externalFrameGenerationActive = false;
 	frameGenerationInputsWanted = false;
 	d3d12DLSSActive = false;
 	Streamline::GetSingleton()->RequestTemporalReset();
@@ -3114,7 +3121,7 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
 
 	UpscaleMethod currentUpscaleMethod = (UpscaleMethod)settings.upscaleMethodPreference;
 	const bool dx12Ready = DX12SwapChain::GetSingleton()->IsReady();
-	if ((currentUpscaleMethod == UpscaleMethod::kDLSS || currentUpscaleMethod == UpscaleMethod::kFSR) && !dx12Ready) {
+	if ((currentUpscaleMethod == UpscaleMethod::kDLSS || IsSharedTemporalSR(currentUpscaleMethod)) && !dx12Ready) {
 		return UpscaleMethod::kDisabled;
 	}
 		
@@ -3123,58 +3130,55 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
 		currentUpscaleMethod = UpscaleMethod::kFSR;
 
 	if ((currentUpscaleMethod == UpscaleMethod::kDLSS && IsFeatureRequestBlocked(FeatureRequest::kDLSS)) ||
-		(currentUpscaleMethod == UpscaleMethod::kFSR && IsFeatureRequestBlocked(FeatureRequest::kFSR))) {
+		(IsSharedTemporalSR(currentUpscaleMethod) && IsFeatureRequestBlocked(FeatureRequest::kFSR))) {
 		currentUpscaleMethod = UpscaleMethod::kSpatialFallback;
 	}
 
 	return currentUpscaleMethod;
 }
 
+void Upscaling::SelectFGProviderAtStartup(bool dlssSupported)
+{
+	if (fgProviderSelected) return;
+	// Non-ENB creates its swapchain before kGameDataReady loads settings.
+	LoadSettings();
+	fgProviderSelected = true;
+	startupFGPreference = std::min(settings.frameGenerationProvider, 2u);
+	activeFGProvider = static_cast<FGProvider>(startupFGPreference);
+	if (activeFGProvider == FGProvider::DLSSG && !dlssSupported) UseXeFGFallback();
+	logger::info("[Frame Generation] Startup preference={} selected={}", startupFGPreference, GetFGProviderName());
+}
+void Upscaling::UseXeFGFallback()
+{
+	activeFGProvider = FGProvider::XeSS;
+	logger::info("[Frame Generation] DLSS-G unavailable; selecting XeSS FG (restart-only provider)");
+}
+void Upscaling::DisableFGProvider()
+{
+	activeFGProvider = FGProvider::Unavailable;
+	logger::warn("[Frame Generation] Selected provider unavailable; FG disabled. Select another provider and restart.");
+}
+const char* Upscaling::GetFGProviderName() const
+{
+	switch (activeFGProvider) {
+	case FGProvider::DLSSG: return "DLSS-G";
+	case FGProvider::FSR: return "FSR FG";
+	case FGProvider::XeSS: return "XeSS FG";
+	default: return "Unavailable";
+	}
+}
 bool Upscaling::ShouldUseFrameGeneration(bool a_checkMenu)
 {
-	if (a_checkMenu) {
-		return frameGenerationActive;
-	}
-
-	auto streamline = Streamline::GetSingleton();
-
-	if (ShouldUseFSRFrameGeneration(a_checkMenu)) {
-		return false;
-	}
-
-	if ((settings.frameGenerationMode == 0 && settings.dynamicMFGEnabled == 0) || !streamline->featureDLSSG) {
-		return false;
-	}
-
-	if (a_checkMenu && ShouldBlockFrameGeneration()) {
-		return false;
-	}
-
-	return true;
+	if (a_checkMenu) return frameGenerationActive;
+	return activeFGProvider == FGProvider::DLSSG && Streamline::GetSingleton()->featureDLSSG &&
+		(settings.frameGenerationMode != 0 || settings.dynamicMFGEnabled != 0);
 }
-
-bool Upscaling::ShouldUseFSRFrameGeneration(bool a_checkMenu)
+bool Upscaling::ShouldUseExternalFrameGeneration(bool a_checkMenu)
 {
-	if (a_checkMenu) {
-		return fsrFrameGenerationActive;
-	}
-
-	auto streamline = Streamline::GetSingleton();
-	if (static_cast<UpscaleMethod>(settings.upscaleMethodPreference) == UpscaleMethod::kDisabled ||
-		(settings.frameGenerationMode == 0 && settings.dynamicMFGEnabled == 0) ||
-		!DX12SwapChain::GetSingleton()->IsReady()) {
-		return false;
-	}
-
-	if (!kForceFSRFrameGenerationForTesting && streamline->featureDLSSG) {
-		return false;
-	}
-
-	if (a_checkMenu && ShouldBlockFrameGeneration()) {
-		return false;
-	}
-
-	return true;
+	if (a_checkMenu) return externalFrameGenerationActive;
+	return (activeFGProvider == FGProvider::FSR || activeFGProvider == FGProvider::XeSS) &&
+		static_cast<UpscaleMethod>(settings.upscaleMethodPreference) != UpscaleMethod::kDisabled &&
+		settings.frameGenerationMode != 0 && DX12SwapChain::GetSingleton()->IsReady();
 }
 
 bool Upscaling::IsFeatureRequestBlocked(FeatureRequest a_feature) const
@@ -3202,9 +3206,9 @@ void Upscaling::ClearFrameFeatureRequests()
 {
 	frameGenerationInputsWanted = false;
 	frameGenerationActive = false;
-	fsrFrameGenerationActive = false;
+	externalFrameGenerationActive = false;
 	d3d12DLSSActive = false;
-	const bool frameGenerationSettingEnabled = settings.frameGenerationMode != 0 || settings.dynamicMFGEnabled != 0;
+	const bool frameGenerationSettingEnabled = settings.frameGenerationMode != 0 || (activeFGProvider == FGProvider::DLSSG && settings.dynamicMFGEnabled != 0);
 	dlssgMenuResumeReady = !frameGenerationSettingEnabled;
 	dlssgStableGameplayFrames = frameGenerationSettingEnabled ? 0 : kDLSSGResumeStableFrames;
 
@@ -3215,7 +3219,7 @@ void Upscaling::ClearFrameFeatureRequests()
 
 	for (std::size_t i = 0; i < dlssgInputsReady.size(); ++i) {
 		dlssgInputsReady[i] = false;
-		fsrFrameGenerationInputsReady[i] = false;
+		externalFrameGenerationInputsReady[i] = false;
 		fsrD3D12InputsReady[i] = false;
 		dlssD3D12InputsReady[i] = false;
 		dlssD3D12Sharpened[i] = false;
@@ -3292,7 +3296,7 @@ void Upscaling::CheckResources()
 		resourceUpscaleMethodNoMenu = UpscaleMethod::kFSR;
 	}
 	const bool dx12Ready = DX12SwapChain::GetSingleton()->IsReady();
-	if ((resourceUpscaleMethodNoMenu == UpscaleMethod::kDLSS || resourceUpscaleMethodNoMenu == UpscaleMethod::kFSR) && !dx12Ready) {
+	if ((resourceUpscaleMethodNoMenu == UpscaleMethod::kDLSS || IsSharedTemporalSR(resourceUpscaleMethodNoMenu)) && !dx12Ready) {
 		resourceUpscaleMethodNoMenu = UpscaleMethod::kDisabled;
 	}
 	if (ENBRenderDomain::Get().Active() && resourceUpscaleMethodNoMenu == UpscaleMethod::kDisabled) {
@@ -3316,14 +3320,19 @@ void Upscaling::CheckResources()
 		}
 		for (std::size_t i = 0; i < dlssD3D12InputsReady.size(); ++i) {
 			dlssgInputsReady[i] = false;
-			fsrFrameGenerationInputsReady[i] = false;
+			externalFrameGenerationInputsReady[i] = false;
 			fsrD3D12InputsReady[i] = false;
 			dlssD3D12InputsReady[i] = false;
 		}
 
+		DeferNRUntilPresent();
+		nrMotionHistoryValid = false;
+		streamline->RequestTemporalReset();
 		// Clean up resources from the previous upscaling method
 		if (previousResourceUpscaleMethodNoMenu == UpscaleMethod::kFSR)
 			fidelityFX->DestroyFSRResources();  // Switching away from FSR
+		else if (previousResourceUpscaleMethodNoMenu == UpscaleMethod::kXeSS)
+			XeSS::GetSingleton()->DestroySR();
 		else if (previousResourceUpscaleMethodNoMenu == UpscaleMethod::kDLSS)
 			streamline->DestroyDLSSResources();  // Switching away from DLSS
 
@@ -3521,18 +3530,18 @@ void Upscaling::UpdateUpscaling()
 	const bool dx12Ready = DX12SwapChain::GetSingleton()->IsReady();
 
 	upscaleMethodNoMenu = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
-	if ((upscaleMethodNoMenu == UpscaleMethod::kDLSS || upscaleMethodNoMenu == UpscaleMethod::kFSR) && !dx12Ready) {
+	if ((upscaleMethodNoMenu == UpscaleMethod::kDLSS || IsSharedTemporalSR(upscaleMethodNoMenu)) && !dx12Ready) {
 		upscaleMethodNoMenu = UpscaleMethod::kDisabled;
 	}
 	if (!streamline->featureDLSS && upscaleMethodNoMenu == UpscaleMethod::kDLSS) {
 		upscaleMethodNoMenu = UpscaleMethod::kFSR;
 	}
 	if ((upscaleMethodNoMenu == UpscaleMethod::kDLSS && IsFeatureRequestBlocked(FeatureRequest::kDLSS)) ||
-		(upscaleMethodNoMenu == UpscaleMethod::kFSR && IsFeatureRequestBlocked(FeatureRequest::kFSR))) {
+		(IsSharedTemporalSR(upscaleMethodNoMenu) && IsFeatureRequestBlocked(FeatureRequest::kFSR))) {
 		upscaleMethodNoMenu = UpscaleMethod::kSpatialFallback;
 	}
 
-	const bool frameGenerationSettingEnabled = settings.frameGenerationMode != 0 || settings.dynamicMFGEnabled != 0;
+	const bool frameGenerationSettingEnabled = settings.frameGenerationMode != 0 || (activeFGProvider == FGProvider::DLSSG && settings.dynamicMFGEnabled != 0);
 	const bool upscalerSelected = upscaleMethodNoMenu != UpscaleMethod::kDisabled;
 	const bool menuBlocksTemporal = temporalFeaturesBlocked;
 	const bool customRenderingMenu = IsCustomRenderingMenuOpen();
@@ -3553,7 +3562,7 @@ void Upscaling::UpdateUpscaling()
 		!customRenderingMenu &&
 		!windowUnavailable &&
 		frameGenerationSettingEnabled &&
-		streamline->featureDLSSG;
+		activeFGProvider == FGProvider::DLSSG && streamline->featureDLSSG;
 	const bool menuSuspendsD3D12DLSS =
 		menuBlocksUpscaling &&
 		!dlssgHeldThroughMenu &&
@@ -3589,31 +3598,31 @@ void Upscaling::UpdateUpscaling()
 		d3d12DLSSMenuSuspended = false;
 	}
 
-	const bool dlssgAllowed = frameGenerationSettingEnabled &&
+	const bool dlssgAllowed = activeFGProvider == FGProvider::DLSSG && frameGenerationSettingEnabled &&
 		streamline->featureDLSSG &&
 		!customRenderingMenu &&
 		!IsFeatureRequestBlocked(FeatureRequest::kDLSSG) &&
 		(!menuBlocksTemporal || dlssgHeldThroughMenu) &&
 		(dlssgHeldThroughMenu || dlssgMenuResumeReady);
-	fsrFrameGenerationActive =
+	externalFrameGenerationActive =
 		static_cast<UpscaleMethod>(settings.upscaleMethodPreference) != UpscaleMethod::kDisabled &&
 		frameGenerationSettingEnabled &&
 		dx12Ready &&
-		(kForceFSRFrameGenerationForTesting || !streamline->featureDLSSG) &&
+		(activeFGProvider == FGProvider::FSR || activeFGProvider == FGProvider::XeSS) &&
 		!IsFeatureRequestBlocked(FeatureRequest::kFSRFrameGeneration) &&
 		!customRenderingMenu &&
 		!menuBlocksTemporal &&
 		dlssgMenuResumeReady;
 	frameGenerationActive =
-		!fsrFrameGenerationActive &&
+		!externalFrameGenerationActive &&
 		dlssgAllowed;
 	if (ENBRenderDomain::Get().qualityChangePending) {
 		frameGenerationActive = false;
-		fsrFrameGenerationActive = false;
+		externalFrameGenerationActive = false;
 	}
-	if (virtualENB && upscaleMethod != UpscaleMethod::kDLSS && upscaleMethod != UpscaleMethod::kFSR) {
+	if (virtualENB && upscaleMethod != UpscaleMethod::kDLSS && !IsSharedTemporalSR(upscaleMethod)) {
 		frameGenerationActive = false;
-		fsrFrameGenerationActive = false;
+		externalFrameGenerationActive = false;
 	}
 	d3d12DLSSActive =
 		streamline->UsesD3D12() &&
@@ -3621,7 +3630,7 @@ void Upscaling::UpdateUpscaling()
 		streamline->featureDLSS;
 	frameGenerationInputsWanted =
 		dx12Ready &&
-		(frameGenerationActive || fsrFrameGenerationActive || d3d12DLSSActive);
+		(frameGenerationActive || externalFrameGenerationActive || d3d12DLSSActive);
 
 	// SR/NR remain in their render-resolution domain through ordinary pause /
 	// overlay menus. Custom-rendering menus use the native game path and skip
@@ -3637,7 +3646,7 @@ void Upscaling::UpdateUpscaling()
 	float currentMipBias = std::log2f(resolutionScale);
 
 	if (upscaleMethodNoMenu == UpscaleMethod::kDLSS ||
-		upscaleMethodNoMenu == UpscaleMethod::kFSR ||
+		IsSharedTemporalSR(upscaleMethodNoMenu) ||
 		upscaleMethodNoMenu == UpscaleMethod::kSpatialFallback) {
 		currentMipBias -= 1.0f;
 	}
@@ -3702,8 +3711,8 @@ void Upscaling::UpdateUpscaling()
 			if (dlssgInputsReady[i]) {
 				dlssgInputsReady[i] = false;
 			}
-			if (!fsrFrameGenerationActive && fsrFrameGenerationInputsReady[i]) {
-				fsrFrameGenerationInputsReady[i] = false;
+			if (!externalFrameGenerationActive && externalFrameGenerationInputsReady[i]) {
+				externalFrameGenerationInputsReady[i] = false;
 			}
 		}
 	}
@@ -3797,7 +3806,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		frameGenerationMotionVectorTexture &&
 		frameGenerationMotionVectorTexture->resource;
 	const bool needsDilatedMotionVectors =
-		(frameGenerationActive || fsrFrameGenerationActive) && !usePreservedMotionVectors;
+		(frameGenerationActive || externalFrameGenerationActive) && !usePreservedMotionVectors;
 	if (needsDilatedMotionVectors) {
 		const auto feature = frameGenerationActive ? FeatureRequest::kDLSSG : FeatureRequest::kFSRFrameGeneration;
 		try {
@@ -3831,7 +3840,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 	}
 
 	// Preserve the existing state cleanup even when SR does not need dilation.
-	if (upscaleMethod == UpscaleMethod::kDLSS || upscaleMethod == UpscaleMethod::kFSR || frameGenerationActive || fsrFrameGenerationActive) {
+	if (upscaleMethod == UpscaleMethod::kDLSS || IsSharedTemporalSR(upscaleMethod) || frameGenerationActive || externalFrameGenerationActive) {
 		// Unbind compute resources
 		ID3D11Buffer* nullBuffer = nullptr;
 		context->CSSetConstantBuffers(0, 1, &nullBuffer);
@@ -3848,10 +3857,10 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 
 	// Execute upscaling
 	const bool useD3D12DLSS = d3d12DLSSActive;
-	const bool useD3D12FSR = upscaleMethod == UpscaleMethod::kFSR && DX12SwapChain::GetSingleton()->IsReady();
-	const bool fsrFrameGenerationSwapChainReady =
-		!fsrFrameGenerationActive ||
-		DX12SwapChain::GetSingleton()->EnsureFidelityFXFrameGenerationSwapChain();
+	const bool useD3D12FSR = IsSharedTemporalSR(upscaleMethod) && DX12SwapChain::GetSingleton()->IsReady();
+	const bool externalFrameGenerationSwapChainReady =
+		!externalFrameGenerationActive ||
+		DX12SwapChain::GetSingleton()->EnsureExternalFrameGenerationSwapChain();
 	bool d3d12FSRInputsReady = false;
 	bool presentOverrideUIPrepared = false;
 	auto fsrJitter = jitter;
@@ -3941,8 +3950,8 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 				return false;
 			}
 			dlssgInputsReady[frameIndex] = false;
-			fsrFrameGenerationInputsReady[frameIndex] = false;
-			frameGenerationActive = fsrFrameGenerationActive = false;
+			externalFrameGenerationInputsReady[frameIndex] = false;
+			frameGenerationActive = externalFrameGenerationActive = false;
 			Streamline::GetSingleton()->RequestDLSSGDisable();
 			// At native size the engine can keep the world in its backbuffer.
 			// No separate scene snapshot, slot wait or transparent UI clear is needed.
@@ -4025,7 +4034,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		}
 		runSpatialFallbackNow("deprecated D3D11 DLSS path");
 	}
-	else if (upscaleMethod == UpscaleMethod::kFSR && useD3D12FSR) {
+	else if (IsSharedTemporalSR(upscaleMethod) && useD3D12FSR) {
 		auto motionVectorTexture = reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMotionVectors)].texture);
 		const bool usePatchedFrameGenerationBuffers =
 			upscaleMethod == UpscaleMethod::kDisabled &&
@@ -4049,7 +4058,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 				ReportFeatureRequestFailure(FeatureRequest::kFSR, "D3D12 FSR inputs");
 			}
 			runSpatialFallbackNow("D3D12 FSR input failure");
-		} else if (!fsrFrameGenerationActive) {
+		} else if (!externalFrameGenerationActive) {
 			const auto usePresentOverride = getD3D12FSROutput() != nullptr;
 			const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(false, true, false, !usePresentOverride);
 			if (d3d12Result.fsr) {
@@ -4063,7 +4072,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 			}
 		}
 	}
-	else if (upscaleMethod == UpscaleMethod::kFSR) {
+	else if (IsSharedTemporalSR(upscaleMethod)) {
 		static bool loggedDeprecatedD3D11FSR = false;
 		if (!loggedDeprecatedD3D11FSR) {
 			logger::warn("[Upscaling] D3D11 FSR path is unavailable; using local spatial fallback for this frame");
@@ -4077,7 +4086,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		}
 	}
 
-	if (frameGenerationActive || fsrFrameGenerationActive || useD3D12DLSS) {
+	if (frameGenerationActive || externalFrameGenerationActive || useD3D12DLSS) {
 		ID3D11Texture2D* motionVectorTexture = nullptr;
 		if (needsDilatedMotionVectors && dilatedMotionVectorTexture) {
 			motionVectorTexture = dilatedMotionVectorTexture->resource.get();
@@ -4100,11 +4109,11 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 				ReportFeatureRequestFailure(FeatureRequest::kDLSS, e.what());
 			} else if (frameGenerationActive) {
 				ReportFeatureRequestFailure(FeatureRequest::kDLSSG, e.what());
-			} else if (fsrFrameGenerationActive) {
+			} else if (externalFrameGenerationActive) {
 				ReportFeatureRequestFailure(FeatureRequest::kFSRFrameGeneration, e.what());
 			}
 		}
-		const bool requestedD3D12FSR = d3d12FSRInputsReady && fsrFrameGenerationActive;
+		const bool requestedD3D12FSR = d3d12FSRInputsReady && externalFrameGenerationActive;
 		const bool requestedD3D12DLSS = useD3D12DLSS;
 		const auto frameIndex = dx12SwapChain->GetFrameIndex();
 		const bool dlssPresentOverrideReady =
@@ -4118,7 +4127,7 @@ void Upscaling::Upscale(int a_renderTargetIndex)
 		const auto d3d12Result = dx12SwapChain->EvaluateD3D12WorkForCurrentFrame(
 			requestedD3D12DLSS,
 			requestedD3D12FSR,
-			fsrFrameGenerationActive && fsrFrameGenerationSwapChainReady,
+			externalFrameGenerationActive && externalFrameGenerationSwapChainReady,
 			!usePresentOverride);
 		if (d3d12Result.fsr) {
 			if (usePresentOverride && prepareD3D12PresentOverrideUI() && setD3D12PresentOverride(getD3D12FSROutput())) {
@@ -4194,6 +4203,11 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 		return false;
 	}
 	fsrDepthCaptureFrames[frameIndex] = 0;
+	fsrD3D12InputsReady[frameIndex] = false;
+	nrCapturedGeneration[frameIndex] = nrSettingsGeneration;
+	nrEvaluatedGeneration[frameIndex] = 0;
+	nrMotionReady[frameIndex] = false;
+	nrAfterSR[frameIndex] = settings.dlssNRPosition == 1;
 	if (!dx12SwapChain->WaitForFrameSlot(frameIndex, true)) {
 		return false;
 	}
@@ -4329,6 +4343,19 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 		}
 	}
 
+	// NR is optional: a failed guide/constant preparation never disables SR.
+	if (settings.dlssNREnabled && IsNRSupported()) {
+		try {
+			EnsureSharedD3D12Texture(this, outputDesc, dlssSharpenedSharedTextures[frameIndex], dlssSharpenedD3D12[frameIndex], true);
+			if (CaptureRawSRGuides(frameIndex, a_renderSize, a_displaySize)) {
+				CaptureNRGuides(frameIndex, a_renderSize, a_displaySize);
+				if (!Streamline::GetSingleton()->UpdateConstants(a_jitter)) nrMotionReady[frameIndex] = false;
+			}
+		} catch (const std::exception& e) {
+			nrMotionReady[frameIndex] = false;
+			logger::warn("[NR] Optional shared-SR inputs unavailable: {}", e.what());
+		}
+	}
 	fsrInputJitters[frameIndex] = a_jitter;
 	fsrInputRenderSizes[frameIndex] = a_renderSize;
 	fsrInputDisplaySizes[frameIndex] = a_displaySize;
@@ -4338,6 +4365,79 @@ bool Upscaling::CaptureD3D12FSRInputs(int, ID3D11Texture2D* a_motionVectorTextur
 		fsrMotionVectorD3D12[frameIndex] &&
 		fsrDepthD3D12[frameIndex];
 	return fsrD3D12InputsReady[frameIndex];
+}
+
+
+bool Upscaling::IsNRSupported() const
+{
+	return Streamline::GetSingleton()->IsNRSupported(settings.dlssNRPosition == 1);
+}
+
+bool Upscaling::CaptureRawSRGuides(UINT frameIndex, float2 a_renderSize, float2)
+{
+	auto* rendererData = RE::BSGraphics::GetRendererData();
+	auto* context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
+	auto* streamline = Streamline::GetSingleton();
+	D3D11_TEXTURE2D_DESC sharedDepthDesc{};
+	sharedDepthDesc.Width = static_cast<UINT>(a_renderSize.x);
+	sharedDepthDesc.Height = static_cast<UINT>(a_renderSize.y);
+	sharedDepthDesc.MipLevels = sharedDepthDesc.ArraySize = sharedDepthDesc.SampleDesc.Count = 1;
+	sharedDepthDesc.Format = DXGI_FORMAT_R32_FLOAT;
+	sharedDepthDesc.Usage = D3D11_USAGE_DEFAULT;
+	sharedDepthDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	auto* engineMotion = reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMotionVectors)].texture);
+	auto* engineDepth = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
+	auto* copyDepth = GetCopyDepthToFrameGenerationCS();
+	D3D11_TEXTURE2D_DESC engineMotionDesc{};
+	if (engineMotion) {
+		engineMotion->GetDesc(&engineMotionDesc);
+	}
+	if (!engineMotion || !engineDepth || !copyDepth ||
+		engineMotionDesc.Width < sharedDepthDesc.Width || engineMotionDesc.Height < sharedDepthDesc.Height ||
+		engineMotionDesc.SampleDesc.Count != 1 || engineMotionDesc.ArraySize != 1) {
+		streamline->RequestTemporalReset();
+		return false;
+	}
+	auto rawMotionDesc = engineMotionDesc;
+	rawMotionDesc.Width = sharedDepthDesc.Width;
+	rawMotionDesc.Height = sharedDepthDesc.Height;
+	rawMotionDesc.MipLevels = 1;
+	rawMotionDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	rawMotionDesc.MiscFlags = 0;
+	EnsureSharedD3D12Texture(this, rawMotionDesc, dlssMotionVectorSharedTextures[frameIndex], dlssMotionVectorD3D12[frameIndex], false);
+	EnsureSharedD3D12Texture(this, sharedDepthDesc, dlssDepthSharedTextures[frameIndex], dlssDepthD3D12[frameIndex], true);
+	const D3D11_BOX sourceBox{ 0, 0, 0, rawMotionDesc.Width, rawMotionDesc.Height, 1 };
+	context->CopySubresourceRegion(dlssMotionVectorSharedTextures[frameIndex]->resource.get(), 0, 0, 0, 0, engineMotion, 0, &sourceBox);
+	ID3D11ShaderResourceView* views[] = { engineDepth };
+	ID3D11UnorderedAccessView* uavs[] = { dlssDepthSharedTextures[frameIndex]->uav.get() };
+	context->CSSetShaderResources(0, ARRAYSIZE(views), views);
+	context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
+	context->CSSetShader(copyDepth, nullptr, 0);
+	context->Dispatch((rawMotionDesc.Width + 7) / 8, (rawMotionDesc.Height + 7) / 8, 1);
+	ClearDLSSGComputeBindings(context);
+	return true;
+}
+
+void Upscaling::CaptureNRGuides(UINT slot, float2 renderSize, float2 displaySize)
+{
+	nrMotionReady[slot] = false;
+	if (!settings.dlssNREnabled || !IsNRSupported()) {
+		nrMotionHistoryValid = false;
+		return;
+	}
+	try {
+		const bool afterSR = nrAfterSR[slot];
+		EnsureNRGuideResources(static_cast<UINT>(afterSR ? displaySize.x : renderSize.x),
+			static_cast<UINT>(afterSR ? displaySize.y : renderSize.y), afterSR);
+		if (IsDLSSNRReady()) {
+			nrMotionReady[slot] = afterSR ?
+				CaptureNRAfterSRGuides(slot, static_cast<UINT>(renderSize.x), static_cast<UINT>(renderSize.y), displaySize) :
+				CaptureNRMotion(slot, static_cast<UINT>(renderSize.x), static_cast<UINT>(renderSize.y));
+		}
+	} catch (const std::exception& e) {
+		nrMotionHistoryValid = false;
+		logger::warn("[NR motion] Conversion unavailable; SR retains original inputs: {}", e.what());
+	}
 }
 
 void Upscaling::EnsureNRGuideResources(UINT width, UINT height, bool afterSR)
@@ -4590,18 +4690,20 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 	// A resource remaining alive does not mean it contains this frame's inputs.
 	const auto captureIndex = DX12SwapChain::GetSingleton()->GetFrameIndex();
 	if (captureIndex < dlssD3D12InputsReady.size()) {
-		nrCapturedGeneration[captureIndex] = nrSettingsGeneration;
-		nrEvaluatedGeneration[captureIndex] = 0;
-		nrMotionReady[captureIndex] = false;
-		nrAfterSR[captureIndex] = settings.dlssNRPosition == 1;
+		if (d3d12DLSSActive) {
+			nrCapturedGeneration[captureIndex] = nrSettingsGeneration;
+			nrEvaluatedGeneration[captureIndex] = 0;
+			nrMotionReady[captureIndex] = false;
+			nrAfterSR[captureIndex] = settings.dlssNRPosition == 1;
+		}
 		dlssDepthCaptureFrames[captureIndex] = 0;
 		dlssD3D12InputsReady[captureIndex] = false;
 		dlssgInputsReady[captureIndex] = false;
-		fsrFrameGenerationInputsReady[captureIndex] = false;
+		externalFrameGenerationInputsReady[captureIndex] = false;
 	}
 	const bool useD3D12DLSS = d3d12DLSSActive && upscalingTexture;
 	const bool useFrameGeneration = frameGenerationActive;
-	const bool useFSRFrameGeneration = fsrFrameGenerationActive;
+	const bool useFSRFrameGeneration = externalFrameGenerationActive;
 	if (!useFrameGeneration && !useFSRFrameGeneration && !useD3D12DLSS) {
 		return;
 	}
@@ -4698,14 +4800,14 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			return;
 		}
 		dlssgInputsReady[frameIndex] = false;
-		fsrFrameGenerationInputsReady[frameIndex] = false;
+		externalFrameGenerationInputsReady[frameIndex] = false;
 		dlssD3D12InputsReady[frameIndex] = false;
 		dlssD3D12Sharpened[frameIndex] = false;
 		dlssD3D12TransparencyMaskReady[frameIndex] = false;
 		RetireD3D12Resource(dlssD3D12PresentFinal[frameIndex]);
 		const bool reuseFSRResourcesForFrameGeneration =
 			(useFSRFrameGeneration || (ENBRenderDomain::Get().Active() && useFrameGeneration)) &&
-			upscaleMethod == UpscaleMethod::kFSR &&
+			IsSharedTemporalSR(upscaleMethod) &&
 			frameIndex < fsrD3D12InputsReady.size() &&
 			fsrD3D12InputsReady[frameIndex] &&
 			fsrOutputD3D12[frameIndex] &&
@@ -4739,7 +4841,7 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 				0,
 				&colorSourceBox);
 
-			if (settings.sharpness > 0.0f || settings.dlssNREnabled != 0) {
+			if (settings.sharpness > 0.0f || (settings.dlssNREnabled != 0 && IsNRSupported())) {
 				auto sharpenedDesc = frameBufferDesc;
 				sharpenedDesc.Width = static_cast<UINT>(a_displaySize.x);
 				sharpenedDesc.Height = static_cast<UINT>(a_displaySize.y);
@@ -4877,56 +4979,8 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 		}
 
 		if (useD3D12DLSS) {
-			// Keep a separate raw guide copy for NR. SR continues to consume the
-			// original dlssg guide resources, matching the 1.5.3 path.
-			auto* engineMotion = reinterpret_cast<ID3D11Texture2D*>(rendererData->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMotionVectors)].texture);
-			auto* engineDepth = reinterpret_cast<ID3D11ShaderResourceView*>(rendererData->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].srViewDepth);
-			auto* copyDepth = GetCopyDepthToFrameGenerationCS();
-			D3D11_TEXTURE2D_DESC engineMotionDesc{};
-			if (engineMotion) {
-				engineMotion->GetDesc(&engineMotionDesc);
-			}
-			if (!engineMotion || !engineDepth || !copyDepth ||
-				engineMotionDesc.Width < sharedDepthDesc.Width || engineMotionDesc.Height < sharedDepthDesc.Height ||
-				engineMotionDesc.SampleDesc.Count != 1 || engineMotionDesc.ArraySize != 1) {
-				streamline->RequestTemporalReset();
-				return;
-			}
-			auto rawMotionDesc = engineMotionDesc;
-			rawMotionDesc.Width = sharedDepthDesc.Width;
-			rawMotionDesc.Height = sharedDepthDesc.Height;
-			rawMotionDesc.MipLevels = 1;
-			rawMotionDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			rawMotionDesc.MiscFlags = 0;
-			EnsureSharedD3D12Texture(this, rawMotionDesc, dlssMotionVectorSharedTextures[frameIndex], dlssMotionVectorD3D12[frameIndex], false);
-			EnsureSharedD3D12Texture(this, sharedDepthDesc, dlssDepthSharedTextures[frameIndex], dlssDepthD3D12[frameIndex], true);
-			const D3D11_BOX sourceBox{ 0, 0, 0, rawMotionDesc.Width, rawMotionDesc.Height, 1 };
-			context->CopySubresourceRegion(dlssMotionVectorSharedTextures[frameIndex]->resource.get(), 0, 0, 0, 0, engineMotion, 0, &sourceBox);
-			ID3D11ShaderResourceView* views[] = { engineDepth };
-			ID3D11UnorderedAccessView* uavs[] = { dlssDepthSharedTextures[frameIndex]->uav.get() };
-			context->CSSetShaderResources(0, ARRAYSIZE(views), views);
-			context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
-			context->CSSetShader(copyDepth, nullptr, 0);
-			context->Dispatch((rawMotionDesc.Width + 7) / 8, (rawMotionDesc.Height + 7) / 8, 1);
-			ClearDLSSGComputeBindings(context);
-			if (settings.dlssNREnabled != 0) {
-				try {
-					const bool afterSR = nrAfterSR[frameIndex];
-					EnsureNRGuideResources(afterSR ? static_cast<UINT>(a_displaySize.x) : rawMotionDesc.Width,
-						afterSR ? static_cast<UINT>(a_displaySize.y) : rawMotionDesc.Height, afterSR);
-					if (IsDLSSNRReady()) {
-						nrMotionReady[frameIndex] = afterSR ?
-							CaptureNRAfterSRGuides(frameIndex, rawMotionDesc.Width, rawMotionDesc.Height, a_displaySize) :
-							CaptureNRMotion(frameIndex, rawMotionDesc.Width, rawMotionDesc.Height);
-					}
-				} catch (const std::exception& e) {
-					// A failed optional NR conversion must not discard valid SR inputs.
-					nrMotionHistoryValid = false;
-					logger::warn("[NR motion] Conversion unavailable; SR retains raw guides: {}", e.what());
-				}
-			} else {
-				nrMotionHistoryValid = false;
-			}
+			if (!CaptureRawSRGuides(frameIndex, a_renderSize, a_displaySize)) return;
+			CaptureNRGuides(frameIndex, a_renderSize, a_displaySize);
 		}
 
 		bool useDLSSGThisFrame = useFrameGeneration;
@@ -4958,14 +5012,14 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 			}
 		}
 
-		static uint64_t fsrFrameGenerationFrameID = 0;
+		static uint64_t externalFrameGenerationFrameID = 0;
 		dlssgInputRenderSizes[frameIndex] = dlssgInputSize;
 		dlssgInputDisplaySizes[frameIndex] = a_displaySize;
 		dlssgInputFrameTokenIndices[frameIndex] = streamline->GetCurrentFrameTokenIndex();
 		dlssgInputsReady[frameIndex] = useDLSSGThisFrame;
-		fsrFrameGenerationInputsReady[frameIndex] = useFSRFrameGeneration;
-		fsrFrameGenerationColorFormats[frameIndex] = frameBufferDesc.Format;
-		fsrFrameGenerationFrameIDs[frameIndex] = fsrFrameGenerationFrameID++;
+		externalFrameGenerationInputsReady[frameIndex] = useFSRFrameGeneration;
+		externalFrameGenerationColorFormats[frameIndex] = frameBufferDesc.Format;
+		externalFrameGenerationFrameIDs[frameIndex] = externalFrameGenerationFrameID++;
 		dlssD3D12InputsReady[frameIndex] = useD3D12DLSS;
 		dlssD3D12ColorFormats[frameIndex] = frameBufferDesc.Format;
 
@@ -5131,23 +5185,108 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 	return succeeded;
 }
 
+bool Upscaling::PrepareD3D12TemporalSR(uint32_t frame)
+{
+	if (upscaleMethod != UpscaleMethod::kXeSS) return true;
+	auto* output = frame < fsrOutputD3D12.size() ? fsrOutputD3D12[frame].get() : nullptr;
+	if (output && XeSS::GetSingleton()->PrepareSR(DX12SwapChain::GetSingleton()->GetD3D12Device(),
+		static_cast<UINT>(output->GetDesc().Width), output->GetDesc().Height, settings.qualityMode, output->GetDesc().Format)) return true;
+	ReportFeatureRequestFailure(FeatureRequest::kFSR, "XeSS SR initialization");
+	return false;
+}
+
 bool Upscaling::EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex)
+{
+	if (a_frameIndex >= fsrD3D12InputsReady.size() || !fsrD3D12InputsReady[a_frameIndex]) return false;
+	auto* color = fsrInputD3D12[a_frameIndex].get();
+	auto* output = fsrOutputD3D12[a_frameIndex].get();
+	auto* scratch = dlssSharpenedD3D12[a_frameIndex].get();
+	auto* streamline = Streamline::GetSingleton();
+	const auto dispatchSR = [&](ID3D12Resource* input, ID3D12Resource* destination) {
+		return DispatchSharedTemporalSR(a_commandList, a_frameIndex, input, destination);
+	};
+	bool succeeded = false;
+	// Unsupported/disabled NR never makes FSR/XeSS depend on Streamline tokens.
+	const bool commonNR = settings.dlssNREnabled && IsNRSupported() && color && output && scratch &&
+		nrMotionReady[a_frameIndex] && dlssMotionVectorD3D12[a_frameIndex] && dlssDepthD3D12[a_frameIndex];
+	auto* token = commonNR ? streamline->GetFrameTokenForFrame(streamline->GetCurrentFrameTokenIndex()) : nullptr;
+	if (commonNR && token && streamline->ValidateConstantsForFrame(token)) {
+		sl::DLSSNROptions dlssNROptions{};
+		dlssNROptions.mode = IsDLSSNRReady() && nrMotionReady[a_frameIndex] ? sl::DLSSNRMode::eOn : sl::DLSSNRMode::eOff;
+		dlssNROptions.performanceMode = nvngx::dlss_nr::kNativePerformanceMode;
+		dlssNROptions.preset = settings.dlssNRPreset;
+		dlssNROptions.style = settings.dlssNRStyle;
+		dlssNROptions.intensity = settings.dlssNRIntensity;
+		dlssNROptions.localToneStrength = settings.dlssNRLocalToneStrength;
+		dlssNROptions.localStructureStrength = settings.dlssNRLocalStructureStrength;
+		dlssNROptions.useAutoMask = settings.dlssNRUseAutoMask != 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		dlssNROptions.skinStructureStrength = settings.dlssNRSkinStructureStrength;
+
+		bool scratchIsFinal = false;
+		succeeded = streamline->UpscaleD3D12(color, output, scratch,
+			dlssMotionVectorD3D12[a_frameIndex].get(), dlssDepthD3D12[a_frameIndex].get(), nullptr,
+			a_commandList, token, fsrInputRenderSizes[a_frameIndex], fsrInputDisplaySizes[a_frameIndex],
+			color->GetDesc().Format, dlssMotionVectorD3D12[a_frameIndex]->GetDesc().Format,
+			dlssDepthD3D12[a_frameIndex]->GetDesc().Format,
+			settings.qualityMode, 0.0f, settings.dlssModelPreset, settings.dlssNRPassCount,
+			nrMotionD3D12[a_frameIndex].get(), nrMotionJitterDeltas[a_frameIndex], nrAfterSR[a_frameIndex],
+			nrDepthD3D12[a_frameIndex].get(), dlssNROptions, &scratchIsFinal, dispatchSR);
+		if (succeeded && scratchIsFinal) {
+			// Preserve the stable shared output consumed by both D3D11 and all FG
+			// providers. No extra queue/fence; NR/SR/copy share this submission.
+			D3D12_RESOURCE_BARRIER barriers[] = {
+				CD3DX12_RESOURCE_BARRIER::Transition(scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+				CD3DX12_RESOURCE_BARRIER::Transition(output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
+			};
+			a_commandList->ResourceBarrier(2, barriers);
+			a_commandList->CopyResource(output, scratch);
+			for (auto& barrier : barriers) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+			a_commandList->ResourceBarrier(2, barriers);
+		}
+	} else {
+		if (settings.dlssNREnabled && IsNRSupported()) streamline->RequestTemporalReset();
+		succeeded = dispatchSR(color, output);
+	}
+	fsrD3D12InputsReady[a_frameIndex] = false;
+	if (succeeded) {
+		nrEvaluatedGeneration[a_frameIndex] = nrCapturedGeneration[a_frameIndex];
+		ClearFeatureRequestFailure(FeatureRequest::kFSR);
+	} else {
+		ReportFeatureRequestFailure(FeatureRequest::kFSR, "D3D12 temporal SR evaluate");
+	}
+	return succeeded;
+}
+
+bool Upscaling::DispatchSharedTemporalSR(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex, ID3D12Resource* color, ID3D12Resource* output)
 {
 	if (a_frameIndex >= fsrD3D12InputsReady.size() || !fsrD3D12InputsReady[a_frameIndex]) {
 		return false;
 	}
 
-	auto* color = fsrInputD3D12[a_frameIndex].get();
-	auto* output = fsrOutputD3D12[a_frameIndex].get();
 	auto* motionVectors = fsrMotionVectorD3D12[a_frameIndex].get();
 	auto* depth = fsrDepthD3D12[a_frameIndex].get();
 	auto* opaqueOnly = fsrOpaqueOnlyD3D12[a_frameIndex].get();
 	auto* reactiveMask = fsrReactiveMaskD3D12[a_frameIndex].get();
 	auto* pipboyMask = pipboyMaskReady[a_frameIndex] ? pipboyMaskD3D12[a_frameIndex].get() : nullptr;
 	if (!color || !output || !motionVectors || !depth || !a_commandList) {
-		fsrD3D12InputsReady[a_frameIndex] = false;
 		ReportFeatureRequestFailure(FeatureRequest::kFSR, "D3D12 FSR inputs");
 		return false;
+	}
+
+	if (upscaleMethod == UpscaleMethod::kXeSS) {
+		const auto read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		D3D12_RESOURCE_BARRIER barriers[] = {
+			CD3DX12_RESOURCE_BARRIER::Transition(color, D3D12_RESOURCE_STATE_COMMON, read),
+			CD3DX12_RESOURCE_BARRIER::Transition(motionVectors, D3D12_RESOURCE_STATE_COMMON, read),
+			CD3DX12_RESOURCE_BARRIER::Transition(depth, D3D12_RESOURCE_STATE_COMMON, read),
+			CD3DX12_RESOURCE_BARRIER::Transition(output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+		};
+		a_commandList->ResourceBarrier(4, barriers);
+		const bool ok = XeSS::GetSingleton()->Upscale(a_commandList, color, output, motionVectors, depth,
+			fsrInputJitters[a_frameIndex], fsrInputRenderSizes[a_frameIndex]);
+		for (auto& barrier : barriers) std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+		a_commandList->ResourceBarrier(4, barriers);
+		return ok;
 	}
 
 	const auto shaderReadState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -5197,18 +5336,12 @@ bool Upscaling::EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint3
 	}
 	a_commandList->ResourceBarrier(afterDispatchCount, afterDispatch);
 
-	fsrD3D12InputsReady[a_frameIndex] = false;
-	if (succeeded) {
-		ClearFeatureRequestFailure(FeatureRequest::kFSR);
-	} else {
-		ReportFeatureRequestFailure(FeatureRequest::kFSR, "D3D12 FSR evaluate");
-	}
 	return succeeded;
 }
 
-bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex)
+bool Upscaling::EvaluateExternalFrameGeneration(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex)
 {
-	if (a_frameIndex >= fsrFrameGenerationInputsReady.size() || !fsrFrameGenerationInputsReady[a_frameIndex]) {
+	if (a_frameIndex >= externalFrameGenerationInputsReady.size() || !externalFrameGenerationInputsReady[a_frameIndex]) {
 		return false;
 	}
 
@@ -5222,7 +5355,7 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 	auto* motionVectors = dlssgMotionVectorD3D12[a_frameIndex].get();
 	auto* depth = dlssgDepthD3D12[a_frameIndex].get();
 	if (!color || !motionVectors || !depth || !a_commandList) {
-		fsrFrameGenerationInputsReady[a_frameIndex] = false;
+		externalFrameGenerationInputsReady[a_frameIndex] = false;
 		ReportFeatureRequestFailure(FeatureRequest::kFSRFrameGeneration, "FSR frame generation inputs");
 		return false;
 	}
@@ -5236,7 +5369,10 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 	a_commandList->ResourceBarrier(beforeDispatchCount, beforeDispatch);
 
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
-	const auto succeeded = FidelityFX::GetSingleton()->ConfigureFrameGeneration(
+	const auto succeeded = activeFGProvider == FGProvider::XeSS ?
+		XeSS::GetSingleton()->TagFrame(a_commandList, color, motionVectors, depth, jitter,
+			dlssgInputRenderSizes[a_frameIndex], dlssgInputDisplaySizes[a_frameIndex], settings.xessGeneratedFrames + 1) :
+		FidelityFX::GetSingleton()->ConfigureFrameGeneration(
 		dx12SwapChain->GetD3D12Device(),
 		a_commandList,
 		dx12SwapChain->swapChain.get(),
@@ -5248,8 +5384,8 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 		jitter,
 		dlssgInputRenderSizes[a_frameIndex],
 		dlssgInputDisplaySizes[a_frameIndex],
-		fsrFrameGenerationColorFormats[a_frameIndex],
-		fsrFrameGenerationFrameIDs[a_frameIndex],
+		externalFrameGenerationColorFormats[a_frameIndex],
+		externalFrameGenerationFrameIDs[a_frameIndex],
 		true);
 
 	D3D12_RESOURCE_BARRIER afterDispatch[3]{};
@@ -5259,7 +5395,7 @@ bool Upscaling::EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandL
 	afterDispatch[afterDispatchCount++] = CD3DX12_RESOURCE_BARRIER::Transition(depth, shaderReadState, D3D12_RESOURCE_STATE_COMMON);
 	a_commandList->ResourceBarrier(afterDispatchCount, afterDispatch);
 
-	fsrFrameGenerationInputsReady[a_frameIndex] = false;
+	externalFrameGenerationInputsReady[a_frameIndex] = false;
 	if (succeeded) {
 		ClearFeatureRequestFailure(FeatureRequest::kFSRFrameGeneration);
 	} else {
@@ -5409,7 +5545,7 @@ void Upscaling::DestroyUpscalingResources(bool a_preserveNativeNR, bool a_intero
 		RetireSharedD3D12Texture(fsrDepthSharedTextures[i], fsrDepthD3D12[i]);
 		RetireD3D12Resource(dlssD3D12PresentFinal[i]);
 		dlssgInputsReady[i] = false;
-		fsrFrameGenerationInputsReady[i] = false;
+		externalFrameGenerationInputsReady[i] = false;
 		fsrD3D12InputsReady[i] = false;
 		dlssD3D12InputsReady[i] = false;
 		dlssD3D12Sharpened[i] = false;

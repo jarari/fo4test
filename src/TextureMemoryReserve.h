@@ -9,8 +9,8 @@ namespace TextureMemoryReserve
 
 	inline constexpr std::uint64_t MaxReserve = 2048 * MiB;
 	inline constexpr std::uint64_t MaxExtraReserve = 2048 * MiB;
-	enum class SR { None, DLSS, FSR };
-	enum class FG { None, DLSS, FSR };
+	enum class SR { None, DLSS, FSR, XeSS };
+	enum class FG { None, DLSS, FSR, XeSS };
 	struct Configuration
 	{
 		std::uint32_t width{}, height{}, renderWidth{}, renderHeight{};
@@ -49,17 +49,19 @@ namespace TextureMemoryReserve
 			e.sr += (c.sr == SR::DLSS ? 64 : 48) * MiB + input * 32 + output * 16;
 		}
 		if (c.fg != FG::None) {
-			const auto generated = c.fg == FG::FSR ? 1u : std::clamp(c.generatedFrames, 1u, 5u);
+			const auto generated = c.fg == FG::FSR ? 1u : std::clamp(c.generatedFrames, 1u, c.fg == FG::XeSS ? 7u : 5u);
 			// HUD-less color, independent FG guides and generated output allowance.
 			e.fg = slots * (output * color + input * 8) + generated * output * color;
 			e.fg += (c.fg == FG::DLSS ? 96 : 64) * MiB + output * 24 + input * 8;
 		}
-		if (c.sr == SR::DLSS && c.nrPasses) {
+		if (c.sr != SR::None && c.nrPasses) {
 			const auto passes = std::clamp(c.nrPasses, 1u, 3u);
 			const auto nrPixels = c.nrAfterSR ? output : input;
 			// Callback samples: ~221 MiB at 1129x635, ~377 at 1080p, one pass.
 			// No unmeasured preset/style/intensity multipliers.
 			e.nr = passes * (160 * MiB + nrPixels * 110);
+			// FSR/XeSS additionally preserve raw guides for NR, separate from SR guides.
+			if (c.sr != SR::DLSS) e.nr += slots * input * 8;
 			// Color/output already counted in SR. Only post-SR needs private depth.
 			e.nr += slots * nrPixels * (c.nrAfterSR ? 8 : 4);
 			e.nr += (passes - 1) * nrPixels * color;

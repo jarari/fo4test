@@ -143,7 +143,7 @@ namespace
 		return result;
 	}
 
-	Streamline* SelectStreamlineForD3D12Proxy(Streamline* a_streamline, IDXGIAdapter* a_adapter, bool a_wantsD3D12FrameGeneration)
+	Streamline* SelectStreamlineForD3D12Proxy(Streamline* a_streamline, IDXGIAdapter* a_adapter)
 	{
 		if (!a_streamline || !a_streamline->interposer) {
 			return nullptr;
@@ -155,15 +155,18 @@ namespace
 		}
 
 		a_streamline->CheckFeatures(a_adapter);
-		if constexpr (Upscaling::kForceFSRFrameGenerationForTesting) {
-			if (a_wantsD3D12FrameGeneration) {
-				logger::info("[DX12SwapChain] Streamline proxy disabled because FSR frame generation testing is forced");
-				return nullptr;
+		auto* upscaling = Upscaling::GetSingleton();
+		upscaling->SelectFGProviderAtStartup(a_streamline->featureDLSSG);
+		if (upscaling->GetFGProvider() != Upscaling::FGProvider::DLSSG) {
+			bool loaded = false;
+			if (a_streamline->slIsFeatureLoaded &&
+				a_streamline->slIsFeatureLoaded(sl::kFeatureDLSS_G, loaded) == sl::Result::eOk && loaded) {
+				if (!a_streamline->slSetFeatureLoaded || a_streamline->slSetFeatureLoaded(sl::kFeatureDLSS_G, false) != sl::Result::eOk) {
+					logger::error("[DX12SwapChain] Cannot disable DLSS-G hooks for the selected FG provider");
+					DX::ThrowIfFailed(DXGI_ERROR_UNSUPPORTED);
+				}
 			}
-		}
-
-		if (a_wantsD3D12FrameGeneration && !a_streamline->featureDLSSG) {
-			logger::info("[DX12SwapChain] Streamline proxy disabled because FidelityFX frame generation will own the swapchain");
+			a_streamline->featureDLSSG = false;
 			return nullptr;
 		}
 
@@ -209,7 +212,7 @@ struct hkIDXGIFactoryCreateSwapChain
 				throw DX::com_exception(E_FAIL);
 			}
 
-			Streamline* streamlineForProxy = SelectStreamlineForD3D12Proxy(streamline, adapter.get(), true);
+			Streamline* streamlineForProxy = SelectStreamlineForD3D12Proxy(streamline, adapter.get());
 
 			winrt::com_ptr<IDXGIFactory5> dxgiFactory;
 			DX::ThrowIfFailed(This->QueryInterface(IID_PPV_ARGS(dxgiFactory.put())));
@@ -228,11 +231,9 @@ struct hkIDXGIFactoryCreateSwapChain
 				streamline->PostDevice();
 			}
 
-			const bool useFidelityFXFrameGeneration = (Upscaling::kForceFSRFrameGenerationForTesting || !streamline->featureDLSSG);
-			if (useFidelityFXFrameGeneration) {
-				logger::info("[DX12SwapChain] FidelityFX frame generation selected force={} dlssgAvailable={}", Upscaling::kForceFSRFrameGenerationForTesting, streamline->featureDLSSG);
-			}
-			dx12SwapChain->CreateSwapChain(dxgiFactory.get(), *pDesc, streamlineForProxy, useFidelityFXFrameGeneration);
+			Upscaling::GetSingleton()->SelectFGProviderAtStartup(streamline->featureDLSSG);
+			dx12SwapChain->CreateSwapChain(dxgiFactory.get(), *pDesc, streamlineForProxy,
+				Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::FSR);
 			dx12SwapChain->CreateInterop();
 
 			*ppSwapChain = dx12SwapChain->GetSwapChainProxy();

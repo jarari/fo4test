@@ -140,16 +140,16 @@ public:
 	{
 		bool dlss = false;
 		bool fsr = false;
-		bool fsrFrameGeneration = false;
+		bool externalFrameGeneration = false;
 
-		bool Any() const { return dlss || fsr || fsrFrameGeneration; }
+		bool Any() const { return dlss || fsr || externalFrameGeneration; }
 	};
 	D3D12EvaluationResult EvaluateD3D12WorkForCurrentFrame(bool a_evaluateDLSS, bool a_evaluateFSR, bool a_evaluateFSRFrameGeneration, bool a_waitForD3D11Consumption = true);
 	bool EvaluateD3D12DLSSForCurrentFrame();
 	bool EvaluateD3D12FSRForCurrentFrame();
-	bool EvaluateFSRFrameGenerationForCurrentFrame();
+	bool EvaluateExternalFrameGenerationForCurrentFrame();
 	void SetPresentOverride(ID3D12Resource* a_finalColor);
-	bool EnsureFidelityFXFrameGenerationSwapChain();
+	bool EnsureExternalFrameGenerationSwapChain();
 	HRESULT GetBuffer(UINT a_buffer, REFIID a_riid, void** a_surface);
 	HRESULT GetDevice(REFIID a_riid, void** a_device);
 	void InstallWndProcHook(HWND a_hwnd);

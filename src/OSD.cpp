@@ -1,3 +1,4 @@
+#include "XeSS.h"
 #include "OSD.h"
 
 #include <algorithm>
@@ -88,8 +89,8 @@ namespace
 		if (upscaling->ShouldUseFrameGeneration(true)) {
 			return "DLSS-G";
 		}
-		if (upscaling->ShouldUseFSRFrameGeneration(true)) {
-			return "FSR FG";
+		if (upscaling->ShouldUseExternalFrameGeneration(true)) {
+			return upscaling->GetFGProviderName();
 		}
 		return "Off";
 	}
@@ -101,6 +102,8 @@ namespace
 			return "DLSS";
 		case Upscaling::UpscaleMethod::kFSR:
 			return "FSR";
+		case Upscaling::UpscaleMethod::kXeSS:
+			return "XeSS";
 		case Upscaling::UpscaleMethod::kSpatialFallback:
 			return "Fallback";
 		case Upscaling::UpscaleMethod::kDisabled:
@@ -452,7 +455,7 @@ void OSD::UpdateStats()
 	++renderedFrames;
 
 	auto streamline = Streamline::GetSingleton();
-	const auto fsrGeneratedFrameCount = FidelityFX::GetSingleton()->GetGeneratedFrameCount();
+	const auto fsrGeneratedFrameCount = (XeSS::GetSingleton()->OwnsSwapChain() ? XeSS::GetSingleton()->PresentedFrames() : FidelityFX::GetSingleton()->GetGeneratedFrameCount());
 
 	if (sampleStart.time_since_epoch().count() == 0) {
 		sampleStart = now;
@@ -476,7 +479,7 @@ void OSD::UpdateStats()
 		// Fall back to successful SDK dispatches only when DXGI statistics are
 		// unavailable. A dispatch alone does not prove the frame was presented.
 		const auto interpolated = fsrGeneratedFrameCount - lastFSRGeneratedFrameCount;
-		generatedFPS = (renderedFrames + interpolated) / elapsedSeconds;
+		generatedFPS = (XeSS::GetSingleton()->OwnsSwapChain() ? interpolated : renderedFrames + interpolated) / elapsedSeconds;
 	}
 	if (FidelityFX::GetSingleton()->IsFrameGenerationEnabled()) {
 		auto* chain = DX12SwapChain::GetSingleton()->swapChain.get();
@@ -536,7 +539,7 @@ std::string OSD::BuildText() const
 std::string OSD::BuildCompactText() const
 {
 	auto upscaling = Upscaling::GetSingleton();
-	const auto fgFPS = upscaling->ShouldUseFrameGeneration(true) || upscaling->ShouldUseFSRFrameGeneration(true) ? generatedFPS : 0.0;
+	const auto fgFPS = upscaling->ShouldUseFrameGeneration(true) || upscaling->ShouldUseExternalFrameGeneration(true) ? generatedFPS : 0.0;
 	char latency[32]{};
 	if (reflexLatencyMs > 0.0f) {
 		std::snprintf(latency, sizeof(latency), "%.1fms", reflexLatencyMs);
@@ -578,7 +581,7 @@ std::string OSD::BuildDetailedText() const
 	text += line;
 	std::snprintf(line, sizeof(line), "FG: %s\n", FGMethodName());
 	text += line;
-	if (upscaling->ShouldUseFrameGeneration(true) || upscaling->ShouldUseFSRFrameGeneration(true)) {
+	if (upscaling->ShouldUseFrameGeneration(true) || upscaling->ShouldUseExternalFrameGeneration(true)) {
 		std::snprintf(line, sizeof(line), "Generated FPS: %.1f\n", generatedFPS);
 		text += line;
 	}
@@ -601,10 +604,10 @@ std::string OSD::BuildDetailedText() const
 		text += line;
 		std::snprintf(line, sizeof(line), "DLSS Preset: %s\n", DLSSModelPresetName(streamline->GetCurrentDLSSModelPreset()));
 		text += line;
-	} else if (activeMethod == Upscaling::UpscaleMethod::kFSR) {
+	} else if (Upscaling::IsSharedTemporalSR(activeMethod)) {
 		std::snprintf(line, sizeof(line), "Res: %.0fx%.0f -> %.0fx%.0f\n", upscaling->osdRenderSize.x, upscaling->osdRenderSize.y, upscaling->osdNativeSize.x, upscaling->osdNativeSize.y);
 		text += line;
-		std::snprintf(line, sizeof(line), "FSR Quality: %s\n", QualityName(upscaling->settings.qualityMode));
+		std::snprintf(line, sizeof(line), "%s Quality: %s\n", activeMethod == Upscaling::UpscaleMethod::kXeSS ? "XeSS" : "FSR", QualityName(upscaling->settings.qualityMode));
 		text += line;
 	} else if (activeMethod == Upscaling::UpscaleMethod::kSpatialFallback) {
 		std::snprintf(line, sizeof(line), "Res: %.0fx%.0f -> %.0fx%.0f\n", upscaling->osdRenderSize.x, upscaling->osdRenderSize.y, upscaling->osdNativeSize.x, upscaling->osdNativeSize.y);
@@ -720,6 +723,7 @@ void OSD::Render(
 	const auto activeMethod = Upscaling::GetSingleton()->upscaleMethod;
 	if (activeMethod != Upscaling::UpscaleMethod::kDLSS &&
 		activeMethod != Upscaling::UpscaleMethod::kFSR &&
+		activeMethod != Upscaling::UpscaleMethod::kXeSS &&
 		activeMethod != Upscaling::UpscaleMethod::kSpatialFallback) {
 		return;
 	}
@@ -747,7 +751,7 @@ void OSD::Reset()
 	sampleStart = {};
 	frameTimeAccumMs = 0.0;
 	renderedFrames = 0;
-	lastFSRGeneratedFrameCount = FidelityFX::GetSingleton()->GetGeneratedFrameCount();
+	lastFSRGeneratedFrameCount = (XeSS::GetSingleton()->OwnsSwapChain() ? XeSS::GetSingleton()->PresentedFrames() : FidelityFX::GetSingleton()->GetGeneratedFrameCount());
 	renderFPS = 0.0;
 	frameTimeMs = 0.0;
 	generatedFPS = 0.0;

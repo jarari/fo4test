@@ -674,7 +674,8 @@ bool FidelityFX::UpscaleD3D12(
 	dispatch.sharpness = sharpness;
 	dispatch.frameTimeDelta = std::max(frameTimeMs, 0.0f);
 	dispatch.preExposure = 1.0f;
-	dispatch.reset = false;
+	const auto resetSerial = srResetSerial.load(std::memory_order_relaxed);
+	dispatch.reset = srAppliedResetSerial != resetSerial;
 	dispatch.cameraNear = *reinterpret_cast<float*>(REL::ID{ 57985, 2712882 }.address());
 	dispatch.cameraFar = *reinterpret_cast<float*>(REL::ID{ 958877, 2712883 }.address());
 	// Match the original D3D11 FSR path: SR does not need the camera matrices
@@ -689,5 +690,6 @@ bool FidelityFX::UpscaleD3D12(
 		return false;
 	}
 
+	srAppliedResetSerial = resetSerial;
 	return true;
 }

@@ -1,3 +1,4 @@
+#include "XeSS.h"
 #include "UpscalingMenu.h"
 #ifdef UPSCALING_NR_CAPTURE
 #include "NRDiagnosticCapture.h"
@@ -260,6 +261,7 @@ namespace
 	{
 		auto* upscaling = Upscaling::GetSingleton();
 		auto updatedSettings = upscaling->settings;
+		if (!updatedSettings.dlssNREnabled && !upscaling->IsNRSupported()) return;
 		updatedSettings.dlssNREnabled = updatedSettings.dlssNREnabled == 0 ? 1u : 0u;
 		if (!upscaling->SaveSettings(updatedSettings)) {
 			logger::error("[Menu] Could not save DLSS-NR hotkey state");
@@ -341,13 +343,13 @@ namespace
 			ImGuiMCP::TextDisabled(
 				"Runtime: DLSS %s | DLSS-NR %s | DLSS Frame Generation %s | Reflex %s",
 				streamline->featureDLSS ? "available" : "unavailable",
-				streamline->featureDLSSNR ? "available" : "direct path",
+				streamline->IsNRSupported(false) ? (streamline->featureDLSSNR ? "available" : "direct path") : "unavailable",
 				streamline->featureDLSSG ? "available" : "unavailable",
 				streamline->featureReflex ? "available" : "unavailable");
 		}
 
 		ImGuiMCP::SeparatorText("Upscaling");
-		static constexpr std::array upscaleMethods{ "Disabled", "AMD FSR", "NVIDIA DLSS" };
+		static constexpr std::array upscaleMethods{ "Disabled", "AMD FSR", "NVIDIA DLSS", "Intel XeSS" };
 		changed |= ComboSetting(
 			"Upscale Method",
 			settings.upscaleMethodPreference,
@@ -366,7 +368,7 @@ namespace
 			0.0f,
 			1.0f,
 			"%.2f",
-			"Controls NVIDIA Image Scaling sharpen for DLSS and RCAS for FSR.");
+			"Controls NVIDIA Image Scaling sharpen for DLSS and RCAS for FSR. XeSS uses its built-in reconstruction without this sharpen pass.");
 
 		const bool dlssSelected = settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDLSS);
 		if (dlssSelected) {
@@ -379,49 +381,64 @@ namespace
 		}
 
 		ImGuiMCP::SeparatorText("Frame Generation");
-		if (streamline->dlssgBlockedByFP16Output) {
-			ImGuiMCP::TextWrapped("DLSS Frame Generation is unavailable with R16G16B16A16_FLOAT (FP16, format 10) swapchain output.");
-			ImGuiMCP::TextWrapped("When RenoDX or another color-format modification uses R16G16B16A16_FLOAT, FidelityFX Frame Generation is used instead when FG is enabled. DLSS upscaling remains available. DLSS multi-frame and Dynamic MFG settings do not apply.");
-		}
+		static constexpr std::array fgProviders{ "DLSS-G", "FSR FG", "XeSS FG" };
+		changed |= ComboSetting("FG Provider (restart required)", settings.frameGenerationProvider, fgProviders,
+			"Applied on game restart. DLSS-G falls back to XeSS FG when unsupported. If XeSS FG is also unavailable, FG is disabled. No automatic FSR selection.");
+		ImGuiMCP::TextDisabled("Active FG provider: %s", Upscaling::GetSingleton()->GetFGProviderName());
+		if (settings.frameGenerationProvider != Upscaling::GetSingleton()->GetStartupFGPreference())
+			ImGuiMCP::TextWrapped("Restart the game to apply the selected FG provider.");
+		if (streamline->dlssgBlockedByFP16Output)
+			ImGuiMCP::TextWrapped("DLSS-G and XeSS FG do not support FP16/scRGB output. Select FSR FG and restart. DLSS SR remains available.");
+		if (const auto* reason = XeSS::GetSingleton()->FailureReason()) ImGuiMCP::TextWrapped("%s", reason);
 		const bool upscalingDisabled = settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDisabled);
 		ImGuiMCP::BeginDisabled(upscalingDisabled);
-		static constexpr std::array frameGenerationModes{ "Disabled", "On", "Auto" };
+		static constexpr std::array frameGenerationModes{ "Disabled", "On", "Auto (menu handling)" };
 		changed |= ComboSetting(
 			"Frame Generation",
 			settings.frameGenerationMode,
 			frameGenerationModes,
-			"Uses DLSS Frame Generation when available, otherwise FidelityFX Frame Generation (including FP16 output).");
+			"Enables the active FG provider independently of the selected SR method.");
 		ImGuiMCP::EndDisabled();
 
 		const bool frameGenerationDisabled = upscalingDisabled || settings.frameGenerationMode == 0;
-		ImGuiMCP::BeginDisabled(frameGenerationDisabled || !dlssSelected || !streamline->featureDLSSG);
+		// Editing the restart-only preference must not redirect live multiplier
+		// edits to a provider that does not own this process's swapchain.
+		const auto activeProvider = Upscaling::GetSingleton()->GetFGProvider();
 		static constexpr std::array generatedFrameCounts{ "1 (2x)", "2 (3x)", "3 (4x)", "4 (5x)", "5 (6x)" };
-		changed |= ComboSetting(
-			"Generated Frames",
-			settings.dlssgGeneratedFrames,
-			generatedFrameCounts,
-			"Controls the requested DLSS generated-frame multiplier. The runtime clamps unsupported values.");
-		changed |= CheckboxSetting(
-			"Dynamic Multi Frame Generation",
-			settings.dynamicMFGEnabled,
-			"Lets Streamline dynamically select the generated-frame multiplier when supported.");
-		ImGuiMCP::BeginDisabled(settings.dynamicMFGEnabled == 0);
-		changed |= SliderIntSetting(
-			"Dynamic Target FPS",
-			settings.dynamicMFGTargetFPS,
-			0,
-			500,
-			"%d FPS",
-			"Target output frame rate. Zero lets Streamline use the display refresh rate.");
-		ImGuiMCP::EndDisabled();
+		static constexpr std::array xeCounts{ "1 (2x)", "2 (3x)", "3 (4x)", "4 (5x)", "5 (6x)", "6 (7x)", "7 (8x)" };
+		ImGuiMCP::BeginDisabled(frameGenerationDisabled);
+		if (activeProvider == Upscaling::FGProvider::DLSSG) {
+			changed |= ComboSetting("Generated Frames", settings.dlssgGeneratedFrames, generatedFrameCounts,
+				"Saved for the active DLSS-G provider. The runtime clamps unsupported values.");
+		} else if (activeProvider == Upscaling::FGProvider::XeSS) {
+			changed |= ComboSetting("Generated Frames", settings.xessGeneratedFrames, xeCounts,
+				"Saved for the active XeSS FG provider and clamped to runtime support.");
+			ImGuiMCP::TextDisabled("XeSS runtime maximum: %ux | Low latency: XeLL", XeSS::GetSingleton()->MaxGeneratedFrames() + 1);
+		} else if (activeProvider == Upscaling::FGProvider::FSR) {
+			ImGuiMCP::TextDisabled("Generated Frames: 1 (2x, fixed)");
+		} else {
+			ImGuiMCP::TextDisabled("Generated Frames: unavailable");
+		}
 		ImGuiMCP::EndDisabled();
 
+		if (activeProvider == Upscaling::FGProvider::DLSSG) {
+			ImGuiMCP::BeginDisabled(frameGenerationDisabled || !streamline->featureDLSSG);
+			changed |= CheckboxSetting("Dynamic Multi Frame Generation", settings.dynamicMFGEnabled,
+				"Lets Streamline dynamically select the generated-frame multiplier when supported.");
+			ImGuiMCP::BeginDisabled(settings.dynamicMFGEnabled == 0);
+			changed |= SliderIntSetting("Dynamic Target FPS", settings.dynamicMFGTargetFPS, 0, 500, "%d FPS",
+				"Target output frame rate. Zero lets Streamline use the display refresh rate.");
+			ImGuiMCP::EndDisabled();
+			ImGuiMCP::EndDisabled();
+		}
+		ImGuiMCP::BeginDisabled(XeSS::GetSingleton()->OwnsSwapChain());
 		static constexpr std::array reflexModes{ "Off", "On", "On + Boost" };
 		changed |= ComboSetting(
 			"NVIDIA Reflex",
 			settings.reflexMode,
 			reflexModes,
-			"Controls NVIDIA Reflex low-latency mode. Frame generation forces at least On while active.");
+			"Controls NVIDIA Reflex low-latency mode. XeSS FG uses XeLL instead.");
+		ImGuiMCP::EndDisabled();
 
 		ImGuiMCP::SeparatorText("FPS Limiter");
 		static constexpr std::array vsyncModes{ "Game setting", "Off", "On" };
@@ -431,7 +448,10 @@ namespace
 			"Reflex-independent frame-start pacing for D3D12 output. 0 disables; values below 10 become 10. Includes FG. Dynamic MFG uses its maximum multiplier conservatively and may run below the target. A cap alone does not prevent tearing; use VSync/VRR.");
 
 		ImGuiMCP::SeparatorText("DLSS NR");
-		ImGuiMCP::BeginDisabled(!dlssSelected);
+		const bool nrSupported = streamline->IsNRSupported(false);
+		if (!nrSupported)
+			ImGuiMCP::TextWrapped("NR is unavailable for this GPU/driver/runtime at the selected stage.");
+		ImGuiMCP::BeginDisabled(upscalingDisabled || !nrSupported);
 
 		changed |= CheckboxSetting(
 			"DLSS Neural Rendering",
@@ -441,6 +461,8 @@ namespace
 		static constexpr std::array nrPositions{ "Before SR", "After SR" };
 		changed |= ComboSetting("NR Position", settings.dlssNRPosition, nrPositions,
 			"Before SR processes render resolution. After SR processes display resolution before UI composition and costs more GPU time and memory.");
+		if (settings.dlssNRPosition == 1 && !streamline->IsNRSupported(true))
+			ImGuiMCP::TextWrapped("After SR requires Direct NR support; NR is skipped at this stage. Select Before SR.");
 		changed |= SliderIntSetting(
 			"NR Passes",
 			settings.dlssNRPassCount,
@@ -500,7 +522,7 @@ namespace
 			"On-Screen Display",
 			settings.osdMode,
 			osdModes,
-			"Shows D3D12 swapchain and upscaler status while DLSS or FSR is active.");
+			"Shows D3D12 swapchain and upscaler status while DLSS, FSR or XeSS is active.");
 
 		ImGuiMCP::SeparatorText("Misc");
 		changed |= SliderIntSetting(

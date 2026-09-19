@@ -1,3 +1,4 @@
+#include "XeSS.h"
 #include "Streamline.h"
 #ifdef UPSCALING_NR_CAPTURE
 #include "NRDiagnosticCapture.h"
@@ -403,7 +404,7 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 
 void Streamline::PrepareDirectDLSSNR()
 {
-	if (!UsesD3D12() || featureDLSSNR) {
+	if (!UsesD3D12()) {
 		return;
 	}
 
@@ -413,7 +414,7 @@ void Streamline::PrepareDirectDLSSNR()
 		return;
 	}
 
-	logger::info("[DLSS-NR Direct] Streamline DLSS-NR is unavailable; initializing the direct path now");
+	logger::info("[DLSS-NR Direct] Checking adapter support and initializing the independent NR path");
 	directDLSSNR.Prepare(device);
 }
 
@@ -435,7 +436,7 @@ void Streamline::PostDevice()
 			featureDLSSNR = false;
 		}
 	}
-	if (!featureDLSSNR) {
+	{
 		// The first feature query runs before the proxy creates its D3D12 device.
 		// PostDevice is the earliest guaranteed point where direct NGX Init_Ext
 		// can run after Streamline rejects the DLSS-NR plugin.
@@ -520,6 +521,8 @@ bool Streamline::PaceFrame(uint32_t a_frameIndex)
 {
 	// Before Reflex Sleep and input markers, even without Streamline/Reflex.
 	DX12SwapChain::GetSingleton()->PaceFrameStart(a_frameIndex);
+	XeSS::GetSingleton()->Sleep(a_frameIndex);
+	if (XeSS::GetSingleton()->OwnsSwapChain()) { EnsureFrameToken(a_frameIndex); UpdateReflex(0, false); return true; }
 	const auto* upscaling = Upscaling::GetSingleton();
 	const bool validToken = EnsureFrameToken(a_frameIndex);
 	if (!validToken || reflexSleepFrame == a_frameIndex) {
@@ -544,12 +547,17 @@ bool Streamline::BeginSimulationFrame(uint32_t a_frameIndex)
 {
 	if (!PaceFrame(a_frameIndex) || simulationMarkerFrame == a_frameIndex) { return false; }
 	simulationMarkerFrame = a_frameIndex;
+	XeSS::GetSingleton()->Marker(XELL_SIMULATION_START);
 	SetPCLMarker(sl::PCLMarker::eSimulationStart);
 	return true;
 }
 
 void Streamline::EndSimulationFrame(uint32_t a_frameIndex)
 {
+	if (XeSS::GetSingleton()->OwnsSwapChain()) {
+		XeSS::GetSingleton()->EndSimulation(a_frameIndex);
+		return;
+	}
 	// A loading screen can render many frames while OnIdle is blocked on I/O.
 	// Do not attribute the old simulation's end to its newer loading-frame token.
 	if (markerFrameIndex != a_frameIndex || !frameToken) {
@@ -563,11 +571,14 @@ void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
 {
 	if (!PaceFrame(a_frameIndex) || renderMarkerFrame == a_frameIndex) { return; }
 	renderMarkerFrame = a_frameIndex;
+	XeSS::GetSingleton()->Marker(XELL_RENDERSUBMIT_START);
 	SetPCLMarker(sl::PCLMarker::eRenderSubmitStart);
 }
 
 void Streamline::RequestTemporalReset()
 {
+	XeSS::GetSingleton()->RequestReset();
+	FidelityFX::GetSingleton()->RequestSRReset();
 	// Published common constants are immutable for their token. A late request
 	// is consumed by UpdateConstants on the next frame, never by republishing.
 	temporalResetPending = true;
@@ -658,6 +669,7 @@ void Streamline::OnPCLStatsPing()
 
 void Streamline::UpdateReflex(uint a_reflexMode, bool a_forceEnabled)
 {
+	if (XeSS::GetSingleton()->OwnsSwapChain()) { a_reflexMode = 0; a_forceEnabled = false; }
 	if (!featureReflex || !slReflexSetOptions) {
 		return;
 	}
@@ -1325,7 +1337,7 @@ bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resour
 	return true;
 }
 
-bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened)
+bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened, const std::function<bool(ID3D12Resource*, ID3D12Resource*)>& a_evaluateSR)
 {
 	if (a_sharpened) {
 		*a_sharpened = false;
@@ -1405,6 +1417,8 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		ID3D12Resource* a_featureOutput,
 		const sl::Extent& a_colorExtent,
 		const sl::Extent& a_outputExtent) {
+		// NR scheduling is shared by DLSS, FSR and XeSS; only SR dispatch differs.
+		if (!a_useDLSSNR && a_evaluateSR) return a_evaluateSR(a_featureColor, a_featureOutput);
 		const auto featureName = a_useDLSSNR ? "DLSS-NR" : "DLSS";
 		const auto feature = a_useDLSSNR ? sl::kFeatureDLSS_NR : sl::kFeatureDLSS;
 		const bool featureAvailable = a_useDLSSNR ? featureDLSSNR : featureDLSS;
@@ -1635,7 +1649,7 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 #endif
 		} else {
 			if (!loggedDLSSNRFallback) {
-				logger::warn("[Streamline] D3D12 DLSS-NR failed; running DLSS SR from the original color input");
+				logger::warn("[Streamline] D3D12 DLSS-NR failed; running SR from the original color input");
 			}
 			loggedDLSSNRFallback = true;
 		}
@@ -1815,13 +1829,18 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 bool Streamline::GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters) const
 {
 	const auto* upscaling = Upscaling::GetSingleton();
-	if (a_slot >= upscaling->dlssD3D12InputsReady.size() || dlssNRSuspended ||
+	if (a_slot >= upscaling->dlssD3D12InputsReady.size()) return false;
+	const bool sharedSR = Upscaling::IsSharedTemporalSR(upscaling->upscaleMethod);
+	const bool ready = sharedSR ? upscaling->fsrD3D12InputsReady[a_slot] : upscaling->dlssD3D12InputsReady[a_slot];
+	if (dlssNRSuspended || !directDLSSNR.IsSupported() ||
 		(!upscaling->nrAfterSR[a_slot] && featureDLSSNR && slDLSSNRSetOptions) ||
 		!upscaling->IsDLSSNRReady() ||
-		!upscaling->dlssD3D12InputsReady[a_slot] || !upscaling->dlssSharpenedD3D12[a_slot]) {
+		!ready || !upscaling->nrMotionReady[a_slot] || !upscaling->dlssSharpenedD3D12[a_slot]) {
 		return false;
 	}
-	const auto size = upscaling->nrAfterSR[a_slot] ? upscaling->dlssgInputDisplaySizes[a_slot] : upscaling->dlssgInputRenderSizes[a_slot];
+	const auto size = sharedSR ?
+		(upscaling->nrAfterSR[a_slot] ? upscaling->fsrInputDisplaySizes[a_slot] : upscaling->fsrInputRenderSizes[a_slot]) :
+		(upscaling->nrAfterSR[a_slot] ? upscaling->dlssgInputDisplaySizes[a_slot] : upscaling->dlssgInputRenderSizes[a_slot]);
 	a_parameters = {};
 	a_parameters.inputWidth = a_parameters.outputWidth = a_parameters.guideWidth = static_cast<uint32_t>(size.x);
 	a_parameters.inputHeight = a_parameters.outputHeight = a_parameters.guideHeight = static_cast<uint32_t>(size.y);
@@ -1834,7 +1853,7 @@ bool Streamline::GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D1
 	a_parameters.options.skinStructureStrength = upscaling->settings.dlssNRSkinStructureStrength;
 	a_parameters.options.useAutoMask = upscaling->settings.dlssNRUseAutoMask != 0;
 	a_parameters.passCount = std::clamp(upscaling->settings.dlssNRPassCount, 1u, 3u);
-	a_parameters.outputFormat = upscaling->dlssD3D12ColorFormats[a_slot];
+	a_parameters.outputFormat = upscaling->dlssSharpenedD3D12[a_slot]->GetDesc().Format;
 	return directDLSSNR.NeedsFeaturePreparation(a_parameters);
 }
 

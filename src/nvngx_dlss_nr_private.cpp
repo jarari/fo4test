@@ -4,6 +4,7 @@
 #endif
 
 #include <algorithm>
+#include <dxgi1_6.h>
 #include <atomic>
 #include <cmath>
 #include <cwchar>
@@ -14,6 +15,56 @@
 
 namespace
 {
+	// Public NVAPI ABI: NVIDIA/nvapi nvapi.h and nvapi_interface.h.
+	// Query the physical GPU belonging to the render device's LUID. The NR
+	// snippet reports minimum requirements even for non-NVIDIA adapters.
+	uint32_t GetAdapterArchitecture(const LUID& luid)
+	{
+		struct ArchInfo { uint32_t version, architecture, implementation, revision; };
+		struct LogicalGPUData {
+			uint32_t version;
+			void* adapterId;
+			uint32_t physicalCount;
+			void* physical[64];
+			uint32_t reserved[8];
+		};
+		const auto module = LoadLibraryExW(L"nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+		if (!module) return 0;
+		const auto query = reinterpret_cast<void* (__cdecl*)(uint32_t)>(GetProcAddress(module, "nvapi_QueryInterface"));
+		uint32_t architecture = 0;
+		if (query) {
+			const auto init = reinterpret_cast<int (__cdecl*)()>(query(0x0150e828));
+			const auto unload = reinterpret_cast<int (__cdecl*)()>(query(0xd22bdd7e));
+			const auto enumerate = reinterpret_cast<int (__cdecl*)(void**, uint32_t*)>(query(0xe5ac921f));
+			const auto logical = reinterpret_cast<int (__cdecl*)(void*, void**)>(query(0xadd604d1));
+			const auto info = reinterpret_cast<int (__cdecl*)(void*, LogicalGPUData*)>(query(0x842b066e));
+			const auto arch = reinterpret_cast<int (__cdecl*)(void*, ArchInfo*)>(query(0xd8265d24));
+			if (init && unload && enumerate && logical && info && arch && init() == 0) {
+				void* handles[64]{};
+				uint32_t count = 0;
+				if (enumerate(handles, &count) == 0) {
+					for (uint32_t i = 0; i < std::min(count, 64u); ++i) {
+						void* logicalHandle = nullptr;
+						LUID candidate{};
+						LogicalGPUData data{};
+						data.version = sizeof(data) | (1u << 16);
+						data.adapterId = &candidate;
+						ArchInfo details{ sizeof(ArchInfo) | (2u << 16), 0, 0, 0 };
+						if (logical(handles[i], &logicalHandle) == 0 && info(logicalHandle, &data) == 0 &&
+							candidate.HighPart == luid.HighPart && candidate.LowPart == luid.LowPart &&
+							arch(handles[i], &details) == 0) {
+							architecture = details.architecture;
+							break;
+						}
+					}
+				}
+				unload();
+			}
+		}
+		FreeLibrary(module);
+		return architecture;
+	}
+
 	using PFun_GetModuleFileNameW = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
 
 	std::atomic<PFun_GetModuleFileNameW> g_originalGetModuleFileNameW = nullptr;
@@ -418,6 +469,15 @@ namespace nvngx::dlss_nr
 		}
 		initializationAttempted_ = true;
 
+		Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+		Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+		DXGI_ADAPTER_DESC adapterDesc{};
+		if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+			FAILED(factory->EnumAdapterByLuid(a_device->GetAdapterLuid(), IID_PPV_ARGS(&adapter))) ||
+			FAILED(adapter->GetDesc(&adapterDesc)) || adapterDesc.VendorId != 0x10DE) {
+			logger::info("[DLSS-NR Direct] Active render adapter is not a supported NVIDIA adapter");
+			return false;
+		}
 		device_ = a_device;
 		device_->AddRef();
 		if (!LoadRuntime() || !InstallModuleNameHook()) {
@@ -426,6 +486,37 @@ namespace nvngx::dlss_nr
 				FreeLibrary(runtime_);
 				runtime_ = nullptr;
 			}
+			device_->Release();
+			device_ = nullptr;
+			return false;
+		}
+
+
+		// The signed snippet validates its caller just like Init_Ext. Query only
+		// after installing the existing scoped caller-name shim, using the actual
+		// D3D12 adapter (not the primary display or DLSS-SR availability).
+		const auto query = reinterpret_cast<decltype(&NVSDK_NGX_D3D12_GetFeatureRequirements)>(
+			GetProcAddress(runtime_, "NVSDK_NGX_D3D12_GetFeatureRequirements"));
+		NVSDK_NGX_FeatureDiscoveryInfo info{};
+		info.SDKVersion = NVSDK_NGX_DLSSNR_SDKVersion;
+		info.FeatureID = NVSDK_NGX_Feature_DLSSNR;
+		info.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
+		info.Identifier.v.ApplicationId = NVSDK_NGX_DLSSNR_ApplicationId;
+		info.ApplicationDataPath = runtimeDirectory_.c_str();
+		NVSDK_NGX_FeatureRequirement requirements{};
+		const auto supportResult = query ?
+			query(adapter.Get(), &info, &requirements) : NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+		const auto architecture = GetAdapterArchitecture(adapterDesc.AdapterLuid);
+		supported_ = IsNGXSuccess(supportResult) && architecture != 0 &&
+			architecture >= requirements.MinHWArchitecture &&
+			requirements.FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported;
+		logger::info("[DLSS-NR Direct] Adapter support={} result=0x{:08X} reasons={} minimumArchitecture=0x{:X} actualArchitecture=0x{:X}",
+			supported_, static_cast<uint32_t>(supportResult), static_cast<uint32_t>(requirements.FeatureSupported),
+			requirements.MinHWArchitecture, architecture);
+		if (!supported_) {
+			RestoreModuleNameHook();
+			FreeLibrary(runtime_);
+			runtime_ = nullptr;
 			device_->Release();
 			device_ = nullptr;
 			return false;
@@ -1055,6 +1146,7 @@ namespace nvngx::dlss_nr
 			}
 		}
 		initialized_ = false;
+		supported_ = false;
 		{
 			std::scoped_lock lock(g_nrAllocationMutex);
 			if (g_nrAllocationOwner == this) {

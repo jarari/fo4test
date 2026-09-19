@@ -72,10 +72,18 @@ public:
 		kDisabled,  ///< No upscaling, native TAA
 		kFSR,       ///< AMD FidelityFX Super Resolution 3
 		kDLSS,      ///< NVIDIA Deep Learning Super Sampling
+		kXeSS,      ///< Intel XeSS Super Resolution (D3D12)
 		kSpatialFallback  ///< Local spatial fallback used while temporal SDK requests are retry-blocked
 	};
 
-	static constexpr bool kForceFSRFrameGenerationForTesting = false;
+	enum class FGProvider : uint { DLSSG, FSR, XeSS, Unavailable };
+	static bool IsSharedTemporalSR(UpscaleMethod method) { return method == UpscaleMethod::kFSR || method == UpscaleMethod::kXeSS; }
+	void SelectFGProviderAtStartup(bool dlssSupported);
+	FGProvider GetFGProvider() const { return activeFGProvider; }
+	uint GetStartupFGPreference() const { return startupFGPreference; }
+	void UseXeFGFallback();
+	void DisableFGProvider();
+	const char* GetFGProviderName() const;
 
 	/**
 	 * @struct Settings
@@ -86,6 +94,8 @@ public:
 		uint upscaleMethodPreference = (uint)UpscaleMethod::kDLSS; ///< Preferred upscaling method
 		uint qualityMode = 1;									   ///< Quality mode: 0=Native AA, 1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance
 		uint frameGenerationMode = 0;                              ///< DLSS-G mode: 0=Disabled, 1=On, 2=Auto, 3=Dynamic
+		uint frameGenerationProvider = 0;                          ///< Restart required: 0=DLSS-G, 1=FSR FG, 2=XeSS FG
+		uint xessGeneratedFrames = 0;                              ///< Index 0..6: 2x..8x, clamped to actual provider support
 		uint dlssgGeneratedFrames = 0;                              ///< MCM index: 0=one generated frame, up to runtime-supported max
 		uint dynamicMFGEnabled = 0;                                 ///< Enable DLSS-G Dynamic Multi Frame Generation when supported
 		uint dynamicMFGTargetFPS = 300;                              ///< Dynamic MFG target FPS; 0 lets Streamline auto-detect display refresh
@@ -109,6 +119,9 @@ public:
 	};
 
 	Settings settings;
+	FGProvider activeFGProvider = FGProvider::Unavailable;
+	uint startupFGPreference = 0;
+	bool fgProviderSelected = false;
 
 	/**
 	 * @brief Load settings from the persistent configuration file
@@ -136,9 +149,9 @@ public:
 	bool ShouldBlockFrameGeneration() const;
 	bool ShouldBlockTemporalFeatures() const;
 	bool ShouldUseFrameGeneration(bool a_checkMenu);
-	bool ShouldUseFSRFrameGeneration(bool a_checkMenu);
+	bool ShouldUseExternalFrameGeneration(bool a_checkMenu);
 	bool IsFrameGenerationActive() const { return frameGenerationActive; }
-	bool IsFSRFrameGenerationActive() const { return fsrFrameGenerationActive; }
+	bool IsExternalFrameGenerationActive() const { return externalFrameGenerationActive; }
 	bool WantsFrameGenerationInputsThisFrame() const { return frameGenerationInputsWanted; }
 	bool IsD3D12DLSSActive() const { return d3d12DLSSActive; }
 
@@ -178,8 +191,9 @@ public:
 	void CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_motionVectorTexture = nullptr, float2 a_renderSize = { 0.0f, 0.0f }, float2 a_displaySize = { 0.0f, 0.0f });
 	bool CaptureD3D12FSRInputs(int a_renderTargetIndex, ID3D11Texture2D* a_motionVectorTexture, float2 a_jitter, float2 a_renderSize, float2 a_displaySize);
 	bool EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
+	bool PrepareD3D12TemporalSR(uint32_t a_frameIndex);
 	bool EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
-	bool EvaluateFSRFrameGeneration(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
+	bool EvaluateExternalFrameGeneration(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
 	void TagDLSSGInputs(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
 	void OnD3D12TemporalSuspend();
 
@@ -406,7 +420,11 @@ public:
 	 * @brief Destroy upscaling-specific resources
 	 */
 	void DestroyUpscalingResources(bool a_preserveNativeNR = false, bool a_interopIdle = false);
-	bool IsDLSSNRReady() const { return settings.dlssNREnabled != 0 && !nrAwaitingPresent; }
+	bool IsNRSupported() const;
+	bool IsDLSSNRReady() const { return settings.dlssNREnabled != 0 && IsNRSupported() && !nrAwaitingPresent; }
+	bool CaptureRawSRGuides(UINT slot, float2 renderSize, float2 displaySize);
+	void CaptureNRGuides(UINT slot, float2 renderSize, float2 displaySize);
+	bool DispatchSharedTemporalSR(ID3D12GraphicsCommandList* commands, uint32_t slot, ID3D12Resource* color, ID3D12Resource* output);
 	void DeferNRUntilPresent(bool a_settingsChanged = true);
 	void OnNRPresentComplete(uint32_t a_slot);
 	bool nrAwaitingPresent = true;
@@ -470,7 +488,7 @@ public:
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> fsrOpaqueOnlyD3D12;
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> fsrReactiveMaskD3D12;
 	std::array<bool, kDX12FrameCount> dlssgInputsReady{};
-	std::array<bool, kDX12FrameCount> fsrFrameGenerationInputsReady{};
+	std::array<bool, kDX12FrameCount> externalFrameGenerationInputsReady{};
 	std::array<bool, kDX12FrameCount> fsrD3D12InputsReady{};
 	std::array<uint32_t, kDX12FrameCount> dlssgInputFrameTokenIndices{};
 	std::array<bool, kDX12FrameCount> dlssD3D12InputsReady{};
@@ -481,8 +499,8 @@ public:
 	std::array<DXGI_FORMAT, kDX12FrameCount> dlssD3D12DepthFormats{};
 	std::array<float2, kDX12FrameCount> dlssgInputRenderSizes{};
 	std::array<float2, kDX12FrameCount> dlssgInputDisplaySizes{};
-	std::array<DXGI_FORMAT, kDX12FrameCount> fsrFrameGenerationColorFormats{};
-	std::array<uint64_t, kDX12FrameCount> fsrFrameGenerationFrameIDs{};
+	std::array<DXGI_FORMAT, kDX12FrameCount> externalFrameGenerationColorFormats{};
+	std::array<uint64_t, kDX12FrameCount> externalFrameGenerationFrameIDs{};
 	std::array<float2, kDX12FrameCount> fsrInputJitters{};
 	std::array<float2, kDX12FrameCount> fsrInputRenderSizes{};
 	std::array<float2, kDX12FrameCount> fsrInputDisplaySizes{};
@@ -505,7 +523,7 @@ public:
 	uint32_t dlssgStableGameplayFrames = 0;
 	bool temporalFeaturesBlocked = false;
 	bool frameGenerationActive = false;
-	bool fsrFrameGenerationActive = false;
+	bool externalFrameGenerationActive = false;
 	bool frameGenerationInputsWanted = false;
 	bool d3d12DLSSActive = false;
 

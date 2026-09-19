@@ -3,6 +3,7 @@
 #define NV_WINDOWS
 
 #include <utility>
+#include <functional>
 #include <d3d12.h>
 
 #pragma warning(push)
@@ -37,6 +38,11 @@ using PFun_slSetTag2 = sl::Result(const sl::ViewportHandle& viewport, const sl::
 class Streamline
 {
 public:
+	bool IsNRSupported(bool afterSR = false) const
+	{
+		return UsesD3D12() && (directDLSSNR.IsSupported() || (!afterSR && featureDLSSNR && slDLSSNRSetOptions));
+	}
+	bool ValidateConstantsForFrame(sl::FrameToken* a_frameToken);
 	bool GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters) const;
 	bool PrepareD3D12DLSSNR(ID3D12GraphicsCommandList* a_list, const nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters);
 	// ========================================
@@ -135,7 +141,7 @@ public:
 	// DLSS Operations
 	// ========================================
 
-	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened);
+	bool UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened, const std::function<bool(ID3D12Resource*, ID3D12Resource*)>& a_evaluateSR = {});
 
 	/**
 	 * @brief Update Streamline constants for current frame
@@ -298,7 +304,6 @@ private:
 	bool EnsureD3D12DLSSNROptions(const sl::DLSSNROptions& a_options);
 	void PrepareDirectDLSSNR();
 	bool EnsureNISOptions(float a_sharpness, std::string_view a_logContext);
-	bool ValidateConstantsForFrame(sl::FrameToken* a_frameToken);
 	void ResetOptionCaches();
 	void SetPCLMarker(sl::PCLMarker a_marker, sl::FrameToken* a_frameToken = nullptr);
 	bool DisableDLSSGNow();

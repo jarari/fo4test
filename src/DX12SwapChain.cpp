@@ -1,3 +1,4 @@
+#include "XeSS.h"
 #include "DX12SwapChain.h"
 #ifdef UPSCALING_NR_CAPTURE
 #include "NRDiagnosticCapture.h"
@@ -708,6 +709,19 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		SwapChainCreationObserver::Scope observation(hwnd);
 		const auto requestedFormat = swapChainDesc.Format;
 		if (!swapChain) {
+			if (Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::XeSS) {
+				auto factory = WithoutStreamlineProxy(Streamline::GetSingleton(), a_dxgiFactory);
+				auto queue = WithoutStreamlineProxy(Streamline::GetSingleton(), commandQueue.get());
+				auto xeDesc = swapChainDesc;
+				xeDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+				if (XeSS::GetSingleton()->CreateSwapChain(d3d12Device.get(), factory.get(), queue.get(),
+						hwnd, xeDesc, swapChain.put())) {
+					swapChainDesc = xeDesc;
+					applicationFrameLatencyWaitable = false;
+				} else {
+					Upscaling::GetSingleton()->DisableFGProvider();
+				}
+			}
 			if (fidelityFXFrameGenerationSwapChainAllowed) {
 				DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreenDesc{};
 				fullscreenDesc.RefreshRate = a_swapChainDesc.BufferDesc.RefreshRate;
@@ -742,23 +756,31 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 						fidelityFXSwapChain->Release();
 					}
 					fidelityFXFrameGenerationSwapChainAllowed = false;
+					Upscaling::GetSingleton()->DisableFGProvider();
 					logger::warn("[DX12SwapChain] FidelityFX frame generation swapchain creation failed; falling back to a regular D3D12 swapchain");
 				}
 			}
 
 			if (!swapChain) {
 				winrt::com_ptr<IDXGISwapChain1> swapChain1;
-				DX::ThrowIfFailed(upgradedFactory->CreateSwapChainForHwnd(commandQueue.get(), a_swapChainDesc.OutputWindow, &swapChainDesc, nullptr, nullptr, swapChain1.put()));
+				if (Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::DLSSG) {
+					DX::ThrowIfFailed(upgradedFactory->CreateSwapChainForHwnd(commandQueue.get(), a_swapChainDesc.OutputWindow, &swapChainDesc, nullptr, nullptr, swapChain1.put()));
+				} else {
+					auto factory = WithoutStreamlineProxy(Streamline::GetSingleton(), a_dxgiFactory);
+					auto queue = WithoutStreamlineProxy(Streamline::GetSingleton(), commandQueue.get());
+					DX::ThrowIfFailed(factory->CreateSwapChainForHwnd(queue.get(), hwnd, &swapChainDesc, nullptr, nullptr, swapChain1.put()));
+				}
 				DX::ThrowIfFailed(swapChain1->QueryInterface(IID_PPV_ARGS(swapChain.put())));
 			}
 		}
 
-		const bool fidelityFXOwnsPresent = FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive();
-		logger::info("[DX12SwapChain] Swapchain presentation owner={} swapchain={}", fidelityFXOwnsPresent ? "FidelityFX (no Streamline swapchain wrapper)" : "Streamline", static_cast<void*>(swapChain.get()));
+		const bool externalOwner = FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive() || XeSS::GetSingleton()->OwnsSwapChain() ||
+			Upscaling::GetSingleton()->GetFGProvider() != Upscaling::FGProvider::DLSSG;
+		logger::info("[DX12SwapChain] Swapchain presentation owner={} swapchain={}", Upscaling::GetSingleton()->GetFGProviderName(), static_cast<void*>(swapChain.get()));
 		LogStreamlineProxy(a_streamline, "dxgiFactory", a_dxgiFactory);
-		LogStreamlineProxy(a_streamline, "factoryForSwapChain", fidelityFXOwnsPresent ? a_dxgiFactory : upgradedFactory.get());
+		LogStreamlineProxy(a_streamline, "factoryForSwapChain", externalOwner ? a_dxgiFactory : upgradedFactory.get());
 		auto swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain", swapChain.get());
-		if (!fidelityFXOwnsPresent && !swapChainIsStreamlineProxy && a_streamline && a_streamline->slUpgradeInterface) {
+		if (!externalOwner && !swapChainIsStreamlineProxy && a_streamline && a_streamline->slUpgradeInterface) {
 			IDXGISwapChain* upgradedSwapChain = swapChain.get();
 			if (SL_FAILED(result, a_streamline->slUpgradeInterface(reinterpret_cast<void**>(&upgradedSwapChain)))) {
 				logger::warn("[DX12SwapChain] Could not upgrade swapchain for Streamline: {}", magic_enum::enum_name(result));
@@ -772,7 +794,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 				swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain.afterUpgrade", swapChain.get());
 			}
 		}
-		if (!fidelityFXOwnsPresent && !swapChainIsStreamlineProxy) {
+		if (!externalOwner && !swapChainIsStreamlineProxy) {
 			logger::warn("[DX12SwapChain] D3D12 swapchain is not a Streamline proxy; DLSS-G Present interception may not run on this swapchain");
 		}
 		DXGI_SWAP_CHAIN_DESC1 actual{};
@@ -803,9 +825,10 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		logger::info("[DX12SwapChain] Creation validation attempt={} requested={} application={} output={} observedByReShade={}",
 			attempt + 1, static_cast<uint32_t>(requestedFormat), static_cast<uint32_t>(applicationFormat),
 			static_cast<uint32_t>(actual.Format), observed.has_value());
-		const bool switchToFidelityFX = actual.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
-			a_streamline && !a_streamline->dlssgBlockedByFP16Output;
-		if (requestedFormat == actual.Format && applicationFormat == actual.Format && !switchToFidelityFX) {
+		const bool switchToXeFG = actual.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+			a_streamline && !a_streamline->dlssgBlockedByFP16Output &&
+			Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::DLSSG;
+		if (requestedFormat == actual.Format && applicationFormat == actual.Format && !switchToXeFG) {
 			break;
 		}
 		// No Present or application work has used this chain yet. Destroy the FSR
@@ -815,14 +838,15 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		}
 		auto* discardedChain = swapChain.detach();
 		const auto remainingReferences = discardedChain->Release();
-		if (switchToFidelityFX) {
+		if (XeSS::GetSingleton()->OwnsSwapChain() && !XeSS::GetSingleton()->DestroyFG()) DX::ThrowIfFailed(E_FAIL);
+		if (switchToXeFG) {
 			// Destroy the SL-owned chain while its Destroyed hook is still installed.
 			// Only then remove DLSS-G hooks, before the next factory call. This is
 			// initialization, with no application Present/FG work in flight.
 			if (streamlinePacing) {
 				if (remainingReferences != 0 || !a_streamline->slSetFeatureLoaded ||
 					a_streamline->slSetFeatureLoaded(sl::kFeatureDLSS_G, false) != sl::Result::eOk) {
-					logger::error("[DX12SwapChain] Cannot safely disable DLSS-G hooks for FP16 FidelityFX fallback");
+					logger::error("[DX12SwapChain] Cannot safely disable DLSS-G hooks for FP16 XeSS fallback");
 					DX::ThrowIfFailed(DXGI_ERROR_UNSUPPORTED);
 				}
 			}
@@ -831,8 +855,9 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 			a_streamline->dlssgActive = false;
 			streamlinePacing = false;
 			applicationFrameLatencyWaitable = true;
-			fidelityFXFrameGenerationSwapChainAllowed = true;
-			logger::info("[DX12SwapChain] R16G16B16A16_FLOAT output (format=10): DLSS FG unavailable; recreating with FidelityFX FG instead. DLSS SR and Reflex remain available.");
+			fidelityFXFrameGenerationSwapChainAllowed = false;
+			Upscaling::GetSingleton()->UseXeFGFallback();
+			logger::info("[DX12SwapChain] FP16 output: recreating with XeSS FG instead of DLSS-G.");
 		}
 		if (attempt == 2 || actual.Format == DXGI_FORMAT_UNKNOWN) {
 			logger::error("[DX12SwapChain] Output format did not converge; refusing incompatible interop buffers");
@@ -846,7 +871,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		swapChainDesc = actual;
 		swapChainDesc.BufferCount = applicationBufferCount;
 		swapChainDesc.Flags = applicationFlags;
-		if (switchToFidelityFX) {
+		if (switchToXeFG) {
 			swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 		}
 		logger::info("[DX12SwapChain] Recreating through SDK with negotiated format={}", static_cast<uint32_t>(swapChainDesc.Format));
@@ -866,7 +891,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 
 	logger::info(
 		"[DX12SwapChain] Created D3D12 {} swapchain {}x{} format={} buffers={} flags={} desktopRefreshHz={:.3f}",
-		FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive() ? "FidelityFX" : "Streamline",
+		Upscaling::GetSingleton()->GetFGProviderName(),
 		swapChainDesc.Width,
 		swapChainDesc.Height,
 		static_cast<uint32_t>(swapChainDesc.Format),
@@ -934,6 +959,8 @@ void DX12SwapChain::SuspendTemporalFeatures(const char* a_reason)
 	}
 	streamline->ApplyPendingDLSSGDisable();
 	streamline->SuspendDLSSNR();
+	XeSS::GetSingleton()->DisableFG();
+	XeSS::GetSingleton()->RequestReset();
 	Upscaling::GetSingleton()->OnD3D12TemporalSuspend();
 	presentOverrideFinalColor = nullptr;
 	for (auto& context : commandContexts) {
@@ -1463,7 +1490,7 @@ void DX12SwapChain::PaceFrameStart(uint32_t frame)
 	}
 	const auto* streamline = Streamline::GetSingleton();
 	const auto multiplier = streamline->dlssgActive ? streamline->GetDLSSGPacingMultiplier() :
-		(FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u);
+		(XeSS::GetSingleton()->FGEnabled() ? XeSS::GetSingleton()->PacingMultiplier() : (FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u));
 	// Main::OnIdle is the pre-input entry; Renderer::Begin handles standalone
 	// loading/movie draws. The same frame reaching both must only wait once.
 	// UpdateDLSSG already passes the user's output target to Dynamic MFG.
@@ -1481,7 +1508,7 @@ void DX12SwapChain::WaitForFrameStart()
 		return;
 	}
 	const auto* upscaling = Upscaling::GetSingleton();
-	if (upscaling->IsFrameGenerationActive() || upscaling->IsFSRFrameGenerationActive() ||
+	if (upscaling->IsFrameGenerationActive() || upscaling->IsExternalFrameGenerationActive() ||
 		FidelityFX::GetSingleton()->IsFrameGenerationEnabled() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety()) {
 		return;
 	}
@@ -1521,7 +1548,7 @@ bool DX12SwapChain::FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext
 	presentSlotFenceValues[a_frameIndex] = signalValue;
 	const auto* upscaling = Upscaling::GetSingleton();
 	if (inputsUsedAtPresent[a_frameIndex] || upscaling->IsFrameGenerationActive() ||
-		upscaling->IsFSRFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety()) {
+		upscaling->IsExternalFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety()) {
 		inputReuseFenceValues[a_frameIndex] = signalValue;
 	}
 	if (a_context) {
@@ -2186,9 +2213,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (upscaling->IsFrameGenerationActive() || dlssgPresentSafety) {
 		upscaling->TagDLSSGInputs(commandList, presentedFrameIndex);
 	}
+	if (!upscaling->IsExternalFrameGenerationActive()) XeSS::GetSingleton()->DisableFG();
 	auto fidelityFX = FidelityFX::GetSingleton();
 	if (fidelityFX->IsFrameGenerationEnabled() &&
-		!upscaling->IsFSRFrameGenerationActive()) {
+		!upscaling->IsExternalFrameGenerationActive()) {
 		const auto desc = destination->GetDesc();
 		const auto displaySize = float2(static_cast<float>(desc.Width), static_cast<float>(desc.Height));
 		fidelityFX->DisableFrameGeneration(
@@ -2245,7 +2273,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	// Diagnostic only: pacing happens before simulation/input, never here.
 	const auto pacingMultiplier = streamline->dlssgActive ? streamline->GetDLSSGPacingMultiplier() :
-		(FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u);
+		(XeSS::GetSingleton()->FGEnabled() ? XeSS::GetSingleton()->PacingMultiplier() : (FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u));
 	const bool sdkDynamicPacing = streamline->UsesDynamicDLSSGPacing();
 	static uint32_t loggedMode = UINT32_MAX, loggedCap = UINT32_MAX, loggedMultiplier = 0, loggedSync = UINT32_MAX;
 	static bool loggedDynamicPacing = false;
@@ -2268,7 +2296,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	const auto depthPresentFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount);
 	ReShadeDepth::PublishPresent(presentedFrameIndex, depthPresentFrame, destination);
+	XeSS::GetSingleton()->BeforePresent();
 	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
+	XeSS::GetSingleton()->AfterPresent(result);
 	if (result != S_OK) { presentPacing.Reset(); }
 	if (emitPresentMarkers) {
 		streamline->OnPresentEnd(result, false);
@@ -2354,7 +2384,7 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 		return result;
 	}
 
-	if (a_evaluateFSRFrameGeneration && !EnsureFidelityFXFrameGenerationSwapChain()) {
+	if (a_evaluateFSRFrameGeneration && !EnsureExternalFrameGenerationSwapChain()) {
 		a_evaluateFSRFrameGeneration = false;
 	}
 
@@ -2362,10 +2392,11 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 		return result;
 	}
 
+	if (a_evaluateFSR && !Upscaling::GetSingleton()->PrepareD3D12TemporalSR(frameIndex)) return result;
 	const auto evaluationFrameIndex = frameIndex;
 	nvngx::dlss_nr::D3D12EvaluationParameters nrPreparation{};
 	auto* streamline = Streamline::GetSingleton();
-	if (a_evaluateDLSS && streamline->GetD3D12DLSSNRPreparation(evaluationFrameIndex, nrPreparation)) {
+	if ((a_evaluateDLSS || a_evaluateFSR) && streamline->GetD3D12DLSSNRPreparation(evaluationFrameIndex, nrPreparation)) {
 		// Lifecycle work precedes this frame's input-ready queue wait. Flush
 		// D3D11 explicitly before the exceptional CPU drain, then submit NGX
 		// creation separately from NR/SR evaluation. Normal frames never drain.
@@ -2400,17 +2431,14 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 
 	result = EvaluateD3D12WorkOnCommandList(commandList, evaluationFrameIndex, a_evaluateDLSS, a_evaluateFSR, a_evaluateFSRFrameGeneration);
 
-	if (!result.Any()) {
-		DX::ThrowIfFailed(commandList->Close());
-		return result;
-	}
-
+	// An unsuccessful SDK call may already have recorded copies/dispatches.
+	// Submit and retire this list even on failure before shared inputs are reused.
 	ExecuteCommandContext(commandContext);
 	const auto signalValue = commandContext.fenceValue;
 	frameSlotFenceValues[evaluationFrameIndex] = signalValue;
 	inputReuseFenceValues[evaluationFrameIndex] = signalValue;
 	inputsUsedAtPresent[evaluationFrameIndex] = upscaling->IsFrameGenerationActive() ||
-		upscaling->IsFSRFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety();
+		upscaling->IsExternalFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety();
 
 	if (a_waitForD3D11Consumption) {
 		DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), signalValue));
@@ -2436,7 +2464,7 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkOnCommandLi
 	const bool upscalerRequested = a_evaluateFSR || a_evaluateDLSS;
 	const bool upscalerSucceeded = (!a_evaluateFSR || result.fsr) && (!a_evaluateDLSS || result.dlss);
 	if (a_evaluateFSRFrameGeneration && (!upscalerRequested || upscalerSucceeded)) {
-		result.fsrFrameGeneration = upscaling->EvaluateFSRFrameGeneration(a_commandList, a_frameIndex);
+		result.externalFrameGeneration = upscaling->EvaluateExternalFrameGeneration(a_commandList, a_frameIndex);
 	}
 
 	return result;
@@ -2452,9 +2480,9 @@ bool DX12SwapChain::EvaluateD3D12FSRForCurrentFrame()
 	return EvaluateD3D12WorkForCurrentFrame(false, true, false).fsr;
 }
 
-bool DX12SwapChain::EvaluateFSRFrameGenerationForCurrentFrame()
+bool DX12SwapChain::EvaluateExternalFrameGenerationForCurrentFrame()
 {
-	return EvaluateD3D12WorkForCurrentFrame(false, false, true).fsrFrameGeneration;
+	return EvaluateD3D12WorkForCurrentFrame(false, false, true).externalFrameGeneration;
 }
 
 void DX12SwapChain::SetPresentOverride(ID3D12Resource* a_finalColor)
@@ -2462,8 +2490,9 @@ void DX12SwapChain::SetPresentOverride(ID3D12Resource* a_finalColor)
 	presentOverrideFinalColor.copy_from(a_finalColor);
 }
 
-bool DX12SwapChain::EnsureFidelityFXFrameGenerationSwapChain()
+bool DX12SwapChain::EnsureExternalFrameGenerationSwapChain()
 {
+	if (Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::XeSS) return XeSS::GetSingleton()->OwnsSwapChain();
 	if (!IsReady() || !fidelityFXFrameGenerationSwapChainAllowed) {
 		return false;
 	}
