@@ -502,6 +502,15 @@ namespace
 			osdModes,
 			"Shows D3D12 swapchain and upscaler status while DLSS or FSR is active.");
 
+		ImGuiMCP::SeparatorText("Misc");
+		changed |= SliderIntSetting(
+			"Extra VRAM Budget",
+			settings.extraVRAMBudgetMB,
+			0,
+			2048,
+			"%d MiB",
+			"Reserves additional VRAM by reducing the engine's mipmap upgrade budget. The automatic reserve is unchanged; at least half of the original engine budget is always retained.");
+
 		g_dirty |= changed;
 	}
 }

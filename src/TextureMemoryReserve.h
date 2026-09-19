@@ -8,6 +8,7 @@ namespace TextureMemoryReserve
 	inline constexpr std::uint64_t MiB = 1024ull * 1024ull;
 
 	inline constexpr std::uint64_t MaxReserve = 2048 * MiB;
+	inline constexpr std::uint64_t MaxExtraReserve = 2048 * MiB;
 	enum class SR { None, DLSS, FSR };
 	enum class FG { None, DLSS, FSR };
 	struct Configuration
@@ -78,9 +79,9 @@ namespace TextureMemoryReserve
 		return e;
 	}
 
-	constexpr std::uint64_t UpgradeLimit(std::uint64_t original, std::uint64_t reserve)
+	constexpr std::uint64_t UpgradeLimit(std::uint64_t original, std::uint64_t reserve, std::uint64_t extraReserve = 0)
 	{
 		// Keep at least half of the original budget for engine textures.
-		return original - std::min({ reserve, MaxReserve, original / 2 });
+		return original - std::min(std::min(reserve, MaxReserve) + std::min(extraReserve, MaxExtraReserve), original / 2);
 	}
 }

@@ -698,7 +698,8 @@ namespace
 		config.sharpen = settings.sharpness > 0.0f;
 		config.reshadeDepth = ReShadeDepth::IsActive();
 		const auto estimate = TextureMemoryReserve::Calculate(config);
-		const auto reserve = estimate.reserve;
+		const auto extraReserve = std::min(settings.extraVRAMBudgetMB, 2048u) * TextureMemoryReserve::MiB;
+		const auto reserve = estimate.reserve + extraReserve;
 		static uint64_t pendingDecrease = 0, pendingSince = 0;
 		if (reserve >= g_textureMemoryRequestedReserve) pendingDecrease = 0;
 		auto* limit = GetTextureMemoryUpgradeLimit();
@@ -723,17 +724,19 @@ namespace
 		pendingDecrease = 0;
 		// Recompute from the unmodified engine limit, never subtract twice.
 		const auto originalLimit = g_textureMemoryOriginalLimit;
-		const auto reservedLimit = TextureMemoryReserve::UpgradeLimit(originalLimit, reserve);
+		const auto reservedLimit = TextureMemoryReserve::UpgradeLimit(originalLimit, estimate.reserve, extraReserve);
 
 		*limit = reservedLimit;
 		g_textureMemoryReserveApplied = true;
 		g_textureMemoryRequestedReserve = reserve;
 		logger::info(
-			"[Upscaling] Texture memory upgrade limit {} -> {} MiB; output={}x{} render={}x{} format={} reserve={} MiB applied={} MiB; estimates resident/SR/FG/NR/UI/depth={}/{}/{}/{}/{}/{} MiB (cap=2048)",
+			"[Upscaling] Texture memory upgrade limit {} -> {} MiB; output={}x{} render={}x{} format={} reserve={} MiB (automatic={} extra={}) applied={} MiB; estimates resident/SR/FG/NR/UI/depth={}/{}/{}/{}/{}/{} MiB (automatic cap=2048)",
 			originalLimit / (1024ull * 1024ull),
 			reservedLimit / (1024ull * 1024ull),
 			desc.Width, desc.Height, config.renderWidth, config.renderHeight, static_cast<uint32_t>(desc.Format),
 			reserve / TextureMemoryReserve::MiB,
+			estimate.reserve / TextureMemoryReserve::MiB,
+			extraReserve / TextureMemoryReserve::MiB,
 			(originalLimit - reservedLimit) / TextureMemoryReserve::MiB,
 			estimate.resident / TextureMemoryReserve::MiB, estimate.sr / TextureMemoryReserve::MiB,
 			estimate.fg / TextureMemoryReserve::MiB, estimate.nr / TextureMemoryReserve::MiB,
@@ -1963,6 +1966,7 @@ void Upscaling::LoadSettings()
 	settings.dlssNRLocalStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalStructureStrength", 1.0)), 0.0f, 2.0f);
 	settings.dlssNRSkinStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fSkinStructureStrength", 1.0)), -1.0f, 2.0f);
 	settings.osdMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iOnScreenDisplay", 0), 0, 2));
+	settings.extraVRAMBudgetMB = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Misc", "iExtraVRAMBudgetMB", 0), 0, 2048));
 	const auto legacySharpness = ini.GetDoubleValue("Settings", "fRCASSharpness", 0.2);
 	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", legacySharpness)), 0.0f, 1.0f);
 
@@ -2040,6 +2044,7 @@ bool Upscaling::SaveSettings(const Settings& a_settings)
 	ini.SetLongValue("Settings", "iReflexMode", static_cast<long>(a_settings.reflexMode));
 	ini.SetLongValue("Settings", "iDLSSModelPreset", static_cast<long>(a_settings.dlssModelPreset));
 	ini.SetLongValue("Settings", "iOnScreenDisplay", static_cast<long>(a_settings.osdMode));
+	ini.SetLongValue("Misc", "iExtraVRAMBudgetMB", static_cast<long>(std::min(a_settings.extraVRAMBudgetMB, 2048u)));
 	ini.Delete("Settings", "bENBGPUTiming");
 	ini.Delete("Settings", "bImageSpaceEffectLog");
 	ini.Delete("Settings", "bTaggedTextureDebug");

@@ -100,6 +100,7 @@ public:
 		uint dlssNRStyle = 0;                                       ///< DLSS-NR style: 0=Natural, 1=Cinematic
 		uint dlssNRUseAutoMask = 0;                                 ///< Ask DLSS-NR to generate its control mask
 		uint osdMode = 0;                                           ///< Debug OSD: 0=Off, 1=Compact, 2=Detailed
+		uint extraVRAMBudgetMB = 0;                                 ///< Additional MiB withheld from the engine mipmap upgrade limit
 		float sharpness = 0.2f;                                       ///< Upscaler sharpness: 0.0=off, 1.0=max
 		float dlssNRIntensity = 1.0f;
 		float dlssNRLocalToneStrength = 1.0f;
