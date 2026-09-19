@@ -3174,6 +3174,11 @@ void Upscaling::UseXeFGFallback()
 	activeFGProvider = FGProvider::XeSS;
 	logger::info("[Frame Generation] DLSS-G unavailable; selecting XeSS FG (restart-only provider)");
 }
+void Upscaling::UseFSRFGFallback()
+{
+	activeFGProvider = FGProvider::FSR;
+	logger::info("[Frame Generation] FP16/scRGB output; selecting FSR FG for this session");
+}
 void Upscaling::DisableFGProvider()
 {
 	activeFGProvider = FGProvider::Unavailable;

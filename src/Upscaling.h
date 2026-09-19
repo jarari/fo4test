@@ -82,6 +82,7 @@ public:
 	FGProvider GetFGProvider() const { return activeFGProvider; }
 	uint GetStartupFGPreference() const { return startupFGPreference; }
 	void UseXeFGFallback();
+	void UseFSRFGFallback();
 	void DisableFGProvider();
 	const char* GetFGProviderName() const;
 

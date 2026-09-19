@@ -128,7 +128,7 @@ bool XeSS::CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12C
     // SDK 3.0.2 supports SDR and HDR10, not FP16/scRGB. Do not silently
     // truncate RenoDX output or advertise a non-functional FG provider.
     if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        failureReason = "XeSS FG does not support FP16/scRGB output. Select FSR FG and restart.";
+        failureReason = "XeSS FG does not support FP16/scRGB output.";
         logger::warn("[XeSS FG] {}", failureReason);
         return false;
     }

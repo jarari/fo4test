@@ -1,5 +1,6 @@
 #include "XeSS.h"
 #include "UpscalingMenu.h"
+#include "DX12SwapChain.h"
 #ifdef UPSCALING_NR_CAPTURE
 #include "NRDiagnosticCapture.h"
 #endif
@@ -383,12 +384,14 @@ namespace
 		ImGuiMCP::SeparatorText("Frame Generation");
 		static constexpr std::array fgProviders{ "DLSS-G", "FSR FG", "XeSS FG" };
 		changed |= ComboSetting("FG Provider (restart required)", settings.frameGenerationProvider, fgProviders,
-			"Applied on game restart. DLSS-G falls back to XeSS FG when unsupported. If XeSS FG is also unavailable, FG is disabled. No automatic FSR selection.");
+			"Applied on game restart. DLSS-G falls back to XeSS FG when unsupported; FP16/scRGB output automatically uses FSR FG for this session.");
 		ImGuiMCP::TextDisabled("Active FG provider: %s", Upscaling::GetSingleton()->GetFGProviderName());
 		if (settings.frameGenerationProvider != Upscaling::GetSingleton()->GetStartupFGPreference())
 			ImGuiMCP::TextWrapped("Restart the game to apply the selected FG provider.");
-		if (streamline->dlssgBlockedByFP16Output)
-			ImGuiMCP::TextWrapped("DLSS-G and XeSS FG do not support FP16/scRGB output. Select FSR FG and restart. DLSS SR remains available.");
+		if (Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::FSR &&
+			Upscaling::GetSingleton()->GetStartupFGPreference() != static_cast<uint>(Upscaling::FGProvider::FSR) &&
+			DX12SwapChain::GetSingleton()->swapChainDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+			ImGuiMCP::TextWrapped("FP16/scRGB output uses FSR FG instead of DLSS-G or XeSS FG. DLSS SR remains available.");
 		if (const auto* reason = XeSS::GetSingleton()->FailureReason()) ImGuiMCP::TextWrapped("%s", reason);
 		const bool upscalingDisabled = settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDisabled);
 		ImGuiMCP::BeginDisabled(upscalingDisabled);

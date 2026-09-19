@@ -702,6 +702,34 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 	if (fidelityFXFrameGenerationSwapChainAllowed) {
 		logger::info("[DX12SwapChain] FidelityFX frame generation swapchain will be created during swapchain initialization");
 	}
+	auto useFidelityFXForFP16 = [&](ULONG a_remainingReferences) {
+		const bool wasDLSSG = Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::DLSSG;
+		if (wasDLSSG && a_streamline) {
+			// Remove DLSS-G's Present hooks before creating the FSR-owned chain.
+			// At this point no application Present has run on the discarded chain.
+			if (streamlinePacing &&
+				(a_remainingReferences != 0 || !a_streamline->slSetFeatureLoaded ||
+					a_streamline->slSetFeatureLoaded(sl::kFeatureDLSS_G, false) != sl::Result::eOk)) {
+				logger::error("[DX12SwapChain] Cannot safely disable DLSS-G hooks for FP16 FSR fallback");
+				DX::ThrowIfFailed(DXGI_ERROR_UNSUPPORTED);
+			}
+			a_streamline->dlssgBlockedByFP16Output = true;
+			a_streamline->featureDLSSG = false;
+			a_streamline->dlssgActive = false;
+		}
+		streamlinePacing = false;
+		applicationFrameLatencyWaitable = true;
+		fidelityFXFrameGenerationSwapChainAllowed = true;
+		swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+		Upscaling::GetSingleton()->UseFSRFGFallback();
+	};
+	// The requested format may already be FP16 (without an interception retry).
+	// Select the compatible owner before the first SDK swapchain creation.
+	if (swapChainDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+		(Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::DLSSG ||
+			Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::XeSS)) {
+		useFidelityFXForFP16(0);
+	}
 
 	// Negotiate before exposing any game-facing buffers/views. Every retry must
 	// re-enter the same SDK creation path, not just wrap an already-created chain.
@@ -825,10 +853,10 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		logger::info("[DX12SwapChain] Creation validation attempt={} requested={} application={} output={} observedByReShade={}",
 			attempt + 1, static_cast<uint32_t>(requestedFormat), static_cast<uint32_t>(applicationFormat),
 			static_cast<uint32_t>(actual.Format), observed.has_value());
-		const bool switchToXeFG = actual.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
-			a_streamline && !a_streamline->dlssgBlockedByFP16Output &&
-			Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::DLSSG;
-		if (requestedFormat == actual.Format && applicationFormat == actual.Format && !switchToXeFG) {
+		const bool switchToFSRFG = actual.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+			(Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::DLSSG ||
+				Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::XeSS);
+		if (requestedFormat == actual.Format && applicationFormat == actual.Format && !switchToFSRFG) {
 			break;
 		}
 		// No Present or application work has used this chain yet. Destroy the FSR
@@ -839,25 +867,9 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		auto* discardedChain = swapChain.detach();
 		const auto remainingReferences = discardedChain->Release();
 		if (XeSS::GetSingleton()->OwnsSwapChain() && !XeSS::GetSingleton()->DestroyFG()) DX::ThrowIfFailed(E_FAIL);
-		if (switchToXeFG) {
-			// Destroy the SL-owned chain while its Destroyed hook is still installed.
-			// Only then remove DLSS-G hooks, before the next factory call. This is
-			// initialization, with no application Present/FG work in flight.
-			if (streamlinePacing) {
-				if (remainingReferences != 0 || !a_streamline->slSetFeatureLoaded ||
-					a_streamline->slSetFeatureLoaded(sl::kFeatureDLSS_G, false) != sl::Result::eOk) {
-					logger::error("[DX12SwapChain] Cannot safely disable DLSS-G hooks for FP16 XeSS fallback");
-					DX::ThrowIfFailed(DXGI_ERROR_UNSUPPORTED);
-				}
-			}
-			a_streamline->dlssgBlockedByFP16Output = true;
-			a_streamline->featureDLSSG = false;
-			a_streamline->dlssgActive = false;
-			streamlinePacing = false;
-			applicationFrameLatencyWaitable = true;
-			fidelityFXFrameGenerationSwapChainAllowed = false;
-			Upscaling::GetSingleton()->UseXeFGFallback();
-			logger::info("[DX12SwapChain] FP16 output: recreating with XeSS FG instead of DLSS-G.");
+		if (switchToFSRFG) {
+			useFidelityFXForFP16(remainingReferences);
+			logger::info("[DX12SwapChain] FP16 output: recreating with FidelityFX FG swapchain.");
 		}
 		if (attempt == 2 || actual.Format == DXGI_FORMAT_UNKNOWN) {
 			logger::error("[DX12SwapChain] Output format did not converge; refusing incompatible interop buffers");
@@ -871,9 +883,7 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		swapChainDesc = actual;
 		swapChainDesc.BufferCount = applicationBufferCount;
 		swapChainDesc.Flags = applicationFlags;
-		if (switchToXeFG) {
-			swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-		}
+		if (switchToFSRFG) swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 		logger::info("[DX12SwapChain] Recreating through SDK with negotiated format={}", static_cast<uint32_t>(swapChainDesc.Format));
 	}
 	ConfigureFrameLatency();
