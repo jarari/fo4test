@@ -22,6 +22,10 @@
 #include "Buffer.h"
 
 #include <limits>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <mutex>
 #include <filesystem>
 #include <string_view>
 
@@ -180,6 +184,7 @@ public:
 	void ApplyPendingDLSSGDisable();
 	bool NeedsDLSSGPresentSafety() const;
 	bool NeedsPresentMarkers() const { return featurePCL && slPCLSetMarker && (presentFrameToken || frameToken); }
+	bool HasRenderMarkerForFrame(uint32_t a_frame) const { return renderMarkerFrame.load(std::memory_order_acquire) == a_frame; }
 	void OnDLSSGPresentComplete();
 	uint32_t GetCurrentFrameTokenIndex() const { return currentFrameTokenIndex; }
 	sl::FrameToken* GetFrameTokenForFrame(uint32_t a_frameIndex);
@@ -200,8 +205,9 @@ public:
 	void OnPresentEnd(HRESULT a_result, bool a_queryState = true);
 	void QueryDLSSGState();
 	sl::ReflexMode GetCurrentReflexMode() const { return currentReflexMode; }
-	// Latest completed simulation-start -> GPU-end duration; 0 means unavailable.
+	// Latest eligible Reflex simulation-start -> driver GPU-end duration; 0 means unavailable.
 	float GetReflexLatencyMs();
+	void ResetReflexLatencyHistory();
 	uint32_t GetOSDGeneratedFramesPerRenderFrame() const { return dlssgActive ? (currentDLSSGGeneratedFrames != 0 ? currentDLSSGGeneratedFrames : 1) : 0; }
 	double GetDLSSGPresentedFrameMultiplier() const { return lastDLSSGPresentMultiplier; }
 	uint GetCurrentDLSSQualityMode() const { return currentDLSSQualityMode; }
@@ -209,7 +215,7 @@ public:
 	uint32_t GetPCLStatsWindowMessage() const { return pclStatsWindowMessage; }
 	void OnPCLStatsPing();
 	uint32_t GetPCLPingCount() const { return pclPingCount; }
-	bool IsPCLLatencyReportAvailable() const { return pclLatencyReportAvailable; }
+	bool IsPCLLatencyReportAvailable() const { return pclLatencyReportAvailable.load(std::memory_order_acquire); }
 
 	/**
 	 * @brief Destroy DLSS resources and disable DLSS
@@ -297,6 +303,7 @@ public:
 private:
 	void CheckFeature(sl::Feature a_feature, IDXGIAdapter* a_adapter, bool& a_available, std::string_view a_name);
 	bool EnsureFrameToken(uint32_t a_frameIndex);
+	void InvalidateAbandonedPresentScope();
 	bool PaceFrame(uint32_t a_frameIndex);
 	bool ApplyNISSharpen(ID3D11Resource* a_inputColor, ID3D11Resource* a_outputColor, ID3D11DeviceContext* a_context, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resource* a_outputColor, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
@@ -319,7 +326,11 @@ private:
 	uint32_t markerFrameIndex = std::numeric_limits<uint32_t>::max();
 	uint32_t reflexSleepFrame = std::numeric_limits<uint32_t>::max();
 	uint32_t simulationMarkerFrame = std::numeric_limits<uint32_t>::max();
-	uint32_t renderMarkerFrame = std::numeric_limits<uint32_t>::max();
+	uint32_t openSimulationFrame = std::numeric_limits<uint32_t>::max();
+	uint32_t completedSimulationFrame = std::numeric_limits<uint32_t>::max();
+	sl::FrameToken* openSimulationToken = nullptr;
+	std::mutex simulationMutex;
+	std::atomic<uint32_t> renderMarkerFrame{ std::numeric_limits<uint32_t>::max() };
 	uint32_t lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();
 	double lastDLSSGPresentMultiplier = 1.0;
 	uint32_t maxFramesToGenerate = 1;
@@ -330,6 +341,16 @@ private:
 	sl::FrameToken* presentFrameToken = nullptr;
 	uint32_t presentFrameTokenIndex = std::numeric_limits<uint32_t>::max();
 	uint32_t lastPresentFrameTokenIndex = std::numeric_limits<uint32_t>::max();
+	bool pclPresentStarted = false;
+	uint32_t pclPresentTokenIndex = std::numeric_limits<uint32_t>::max();
+	struct ReflexLatencyFrame
+	{
+		uint64_t token = 0;
+		std::chrono::steady_clock::time_point simulationStart{};
+		bool presented = false;
+	};
+	std::array<ReflexLatencyFrame, 64> reflexLatencyFrames{};
+	std::mutex reflexLatencyMutex;
 	sl::ReflexMode currentReflexMode = sl::ReflexMode::ReflexMode_eCount;
 	bool currentReflexUseMarkersToOptimize = false;
 	uint32_t currentReflexThreadId = 0;
@@ -351,7 +372,7 @@ private:
 	float currentNISSharpness = -1.0f;
 	uint32_t pclStatsWindowMessage = 0;
 	uint32_t pclPingCount = 0;
-	bool pclLatencyReportAvailable = false;
+	std::atomic<bool> pclLatencyReportAvailable{ false };
 	bool pendingDLSSGDisable = false;
 	uint32_t dlssgPresentSafetyFrames = 0;
 	bool dlssgVSyncSupported = false;

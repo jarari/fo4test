@@ -31,8 +31,6 @@ extern bool enbLoaded;
 static RE::BSGraphics::Renderer* g_nativeUIRenderer = nullptr;
 static thread_local bool g_nativeScreenSpaceUI = false;
 static uint32_t g_upscalingUpdateFrame = UINT32_MAX;
-static thread_local uint32_t g_simulationFrame = 0;
-static thread_local bool g_simulationOpen = false;
 
 namespace
 {
@@ -52,30 +50,26 @@ struct Main_Run_OnIdle
 	static void thunk(RE::Main* a_main)
 	{
 		const auto nextFrame = Util::State_GetSingleton()->frameCount + 1;
-		g_simulationFrame = nextFrame;
 		DX12SwapChain::GetSingleton()->WaitForFrameStart();
-		g_simulationOpen = Streamline::GetSingleton()->BeginSimulationFrame(nextFrame);
+		Streamline::GetSingleton()->BeginSimulationFrame(nextFrame);
 		func(a_main);
-		if (g_simulationOpen) {
-			// Alt-Tab can skip Swap after OnIdle has already begun.
-			Streamline::GetSingleton()->EndSimulationFrame(g_simulationFrame);
-			g_simulationOpen = false;
-		}
+		// Alt-Tab can skip Renderer::Begin. A serving-thread loading draw may
+		// already have closed this frame; the close operation is idempotent.
+		Streamline::GetSingleton()->EndSimulationFrame(nextFrame);
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
 
-struct Main_OnIdle_Swap
+// Input sampled at the end of a loading iteration belongs to the next
+// iteration. Open its real simulation scope before polling; Renderer::Begin
+// closes it, or Main::OnIdle adopts the same frame if loading stops.
+struct Loading_PollInputDevices
 {
-	static void thunk(RE::Main* a_main)
+	static void thunk(void* a_manager, float a_delta)
 	{
-		// OnIdle has waited for OkToRender (stage 0). UI jobs and
-		// post-render housekeeping can still overlap rendering.
-		if (g_simulationOpen) {
-			Streamline::GetSingleton()->EndSimulationFrame(g_simulationFrame);
-			g_simulationOpen = false;
-		}
-		func(a_main);
+		DX12SwapChain::GetSingleton()->WaitForFrameStart();
+		Streamline::GetSingleton()->BeginSimulationFrame(Util::State_GetSingleton()->frameCount + 1);
+		func(a_manager, a_delta);
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
 };
@@ -121,9 +115,11 @@ struct Renderer_Begin_ENBDomains
 	{
 		if (a_window == 0) {
 			DX12SwapChain::GetSingleton()->BeginLoadingFrame();
+			const auto frame = Util::State_GetSingleton()->frameCount + 1;
+			Streamline::GetSingleton()->EndSimulationFrame(frame);
 			// OG and AE increment State::frameCount inside Begin. Acquire that
 			// upcoming token before rendering; late constants reuse it without Sleep.
-			Streamline::GetSingleton()->BeginRenderFrame(Util::State_GetSingleton()->frameCount + 1);
+			Streamline::GetSingleton()->BeginRenderFrame(frame);
 		}
 		g_nativeUIRenderer = a_renderer;
 		auto* swap = DX12SwapChain::GetSingleton();
@@ -302,6 +298,7 @@ namespace
 	constexpr uint32_t kDLSSGResumeStableFrames = 2;
 	constexpr uint64_t kFeatureRetryGameFrames = 5;
 	constexpr uint32_t kFeatureFailuresBeforeRetryBlock = 3;
+	constexpr uint32_t kSRMaxFailureAttempts = 3;
 	FILETIME g_lastSettingsWriteTime{};
 	bool g_hasLastSettingsWriteTime = false;
 	bool g_lastSettingsFileExists = false;
@@ -1774,10 +1771,20 @@ void Upscaling::InstallHooks()
 	// `call Main::OnIdle` sits at +0xEB instead of AE's +0xCB.
 	stl::write_thunk_call<Main_Run_OnIdle>(
 		REL::ID{ 1125396, 2718225, 4484191 }.address() + (isOG ? 0xBB : isNG ? 0xEB : 0xCB));
-	stl::write_thunk_call<Main_OnIdle_Swap>(
-		REL::ID{ 633524, 2228917 }.address() + (isOG ? 0x6EC : 0xCDC));
-	logger::info("[Reflex] Installed Main simulation hooks; previous OnIdle={:x}, Swap={:x}",
-		Main_Run_OnIdle::func.address(), Main_OnIdle_Swap::func.address());
+	logger::info("[Reflex] Installed Main simulation hook; previous OnIdle={:x}", Main_Run_OnIdle::func.address());
+	// OG and AE share the relocated loading Poll call shape. NG has no
+	// validated Poll call site and retains the Renderer::Begin fallback.
+	if (!isNG) {
+		const auto loadingLoop = REL::ID{ 132841, 2227631 }.address();
+		const auto pollCall = loadingLoop + (isOG ? 0x198 : 0x21E);
+		// CALL5 remains chainable when another plugin already replaced the target.
+		if (*reinterpret_cast<const std::uint8_t*>(pollCall) == 0xE8) {
+			stl::write_thunk_call<Loading_PollInputDevices>(pollCall);
+			logger::info("[Reflex] Installed loading pre-input hook; previous Poll={:x}", Loading_PollInputDevices::func.address());
+		} else {
+			logger::warn("[Reflex] Loading loop call-site validation failed; retaining Renderer::Begin fallback");
+		}
+	}
 
 	stl::detour_thunk_gateway<Renderer_Begin_ENBDomains>(
 		REL::ID{ 288964, 2276833 }, isOG ? 8 : 6, "Renderer::Begin frame pacing and ENB domains");
@@ -1984,7 +1991,10 @@ void Upscaling::LoadSettings()
 
 	auto streamline = Streamline::GetSingleton();
 	const auto currentUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
-	if (previousUpscaleMethodPreference != currentUpscaleMethodPreference) ClearFeatureRequestFailure(FeatureRequest::kFSR);
+	if (previousUpscaleMethodPreference != currentUpscaleMethodPreference || previousQualityMode != settings.qualityMode) {
+		ClearFeatureRequestFailure(FeatureRequest::kDLSS);
+		ClearFeatureRequestFailure(FeatureRequest::kFSR);
+	}
 	if (ENBRenderDomain::Get().Active() && previousQualityMode != settings.qualityMode) {
 		logger::info("[ENB domain] Requested quality {}; active quality {} ({}x{}); scene-only resize queued, HWND/display unchanged",
 			settings.qualityMode, ENBRenderDomain::Get().Quality(), ENBRenderDomain::Get().Width(), ENBRenderDomain::Get().Height());
@@ -3195,13 +3205,13 @@ const char* Upscaling::GetFGProviderName() const
 }
 bool Upscaling::ShouldUseFrameGeneration(bool a_checkMenu)
 {
-	if (a_checkMenu) return frameGenerationActive;
+	if (a_checkMenu) return IsFrameGenerationActive();
 	return activeFGProvider == FGProvider::DLSSG && Streamline::GetSingleton()->featureDLSSG &&
 		(settings.frameGenerationMode != 0 || settings.dynamicMFGEnabled != 0);
 }
 bool Upscaling::ShouldUseExternalFrameGeneration(bool a_checkMenu)
 {
-	if (a_checkMenu) return externalFrameGenerationActive;
+	if (a_checkMenu) return IsExternalFrameGenerationActive();
 	return (activeFGProvider == FGProvider::FSR || activeFGProvider == FGProvider::XeSS) &&
 		static_cast<UpscaleMethod>(settings.upscaleMethodPreference) != UpscaleMethod::kDisabled &&
 		settings.frameGenerationMode != 0 && DX12SwapChain::GetSingleton()->IsReady();
@@ -3215,7 +3225,12 @@ bool Upscaling::IsFeatureRequestBlocked(FeatureRequest a_feature) const
 	}
 
 	const auto& block = featureRetryBlocks[index];
-	return block.active && CurrentGameFrame() < block.retryGameFrame;
+	if (!block.active) return false;
+	if (block.requiresConfigurationChange) return true;
+	if (a_feature == FeatureRequest::kDLSS || a_feature == FeatureRequest::kFSR) {
+		return GetTickCount64() < block.retryAfterTick;
+	}
+	return CurrentGameFrame() < block.retryGameFrame;
 }
 
 void Upscaling::ClearFeatureRequestFailure(FeatureRequest a_feature)
@@ -3256,22 +3271,34 @@ void Upscaling::ClearFrameFeatureRequests()
 	}
 }
 
-void Upscaling::ReportFeatureRequestFailure(FeatureRequest a_feature, std::string_view a_context)
+void Upscaling::ReportFeatureRequestFailure(FeatureRequest a_feature, std::string_view a_context, bool a_retryable)
 {
 	const auto index = static_cast<std::size_t>(a_feature);
 	if (index >= featureRetryBlocks.size()) {
 		return;
 	}
 
+	const bool temporalSR = a_feature == FeatureRequest::kDLSS || a_feature == FeatureRequest::kFSR;
+	if (temporalSR && IsFeatureRequestBlocked(a_feature)) {
+		ClearFrameFeatureRequests();
+		return;
+	}
 	const auto currentGameFrame = CurrentGameFrame();
 	auto& block = featureRetryBlocks[index];
-	if (block.lastFailureGameFrame != currentGameFrame) {
+	if (!block.requiresConfigurationChange && (temporalSR || block.lastFailureGameFrame != currentGameFrame)) {
 		if (block.consecutiveFailures < std::numeric_limits<uint32_t>::max()) {
 			++block.consecutiveFailures;
 		}
 		block.lastFailureGameFrame = currentGameFrame;
 	}
-	if (block.consecutiveFailures >= kFeatureFailuresBeforeRetryBlock) {
+	if (temporalSR && (!a_retryable || block.consecutiveFailures >= kSRMaxFailureAttempts)) {
+		block.active = true;
+		block.requiresConfigurationChange = true;
+		block.retryAfterTick = 0;
+	} else if (temporalSR && !block.requiresConfigurationChange) {
+		block.active = true;
+		block.retryAfterTick = GetTickCount64() + (uint64_t{1} << std::min(block.consecutiveFailures, 2u)) * 1000;
+	} else if (!temporalSR && block.consecutiveFailures >= kFeatureFailuresBeforeRetryBlock) {
 		block.active = true;
 		block.retryGameFrame = currentGameFrame + kFeatureRetryGameFrames;
 	}
@@ -3286,16 +3313,17 @@ void Upscaling::ReportFeatureRequestFailure(FeatureRequest a_feature, std::strin
 	const auto freezeFrameMenuBG = ui ? ui->freezeFrameMenuBG : 0;
 	const auto freezeFramePause = ui ? ui->freezeFramePause : 0;
 
+	const auto retryState = block.requiresConfigurationChange ? "configuration-change" : block.active ? "cooldown" : "unblocked";
+	const auto retryDetails = temporalSR ?
+		std::format("attempts={}/{} state={} retryTick={}", block.consecutiveFailures, kSRMaxFailureAttempts, retryState, block.retryAfterTick) :
+		std::format("failures={} state={} retryFrame={}", block.consecutiveFailures, retryState, block.retryGameFrame);
 	logger::warn(
-		"[Upscaling] {} request failed in {}; failures={}/{} blocked={} retryFrame={} currentFrame={} "
+		"[Upscaling] {} request failed in {}; {} currentFrame={} "
 		"ui(menu={} item={} freezeBG={} freezePause={}) "
 		"worldCamera(state={} reference={} jitter={} matrixFov={} fov={})",
 		FeatureRequestName(a_feature),
 		a_context,
-		block.consecutiveFailures,
-		kFeatureFailuresBeforeRetryBlock,
-		block.active,
-		block.retryGameFrame,
+		retryDetails,
 		currentGameFrame,
 		menuMode,
 		itemMenuMode,
@@ -5216,10 +5244,17 @@ bool Upscaling::EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint
 bool Upscaling::PrepareD3D12TemporalSR(uint32_t frame)
 {
 	if (upscaleMethod != UpscaleMethod::kXeSS) return true;
+	if (IsFeatureRequestBlocked(FeatureRequest::kFSR)) return false;
 	auto* output = frame < fsrOutputD3D12.size() ? fsrOutputD3D12[frame].get() : nullptr;
-	if (output && XeSS::GetSingleton()->PrepareSR(DX12SwapChain::GetSingleton()->GetD3D12Device(),
-		static_cast<UINT>(output->GetDesc().Width), output->GetDesc().Height, settings.qualityMode, output->GetDesc().Format)) return true;
-	ReportFeatureRequestFailure(FeatureRequest::kFSR, "XeSS SR initialization");
+	auto* device = DX12SwapChain::GetSingleton()->GetD3D12Device();
+	if (!output || !device || !output->GetDesc().Width || !output->GetDesc().Height) {
+		ReportFeatureRequestFailure(FeatureRequest::kFSR, "XeSS SR inputs unavailable");
+		return false;
+	}
+	const auto desc = output->GetDesc();
+	auto* xess = XeSS::GetSingleton();
+	if (xess->PrepareSR(device, static_cast<UINT>(desc.Width), desc.Height, settings.qualityMode, desc.Format)) return true;
+	ReportFeatureRequestFailure(FeatureRequest::kFSR, "XeSS SR initialization", !xess->SRFailureRequiresConfigurationChange());
 	return false;
 }
 

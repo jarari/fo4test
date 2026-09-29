@@ -270,6 +270,7 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 
 void Streamline::Shutdown()
 {
+	ResetReflexLatencyHistory();
 	directDLSSNR.Shutdown();
 	dlssNRSuspended = false;
 	if (initialized && slShutdown) {
@@ -301,7 +302,12 @@ void Streamline::Shutdown()
 	markerFrameIndex = std::numeric_limits<uint32_t>::max();
 	reflexSleepFrame = std::numeric_limits<uint32_t>::max();
 	simulationMarkerFrame = std::numeric_limits<uint32_t>::max();
+	openSimulationFrame = std::numeric_limits<uint32_t>::max();
+	completedSimulationFrame = std::numeric_limits<uint32_t>::max();
+	openSimulationToken = nullptr;
 	renderMarkerFrame = std::numeric_limits<uint32_t>::max();
+	pclPresentStarted = false;
+	pclPresentTokenIndex = std::numeric_limits<uint32_t>::max();
 	lastDLSSGStateQueryFrame = std::numeric_limits<uint32_t>::max();
 	lastDLSSGPresentMultiplier = 1.0;
 	maxFramesToGenerate = 1;
@@ -513,8 +519,25 @@ bool Streamline::EnsureFrameToken(uint32_t a_frameIndex)
 
 	markerFrameIndex = a_frameIndex;
 	currentFrameTokenIndex = static_cast<uint32_t>(*frameToken);
+	InvalidateAbandonedPresentScope();
 
 	return true;
+}
+
+void Streamline::InvalidateAbandonedPresentScope()
+{
+	// DXGI_ERROR_WAS_STILL_DRAWING keeps the scope for a same-frame retry.
+	// A fresh frame token means that retry was abandoned, so its pending PCL
+	// Present start and DLSS-G tag token cannot be attributed to this frame.
+	if (presentFrameToken && presentFrameTokenIndex != currentFrameTokenIndex) {
+		presentFrameToken = nullptr;
+		presentFrameTokenIndex = std::numeric_limits<uint32_t>::max();
+	}
+	if (pclPresentStarted && pclPresentTokenIndex != currentFrameTokenIndex) {
+		logger::debug("[PCL] Abandoned incomplete Present scope for token {}", pclPresentTokenIndex);
+		pclPresentStarted = false;
+		pclPresentTokenIndex = std::numeric_limits<uint32_t>::max();
+	}
 }
 
 bool Streamline::PaceFrame(uint32_t a_frameIndex)
@@ -545,31 +568,46 @@ bool Streamline::PaceFrame(uint32_t a_frameIndex)
 
 bool Streamline::BeginSimulationFrame(uint32_t a_frameIndex)
 {
+	std::scoped_lock lock(simulationMutex);
 	if (!PaceFrame(a_frameIndex) || simulationMarkerFrame == a_frameIndex) { return false; }
+	// A blocked Main::OnIdle may still own an older scope. Loading's real
+	// pre-input boundary supersedes it; stale Main completion cannot close this.
 	simulationMarkerFrame = a_frameIndex;
+	openSimulationFrame = a_frameIndex;
+	openSimulationToken = frameToken;
+	if (openSimulationToken) {
+		const auto token = static_cast<uint64_t>(*openSimulationToken);
+		if (token) {
+			std::scoped_lock reportLock(reflexLatencyMutex);
+			reflexLatencyFrames[token % reflexLatencyFrames.size()] = {
+				token, std::chrono::steady_clock::now(), false
+			};
+		}
+	}
+	DX12SwapChain::GetSingleton()->NoteSimulationStart(a_frameIndex);
 	XeSS::GetSingleton()->Marker(XELL_SIMULATION_START);
-	SetPCLMarker(sl::PCLMarker::eSimulationStart);
+	if (openSimulationToken) SetPCLMarker(sl::PCLMarker::eSimulationStart, openSimulationToken);
 	return true;
 }
 
 void Streamline::EndSimulationFrame(uint32_t a_frameIndex)
 {
-	if (XeSS::GetSingleton()->OwnsSwapChain()) {
-		XeSS::GetSingleton()->EndSimulation(a_frameIndex);
-		return;
-	}
-	// A loading screen can render many frames while OnIdle is blocked on I/O.
-	// Do not attribute the old simulation's end to its newer loading-frame token.
-	if (markerFrameIndex != a_frameIndex || !frameToken) {
-		logger::debug("[Reflex] Simulation {} interrupted by render frame {}; end marker omitted", a_frameIndex, markerFrameIndex);
-		return;
-	}
-	SetPCLMarker(sl::PCLMarker::eSimulationEnd);
+	std::scoped_lock lock(simulationMutex);
+	if (openSimulationFrame != a_frameIndex) return;
+	XeSS::GetSingleton()->EndSimulation(a_frameIndex);
+	if (openSimulationToken) SetPCLMarker(sl::PCLMarker::eSimulationEnd, openSimulationToken);
+	completedSimulationFrame = a_frameIndex;
+	openSimulationFrame = std::numeric_limits<uint32_t>::max();
+	openSimulationToken = nullptr;
 }
 
 void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
 {
+	std::scoped_lock lock(simulationMutex);
 	if (!PaceFrame(a_frameIndex) || renderMarkerFrame == a_frameIndex) { return; }
+	// Independent draws without a real simulation scope still pace, but cannot
+	// contribute incomplete vendor latency markers or GPU-span telemetry.
+	if (completedSimulationFrame != a_frameIndex) return;
 	renderMarkerFrame = a_frameIndex;
 	XeSS::GetSingleton()->Marker(XELL_RENDERSUBMIT_START);
 	SetPCLMarker(sl::PCLMarker::eRenderSubmitStart);
@@ -624,6 +662,7 @@ sl::FrameToken* Streamline::GetFrameTokenForFrame(uint32_t a_frameIndex)
 	frameToken = requestedFrameToken;
 	markerFrameIndex = a_frameIndex;
 	currentFrameTokenIndex = requestedFrameToken ? static_cast<uint32_t>(*requestedFrameToken) : std::numeric_limits<uint32_t>::max();
+	InvalidateAbandonedPresentScope();
 	if (constantsFrameIndex != a_frameIndex) {
 		logger::warn("[Streamline] Frame token {} reacquired without matching constants frame {}", a_frameIndex, constantsFrameIndex);
 	}
@@ -700,6 +739,7 @@ void Streamline::UpdateReflex(uint a_reflexMode, bool a_forceEnabled)
 		return;
 	}
 
+	if (currentReflexMode != mode) ResetReflexLatencyHistory();
 	currentReflexMode = mode;
 	currentReflexUseMarkersToOptimize = useMarkersToOptimize;
 	currentReflexThreadId = threadId;
@@ -1074,16 +1114,33 @@ void Streamline::SetPresentFrameIndex(uint32_t a_frameIndex)
 
 void Streamline::OnPresentStart()
 {
+	const auto tokenIndex = presentFrameToken ? presentFrameTokenIndex : currentFrameTokenIndex;
+	if (pclPresentStarted && pclPresentTokenIndex == tokenIndex) return;
+	if (pclPresentStarted) logger::debug("[PCL] Abandoned incomplete Present scope for token {}", pclPresentTokenIndex);
 	auto markerFrameToken = presentFrameToken ? presentFrameToken : frameToken;
 	SetPCLMarker(sl::PCLMarker::eRenderSubmitEnd, markerFrameToken);
 	SetPCLMarker(sl::PCLMarker::ePresentStart, markerFrameToken);
+	pclPresentStarted = true;
+	pclPresentTokenIndex = tokenIndex;
 }
 
-void Streamline::OnPresentEnd(HRESULT, bool a_queryState)
+void Streamline::OnPresentEnd(HRESULT a_result, bool a_queryState)
 {
+	if (a_result == DXGI_ERROR_WAS_STILL_DRAWING) return;
 	auto markerFrameToken = presentFrameToken ? presentFrameToken : frameToken;
+	const auto tokenIndex = presentFrameToken ? presentFrameTokenIndex : currentFrameTokenIndex;
 	lastPresentFrameTokenIndex = presentFrameToken ? presentFrameTokenIndex : currentFrameTokenIndex;
-	SetPCLMarker(sl::PCLMarker::ePresentEnd, markerFrameToken);
+	const bool matchedScope = pclPresentStarted && pclPresentTokenIndex == tokenIndex;
+	if (matchedScope) {
+		SetPCLMarker(sl::PCLMarker::ePresentEnd, markerFrameToken);
+		if (a_result == S_OK && tokenIndex != std::numeric_limits<uint32_t>::max()) {
+			std::scoped_lock reportLock(reflexLatencyMutex);
+			auto& observed = reflexLatencyFrames[tokenIndex % reflexLatencyFrames.size()];
+			if (observed.token == tokenIndex) observed.presented = true;
+		}
+	}
+	pclPresentStarted = false;
+	pclPresentTokenIndex = std::numeric_limits<uint32_t>::max();
 
 	if (a_queryState) {
 		QueryDLSSGState();
@@ -1132,8 +1189,8 @@ void Streamline::QueryDLSSGState()
 
 float Streamline::GetReflexLatencyMs()
 {
-	pclLatencyReportAvailable = false;
-	if (!featureReflex || !slReflexGetState) {
+	pclLatencyReportAvailable.store(false, std::memory_order_release);
+	if (XeSS::GetSingleton()->OwnsSwapChain() || !featureReflex || !slReflexGetState) {
 		return 0.0f;
 	}
 
@@ -1141,17 +1198,31 @@ float Streamline::GetReflexLatencyMs()
 	if (SL_FAILED(result, slReflexGetState(state)) || !state.latencyReportAvailable) {
 		return 0.0f;
 	}
-	pclLatencyReportAvailable = true;
+	pclLatencyReportAvailable.store(true, std::memory_order_release);
 
-	// InputSample is deprecated in PCL. CPU Present end also excludes queued
-	// GPU work. Report simulation-start to GPU-end instead, without claiming
-	// peripheral/scanout/display latency. Require a completed simulation scope.
+	// The SDK ring can retain reports after loading or a failed Present. Accept
+	// only a locally observed simulation that reached a successful Present, and
+	// expire it from the original simulation start rather than from each read.
+	const auto now = std::chrono::steady_clock::now();
 	const sl::ReflexReport* latest = nullptr;
+	std::scoped_lock reportLock(reflexLatencyMutex);
 	for (const auto& report : state.frameReport) {
 		if (report.frameID == 0 || report.simStartTime == 0 ||
-			report.simEndTime < report.simStartTime || report.gpuRenderEndTime <= report.simStartTime) {
+			report.simEndTime < report.simStartTime ||
+			report.renderSubmitStartTime < report.simEndTime ||
+			report.renderSubmitEndTime < report.renderSubmitStartTime ||
+			report.presentStartTime < report.renderSubmitEndTime ||
+			report.presentEndTime < report.presentStartTime ||
+			report.gpuRenderStartTime == 0 ||
+			report.gpuRenderEndTime < report.gpuRenderStartTime ||
+			report.gpuRenderEndTime <= report.simStartTime) {
 			continue;
 		}
+		const auto& observed = reflexLatencyFrames[report.frameID % reflexLatencyFrames.size()];
+		if (observed.token != report.frameID || !observed.presented ||
+			observed.simulationStart.time_since_epoch().count() == 0 ||
+			observed.simulationStart > now ||
+			now - observed.simulationStart > std::chrono::seconds(2)) continue;
 		if (!latest || report.frameID > latest->frameID) {
 			latest = &report;
 		}
@@ -1162,6 +1233,13 @@ float Streamline::GetReflexLatencyMs()
 	}
 
 	return 0.0f;
+}
+
+void Streamline::ResetReflexLatencyHistory()
+{
+	std::scoped_lock reportLock(reflexLatencyMutex);
+	reflexLatencyFrames.fill({});
+	pclLatencyReportAvailable.store(false, std::memory_order_release);
 }
 
 void Streamline::ResetOptionCaches()

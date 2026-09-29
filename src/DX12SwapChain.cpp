@@ -650,6 +650,17 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter, Streamline* a_str
 	queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
 
 	DX::ThrowIfFailed(proxyD3D12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(commandQueue.put())));
+	LARGE_INTEGER qpc{};
+	if (QueryPerformanceFrequency(&qpc)) qpcFrequency = static_cast<uint64_t>(qpc.QuadPart);
+	if (FAILED(commandQueue->GetTimestampFrequency(&gpuTimestampFrequency))) gpuTimestampFrequency = 0;
+	if (qpcFrequency && gpuTimestampFrequency) {
+		D3D12_QUERY_HEAP_DESC queryDesc{};
+		queryDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+		queryDesc.Count = kCommandContextCount;
+		if (FAILED(d3d12Device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(latencyQueryHeap.put())))) {
+			latencyQueryHeap = nullptr;
+		}
+	}
 	logger::info("[DX12SwapChain] D3D12 command queue created via {} device: queue={}", proxyD3D12Device.get() == d3d12Device.get() ? "native" : "Streamline proxy", static_cast<void*>(commandQueue.get()));
 	LogStreamlineProxy(a_streamline, "d3d12Device", d3d12Device.get());
 	LogStreamlineProxy(a_streamline, "deviceForQueue", proxyD3D12Device.get());
@@ -659,6 +670,14 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter, Streamline* a_str
 		DX::ThrowIfFailed(d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(context.allocator.put())));
 		DX::ThrowIfFailed(d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, context.allocator.get(), nullptr, IID_PPV_ARGS(context.list.put())));
 		DX::ThrowIfFailed(context.list->Close());
+		if (latencyQueryHeap) {
+			const auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+			const auto desc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(uint64_t));
+			if (FAILED(d3d12Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+				D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(context.latencyReadback.put())))) {
+				latencyQueryHeap = nullptr;
+			}
+		}
 	}
 }
 
@@ -969,8 +988,10 @@ void DX12SwapChain::SuspendTemporalFeatures(const char* a_reason)
 	}
 	streamline->ApplyPendingDLSSGDisable();
 	streamline->SuspendDLSSNR();
+	ResetLatencyTelemetry();
 	XeSS::GetSingleton()->DisableFG();
 	XeSS::GetSingleton()->RequestReset();
+	XeSS::GetSingleton()->ResetPacingHistory();
 	Upscaling::GetSingleton()->OnD3D12TemporalSuspend();
 	presentOverrideFinalColor = nullptr;
 	for (auto& context : commandContexts) {
@@ -1012,12 +1033,15 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	EndNativeUI();
 	NativeInterfaceUI::ReleaseResources();
 	nativeUITexture = nullptr;
+	nativeUIPassthrough = false;
 	menuComposite = nullptr;
 	sceneUISRV = nullptr;
 	interopReady = false;
 	presentOverrideFinalColor = nullptr;
+	for (auto& staging : presentStaging) staging.reset();
+	menuStaging.reset();
+	menuStagingFenceValue = 0;
 	for (auto& context : commandContexts) {
-		context.presentStaging = nullptr;
 		context.retainedPresentOverride = nullptr;
 		context.screenshotInput.reset();
 		context.screenshotOutput.reset();
@@ -1186,6 +1210,7 @@ HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 	}
 	pendingSceneProxy.reset();
 	Streamline::GetSingleton()->RequestTemporalReset();
+	XeSS::GetSingleton()->ResetPacingHistory();
 	logger::info("[ENB scene resize] quality {} -> {} scene={}x{} display={}x{}; engine-window-resize=false real-swapchain-resize=false native-UI-preserved=true",
 		oldQuality, a_quality, domain.Width(), domain.Height(), swapChainDesc.Width, swapChainDesc.Height);
 	return S_OK;
@@ -1360,11 +1385,15 @@ void DX12SwapChain::RecreateInteropTextures()
 		context.retainedPresentOverride = nullptr;
 		context.screenshotInput.reset();
 		context.screenshotOutput.reset();
-		textureDesc.Width = swapChainDesc.Width;
-		textureDesc.Height = swapChainDesc.Height;
-		textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-		context.presentStaging = std::make_unique<D3D11D3D12SharedTexture>(textureDesc, d3d11Device.get(), d3d12Device.get());
 	}
+	textureDesc.Width = swapChainDesc.Width;
+	textureDesc.Height = swapChainDesc.Height;
+	textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	for (auto& staging : presentStaging) {
+		staging = std::make_unique<D3D11D3D12SharedTexture>(textureDesc, d3d11Device.get(), d3d12Device.get());
+	}
+	menuStaging.reset();
+	menuStagingFenceValue = 0;
 	interopReady = true;
 }
 
@@ -1382,6 +1411,7 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 		const auto contextIndex = (nextCommandContext + i) % std::size(commandContexts);
 		auto& context = commandContexts[contextIndex];
 		if (context.fenceValue == 0 || completedValue >= context.fenceValue) {
+			ConsumeLatencyTimestamp(context);
 			nextCommandContext = static_cast<UINT>((contextIndex + 1) % std::size(commandContexts));
 			context.index = static_cast<UINT>(contextIndex);
 			context.fenceValue = 0;
@@ -1408,6 +1438,7 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 	}
 	nextCommandContext = static_cast<UINT>((waitContextIndex + 1) % std::size(commandContexts));
 	auto& context = commandContexts[waitContextIndex];
+	ConsumeLatencyTimestamp(context);
 	context.index = waitContextIndex;
 	context.fenceValue = 0;
 	context.retainedPresentOverride = nullptr;
@@ -1416,6 +1447,102 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 	DX::ThrowIfFailed(context.allocator->Reset());
 	DX::ThrowIfFailed(context.list->Reset(context.allocator.get(), nullptr));
 	return context;
+}
+
+void DX12SwapChain::NoteSimulationStart(uint32_t frame)
+{
+	LARGE_INTEGER now{};
+	if (!qpcFrequency || !QueryPerformanceCounter(&now)) return;
+	const auto generation = latencyGeneration.load(std::memory_order_acquire);
+	std::scoped_lock lock(simulationStartMutex);
+	auto& start = simulationStarts[frame % simulationStarts.size()];
+	if (start.frame == frame && start.generation == generation) return;
+	start = { frame, static_cast<uint64_t>(now.QuadPart), generation };
+}
+
+void DX12SwapChain::ResetLatencyTelemetry()
+{
+	Streamline::GetSingleton()->ResetReflexLatencyHistory();
+	latencyGeneration.fetch_add(1, std::memory_order_acq_rel);
+	std::scoped_lock lock(latencySampleMutex);
+	latestAppGPULatencyMs = 0.0f;
+	latestAppGPULatencySampleQPC = 0;
+}
+
+void DX12SwapChain::RecordLatencyTimestamp(CommandContext& context, uint32_t frame)
+{
+	context.latencyPending = false;
+	if (!latencyQueryHeap || !context.latencyReadback || !gpuTimestampFrequency ||
+		!Streamline::GetSingleton()->HasRenderMarkerForFrame(frame)) return;
+	SimulationStart start{};
+	{
+		std::scoped_lock lock(simulationStartMutex);
+		start = simulationStarts[frame % simulationStarts.size()];
+	}
+	const auto generation = latencyGeneration.load(std::memory_order_acquire);
+	if (start.frame != frame || start.generation != generation || !start.qpc) return;
+	uint64_t gpuClock = 0, cpuClock = 0;
+	if (FAILED(commandQueue->GetClockCalibration(&gpuClock, &cpuClock))) return;
+	context.latencyFrame = frame;
+	context.latencyGeneration = generation;
+	context.latencySimulationQPC = start.qpc;
+	context.latencyCalibrationGPU = gpuClock;
+	context.latencyCalibrationCPU = cpuClock;
+	context.latencyPresentSucceeded = false;
+	context.list->EndQuery(latencyQueryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP, context.index);
+	context.list->ResolveQueryData(latencyQueryHeap.get(), D3D12_QUERY_TYPE_TIMESTAMP,
+		context.index, 1, context.latencyReadback.get(), 0);
+	context.latencyPending = true;
+}
+
+void DX12SwapChain::ConsumeLatencyTimestamp(CommandContext& context)
+{
+	if (!context.latencyPending || !commandFence || context.fenceValue == UINT64_MAX ||
+		deviceLost || commandFence->GetCompletedValue() == UINT64_MAX ||
+		commandFence->GetCompletedValue() < context.fenceValue) return;
+	context.latencyPending = false;
+	if (!context.latencyPresentSucceeded ||
+		context.latencyGeneration != latencyGeneration.load(std::memory_order_acquire)) return;
+	const D3D12_RANGE readRange{ 0, sizeof(uint64_t) };
+	void* data = nullptr;
+	if (FAILED(context.latencyReadback->Map(0, &readRange, &data)) || !data) return;
+	const auto gpuEnd = *static_cast<const uint64_t*>(data);
+	const D3D12_RANGE writeRange{ 0, 0 };
+	context.latencyReadback->Unmap(0, &writeRange);
+	if (gpuEnd < context.latencyCalibrationGPU) return;
+	const auto cpuEnd = static_cast<long double>(context.latencyCalibrationCPU) +
+		static_cast<long double>(gpuEnd - context.latencyCalibrationGPU) *
+		static_cast<long double>(qpcFrequency) / static_cast<long double>(gpuTimestampFrequency);
+	const auto spanMs = (cpuEnd - static_cast<long double>(context.latencySimulationQPC)) *
+		1000.0L / static_cast<long double>(qpcFrequency);
+	if (spanMs <= 0.0L || spanMs > 1000.0L) return;
+	LARGE_INTEGER now{};
+	if (!QueryPerformanceCounter(&now)) return;
+	const auto sampleQPC = static_cast<uint64_t>(cpuEnd);
+	if (cpuEnd < 0.0L ||
+		sampleQPC > static_cast<uint64_t>(now.QuadPart) + qpcFrequency / 10 ||
+		static_cast<uint64_t>(now.QuadPart) > sampleQPC + 2 * qpcFrequency) return;
+	std::scoped_lock lock(latencySampleMutex);
+	if (context.latencyGeneration != latencyGeneration.load(std::memory_order_acquire)) return;
+	if (latestAppGPULatencyGeneration == context.latencyGeneration &&
+		sampleQPC <= latestAppGPULatencySampleQPC) return;
+	latestAppGPULatencyMs = static_cast<float>(spanMs);
+	latestAppGPULatencyGeneration = context.latencyGeneration;
+	latestAppGPULatencySampleQPC = sampleQPC;
+}
+
+bool DX12SwapChain::GetSimulationToAppGPUCompletionMs(float& a_ms)
+{
+	if (!commandFence || !qpcFrequency) return false;
+	for (auto& context : commandContexts) ConsumeLatencyTimestamp(context);
+	LARGE_INTEGER now{};
+	std::scoped_lock lock(latencySampleMutex);
+	if (!QueryPerformanceCounter(&now) || !latestAppGPULatencySampleQPC ||
+		latestAppGPULatencyGeneration != latencyGeneration.load(std::memory_order_acquire) ||
+		static_cast<uint64_t>(now.QuadPart) < latestAppGPULatencySampleQPC ||
+		static_cast<uint64_t>(now.QuadPart) - latestAppGPULatencySampleQPC > 2 * qpcFrequency) return false;
+	a_ms = latestAppGPULatencyMs;
+	return true;
 }
 
 void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
@@ -1520,12 +1647,14 @@ void DX12SwapChain::BeginLoadingFrame()
 	// Renderer::Begin owns the transition, including open+close with no draws.
 	loadingResumeFrames.store(2, std::memory_order_release);
 	presentPacing.Reset();
+	ResetLatencyTelemetry();
 	{
 		std::scoped_lock lock(frameLatencyMutex);
 		frameLatencyFrameValid = false;
 		frameLatencyRetryAfter = 0;
 	}
 	Streamline::GetSingleton()->RequestTemporalReset();
+	XeSS::GetSingleton()->ResetPacingHistory();
 	appliedLoadingState.store(state, std::memory_order_release);
 }
 
@@ -1559,7 +1688,10 @@ void DX12SwapChain::WaitForFrameStart()
 		return;
 	}
 	const auto* upscaling = Upscaling::GetSingleton();
+	// XeFG owns the swapchain even while interpolation is off; only active FG
+	// needs to bypass the bounded pre-input Present throttle.
 	if (upscaling->IsFrameGenerationActive() || upscaling->IsExternalFrameGenerationActive() ||
+		XeSS::GetSingleton()->FGEnabled() ||
 		FidelityFX::GetSingleton()->IsFrameGenerationEnabled() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety()) {
 		return;
 	}
@@ -1958,8 +2090,16 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 		desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 		menuComposite = std::make_unique<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
 	}
+	if (!menuStaging) {
+		D3D11_TEXTURE2D_DESC desc{};
+		uiTarget->GetDesc(&desc);
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		menuStaging = std::make_unique<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
+	}
 	auto& command = AcquireCommandContext();
-	auto* staging = command.presentStaging.get();
+	if (!WaitForCommandFence(menuStagingFenceValue)) { return; }
+	auto* staging = menuStaging.get();
+	if (!staging) { return; }
 	d3d11Context->CopyResource(staging->resource11.get(), uiTarget);
 	const auto inputFence = fenceValue++;
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), inputFence));
@@ -1985,6 +2125,7 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 	}
 	command.list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
 	ExecuteCommandContext(command);
+	menuStagingFenceValue = command.fenceValue;
 	if (!rendered) { return; }
 	DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), command.fenceValue));
 	d3d11Context->CopyResource(uiTarget, menuComposite->resource11.get());
@@ -1998,6 +2139,34 @@ bool DX12SwapChain::BeginNativeUI()
 	}
 	if (!IsReady() || !swapChainBufferProxyENB) {
 		return false;
+	}
+	// When ENB renders directly at display resolution with every temporal
+	// feature off, RT0 and the window target already are the native UI target.
+	// Keep that allocation bound and avoid a second full-size D3D11 copy.
+	const auto* upscaling = Upscaling::GetSingleton();
+	const auto* streamline = Streamline::GetSingleton();
+	auto* scene = swapChainBufferProxyENB->resource11.get();
+	const auto* sceneRenderer = RE::BSGraphics::GetRendererData();
+	D3D11_TEXTURE2D_DESC sceneDesc{};
+	scene->GetDesc(&sceneDesc);
+	const bool usePassthrough =
+		upscaling->settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDisabled) &&
+		upscaling->settings.dlssNREnabled == 0 &&
+		upscaling->settings.frameGenerationMode == 0 && !upscaling->settings.dynamicMFGEnabled &&
+		!upscaling->IsFrameGenerationActive() && !upscaling->IsExternalFrameGenerationActive() &&
+		!streamline->dlssgActive && !FidelityFX::GetSingleton()->IsFrameGenerationEnabled() &&
+		!XeSS::GetSingleton()->FGEnabled() && !presentOverrideFinalColor &&
+		sceneDesc.Width == swapChainDesc.Width && sceneDesc.Height == swapChainDesc.Height &&
+		sceneDesc.Format == swapChainDesc.Format &&
+		reinterpret_cast<ID3D11Texture2D*>(sceneRenderer->renderTargets[0].texture) == scene &&
+		reinterpret_cast<ID3D11Texture2D*>(sceneRenderer->renderWindow[0].swapChainRenderTarget.texture) == scene;
+	if (usePassthrough != nativeUIPassthrough) {
+		nativeUIPassthrough = usePassthrough;
+		++nativeUIGeneration;
+		logger::info("[ENB UI] Native scene passthrough {}; generation={}", usePassthrough ? "enabled" : "disabled", nativeUIGeneration);
+	}
+	if (usePassthrough) {
+		return true;
 	}
 	try {
 		if (!nativeUITexture) {
@@ -2046,7 +2215,7 @@ void main(uint3 p : SV_DispatchThreadID)
 			DX::ThrowIfFailed(d3d11Device->CreateSamplerState(&sampler, nativeUISampler.put()));
 		}
 		// Keep the UI allocation stable for Scaleform/ENB caches. D3D12 reads
-		// a per-command-context snapshot at Present, so the next UI write does
+		// a fenced swapchain-slot snapshot at Present, so the next UI write does
 		// not need to wait for the previous frame's D3D12 composition.
 		// A separate D3D12 scene requires a transparent overlay, including when
 		// menu rendering leaves an old world image in the D3D11 backbuffer.
@@ -2154,7 +2323,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		presentPacing.Reset();
 		presentOverrideFinalColor = nullptr;
 		const auto presentedFrameIndex = frameIndex;
+		if (!XeSS::GetSingleton()->BeforePresent()) return E_FAIL;
 		const auto result = swapChain->Present(0, Flags & ~DXGI_PRESENT_ALLOW_TEARING);
+		XeSS::GetSingleton()->AfterPresent(result);
 		const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : S_OK;
 		if (FAILED(removedReason)) {
 			deviceLost = true;
@@ -2178,8 +2349,8 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 
 	auto& commandContext = AcquireCommandContext();
 	auto* commandList = commandContext.list.get();
-	auto* presentStaging = commandContext.presentStaging.get();
-	if (!presentStaging) {
+	auto* staging = presentStaging[frameIndex].get();
+	if (!staging) {
 		return DXGI_ERROR_INVALID_CALL;
 	}
 
@@ -2188,15 +2359,16 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		if (!BeginNativeUI()) {
 			return E_FAIL;
 		}
-		// AcquireCommandContext has completed the prior D3D12 use of this
+		// The Present-slot fence above completed the prior D3D12 read of this
 		// snapshot. Copy on D3D11 before signaling this frame's UI-ready fence.
-		captureSource = nativeUITexture->resource.get();
+		captureSource = nativeUIActive && nativeUITexture ? nativeUITexture->resource.get() :
+			swapChainBufferProxyENB->resource11.get();
 	} else if (swapChainBufferProxyENB) {
 		captureSource = swapChainBufferProxyENB->resource11.get();
 	} else {
 		captureSource = swapChainBufferProxy->resource.get();
 	}
-	d3d11Context->CopyResource(presentStaging->resource11.get(), captureSource);
+	d3d11Context->CopyResource(staging->resource11.get(), captureSource);
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	// Publish the complete D3D11 UI batch before the consumer queue waits.
 	// Flush submits work; it does not wait for GPU completion on the CPU.
@@ -2210,7 +2382,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// Repeated Presents without world rendering must never recycle old depth.
 	upscaling->dlssDepthCaptureFrames[presentedFrameIndex] = 0;
 	upscaling->fsrDepthCaptureFrames[presentedFrameIndex] = 0;
-	auto copySource = presentStaging->resource12.get();
+	auto copySource = staging->resource12.get();
 	commandContext.retainedPresentOverride = std::move(presentOverrideFinalColor);
 	// The menu's D3D11 background filter has already consumed the resolved scene.
 	// Retain its resource through submission, but do not composite it a second time.
@@ -2264,7 +2436,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (upscaling->IsFrameGenerationActive() || dlssgPresentSafety) {
 		upscaling->TagDLSSGInputs(commandList, presentedFrameIndex);
 	}
-	if (!upscaling->IsExternalFrameGenerationActive()) XeSS::GetSingleton()->DisableFG();
+	const bool xeFGOffReady = upscaling->IsExternalFrameGenerationActive() || XeSS::GetSingleton()->DisableFG();
 	auto fidelityFX = FidelityFX::GetSingleton();
 	if (fidelityFX->IsFrameGenerationEnabled() &&
 		!upscaling->IsExternalFrameGenerationActive()) {
@@ -2306,7 +2478,12 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		auto afterCopy = CD3DX12_RESOURCE_BARRIER::Transition(destination, destinationState, D3D12_RESOURCE_STATE_PRESENT);
 		commandList->ResourceBarrier(1, &afterCopy);
 	}
+	if (osdEnabled) RecordLatencyTimestamp(commandContext, Util::State_GetSingleton()->frameCount);
 	ExecuteCommandContext(commandContext);
+	if (!xeFGOffReady) {
+		if (!FenceFrameSlotAfterPresent(presentedFrameIndex, &commandContext)) return DXGI_ERROR_DEVICE_REMOVED;
+		return E_FAIL;
+	}
 
 	const auto vsyncMode = upscaling->settings.vsyncMode;
 	UINT presentSyncInterval = vsyncMode == 2 ? 1u : vsyncMode == 1 ? 0u : SyncInterval;
@@ -2340,16 +2517,24 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		loggedSync = presentSyncInterval;
 		loggedDynamicPacing = sdkDynamicPacing;
 	}
-	const auto emitPresentMarkers = streamline->NeedsPresentMarkers();
-	if (emitPresentMarkers) {
-		streamline->OnPresentStart();
-	}
+	const auto emitPresentMarkers = streamline->NeedsPresentMarkers() &&
+		streamline->HasRenderMarkerForFrame(Util::State_GetSingleton()->frameCount);
 	const auto depthPresentFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount);
 	ReShadeDepth::PublishPresent(presentedFrameIndex, depthPresentFrame, destination);
-	XeSS::GetSingleton()->BeforePresent();
+	if (!XeSS::GetSingleton()->BeforePresent()) {
+		if (!FenceFrameSlotAfterPresent(presentedFrameIndex, &commandContext)) return DXGI_ERROR_DEVICE_REMOVED;
+		return E_FAIL;
+	}
+	if (emitPresentMarkers) streamline->OnPresentStart();
 	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
 	XeSS::GetSingleton()->AfterPresent(result);
-	if (result != S_OK) { presentPacing.Reset(); }
+	commandContext.latencyPresentSucceeded = result == S_OK;
+	if (result == DXGI_ERROR_WAS_STILL_DRAWING && commandContext.retainedPresentOverride) {
+		// The engine may retry this logical frame without another world draw.
+		// Keep its scene available for the next UI composite.
+		presentOverrideFinalColor.copy_from(commandContext.retainedPresentOverride.get());
+	}
+	if (result != S_OK && result != DXGI_ERROR_WAS_STILL_DRAWING) { presentPacing.Reset(); }
 	if (emitPresentMarkers) {
 		streamline->OnPresentEnd(result, false);
 	}
@@ -2401,8 +2586,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			// Present interception can submit work even when DXGI reports a transient
 			// mode-change failure. Fence that work before any frame-slot reuse.
 			if (FenceFrameSlotAfterPresent(presentedFrameIndex, &commandContext)) {
-				SuspendTemporalFeatures("Present failure");
-				windowStateDirty.store(true, std::memory_order_release);
+				if (result != DXGI_ERROR_WAS_STILL_DRAWING) {
+					SuspendTemporalFeatures("Present failure");
+					windowStateDirty.store(true, std::memory_order_release);
+				}
 			}
 		}
 	}
@@ -2456,6 +2643,14 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 		// creation separately from NR/SR evaluation. Normal frames never drain.
 		if (!WaitForInteropIdle()) {
 			return result;
+		}
+		// Both queues are drained: release unused D3D11 driver caches before
+		// allocating NR's larger working set. This does not pin NR memory.
+		if (d3d11Device) {
+			winrt::com_ptr<IDXGIDevice3> trimDevice;
+			if (SUCCEEDED(d3d11Device->QueryInterface(IID_PPV_ARGS(trimDevice.put())))) {
+				trimDevice->Trim();
+			}
 		}
 		auto& initialization = AcquireCommandContext();
 		const auto prepared = streamline->PrepareD3D12DLSSNR(initialization.list.get(), nrPreparation);

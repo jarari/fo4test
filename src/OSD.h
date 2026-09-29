@@ -79,6 +79,7 @@ private:
 	std::string gpuMemoryTotalText = "N/A";
 	std::string gpuMemoryDetailText = "N/A";
 	float reflexLatencyMs = 0.0f;
+	float appGPULatencyMs = 0.0f;
 	std::string cachedText;
 	uint32_t cachedMode = 0;
 	bool textureDirty = true;

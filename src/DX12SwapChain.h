@@ -2,6 +2,7 @@
 #include "PresentPacing.h"
 
 #include <atomic>
+#include <mutex>
 
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -103,6 +104,8 @@ public:
 	}
 	bool IsReady() const { return swapChainProxy && swapChain && interopReady; }
 	void PaceFrameStart(uint32_t frame);
+	void NoteSimulationStart(uint32_t frame);
+	bool GetSimulationToAppGPUCompletionMs(float& a_ms);
 	void NotifyLoadingScreen(bool active);
 	void BeginLoadingFrame();
 	bool IsLoadingScreen() const { return (loadingState.load(std::memory_order_acquire) & 1u) != 0; }
@@ -170,11 +173,18 @@ private:
 	{
 		winrt::com_ptr<ID3D12CommandAllocator> allocator;
 		winrt::com_ptr<ID3D12GraphicsCommandList4> list;
-		std::unique_ptr<D3D11D3D12SharedTexture> presentStaging;
 		winrt::com_ptr<ID3D12Resource> retainedPresentOverride;
 		// Reused only after this context's fence completes, unlike a global
 		// upload buffer which CPU text updates could overwrite while in flight.
 		winrt::com_ptr<ID3D12Resource> osdUpload;
+		winrt::com_ptr<ID3D12Resource> latencyReadback;
+		uint32_t latencyFrame = 0;
+		uint64_t latencyGeneration = 0;
+		uint64_t latencyCalibrationGPU = 0;
+		uint64_t latencyCalibrationCPU = 0;
+		uint64_t latencySimulationQPC = 0;
+		bool latencyPending = false;
+		bool latencyPresentSucceeded = false;
 		std::shared_ptr<D3D11D3D12SharedTexture> screenshotInput;
 		std::shared_ptr<D3D11D3D12SharedTexture> screenshotOutput;
 		UINT index = 0;
@@ -185,6 +195,9 @@ private:
 
 	CommandContext& AcquireCommandContext();
 	void ExecuteCommandContext(CommandContext& a_context);
+	void RecordLatencyTimestamp(CommandContext& a_context, uint32_t a_frame);
+	void ConsumeLatencyTimestamp(CommandContext& a_context);
+	void ResetLatencyTelemetry();
 	bool FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext* a_context = nullptr);
 	D3D12EvaluationResult EvaluateD3D12WorkOnCommandList(ID3D12GraphicsCommandList* a_commandList, UINT a_frameIndex, bool a_evaluateDLSS, bool a_evaluateFSR, bool a_evaluateFSRFrameGeneration);
 	bool WaitForCommandFence(UINT64 a_value);
@@ -219,12 +232,29 @@ private:
 	RE::BSGraphics::RenderTarget savedSceneTarget{};
 	RE::BSGraphics::RenderTarget savedSceneWindowTarget{};
 	bool nativeUIActive = false;
+	bool nativeUIPassthrough = false;
 	bool nativeUIWindowTargetActive = false;
 	bool nativeUIIncludesScene = false;
 	std::unique_ptr<D3D11D3D12SharedTexture> menuComposite;
 	void ResolveNativeUIForMenu();
 	uint64_t nativeUIGeneration = 0;
 	CommandContext commandContexts[kCommandContextCount];
+	winrt::com_ptr<ID3D12QueryHeap> latencyQueryHeap;
+	uint64_t gpuTimestampFrequency = 0;
+	uint64_t qpcFrequency = 0;
+	struct SimulationStart { uint32_t frame = 0; uint64_t qpc = 0; uint64_t generation = 0; };
+	std::array<SimulationStart, 64> simulationStarts{};
+	std::mutex simulationStartMutex;
+	std::mutex latencySampleMutex;
+	std::atomic<uint64_t> latencyGeneration{1};
+	float latestAppGPULatencyMs = 0.0f;
+	uint64_t latestAppGPULatencyGeneration = 0;
+	uint64_t latestAppGPULatencySampleQPC = 0;
+	// Presentation uses the swapchain's three fenced slots; menu resolves have
+	// one independently fenced snapshot so evaluation contexts need no image.
+	std::array<std::unique_ptr<D3D11D3D12SharedTexture>, kDX12FrameCount> presentStaging;
+	std::unique_ptr<D3D11D3D12SharedTexture> menuStaging;
+	UINT64 menuStagingFenceValue = 0;
 	winrt::handle commandFenceEvent;
 	winrt::com_ptr<ID3D12Resource> presentOverrideFinalColor;
 	DXGISwapChainProxy* swapChainProxy = nullptr;

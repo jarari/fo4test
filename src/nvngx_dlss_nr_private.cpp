@@ -89,27 +89,52 @@ namespace
 		if (!device || !a_desc || !a_heap) { return; }
 		// Match NGX's committed allocation, including its heap, node masks,
 		// resource flags and initial state. Upload/readback allocations stay as-is.
-		const auto result = device->CreateCommittedResource(a_heap, D3D12_HEAP_FLAG_NONE,
-			a_desc, static_cast<D3D12_RESOURCE_STATES>(a_state), nullptr, IID_PPV_ARGS(a_output));
-		if (FAILED(result)) {
+		Microsoft::WRL::ComPtr<ID3D12Device1> residencyDevice;
+		const bool defaultWithResidencyAPI = a_heap->Type == D3D12_HEAP_TYPE_DEFAULT &&
+			SUCCEEDED(device.As(&residencyDevice));
+		const auto initialFlags = defaultWithResidencyAPI ?
+			D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT : D3D12_HEAP_FLAG_NONE;
+		Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+		auto result = device->CreateCommittedResource(a_heap, initialFlags,
+			a_desc, static_cast<D3D12_RESOURCE_STATES>(a_state), nullptr,
+			IID_PPV_ARGS(resource.ReleaseAndGetAddressOf()));
+		bool createdNonResident = SUCCEEDED(result) && initialFlags == D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT;
+		if (FAILED(result) && initialFlags == D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT &&
+			(result == E_INVALIDARG || result == E_NOTIMPL)) {
+			// Older drivers may reject this optional creation flag. Retry once
+			// with the original implicit-residency behavior, not on GPU failures.
+			static std::atomic_flag warnedCompatibilityFallback = ATOMIC_FLAG_INIT;
+			if (!warnedCompatibilityFallback.test_and_set()) {
+				logger::warn("[DLSS-NR Direct] Nonresident allocation unsupported hr=0x{:08X}; using normal committed allocation",
+					static_cast<uint32_t>(result));
+			}
+			resource.Reset();
+			result = device->CreateCommittedResource(a_heap, D3D12_HEAP_FLAG_NONE,
+				a_desc, static_cast<D3D12_RESOURCE_STATES>(a_state), nullptr,
+				IID_PPV_ARGS(resource.ReleaseAndGetAddressOf()));
+			createdNonResident = false;
+		}
+		if (FAILED(result) || !resource) {
 			logger::warn("[DLSS-NR Direct] Resource allocation failed hr=0x{:08X}", static_cast<uint32_t>(result));
 			return;
 		}
-		if (a_heap->Type == D3D12_HEAP_TYPE_DEFAULT) {
-			// The transition ETL ties a 146 MiB NR internal buffer's promotion
-			// into local VRAM to evaluation dropping from ~68 ms to ~8 ms.
-			// These repeatedly accessed working buffers should outlive cold game
-			// allocations in VRAM. This is a residency hint, not a memory pin.
-			Microsoft::WRL::ComPtr<ID3D12Device1> residencyDevice;
-			if (SUCCEEDED(device.As(&residencyDevice))) {
-				ID3D12Pageable* resource = *a_output;
-				constexpr auto priority = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
-				const auto priorityResult = residencyDevice->SetResidencyPriority(1, &resource, &priority);
-				if (FAILED(priorityResult)) {
-					logger::warn("[DLSS-NR Direct] Residency priority failed hr=0x{:08X}", static_cast<uint32_t>(priorityResult));
+		if (defaultWithResidencyAPI) {
+			// Prioritize before initial residency; this is a hint, not a pin.
+			ID3D12Pageable* pageable = resource.Get();
+			constexpr auto priority = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
+			const auto priorityResult = residencyDevice->SetResidencyPriority(1, &pageable, &priority);
+			if (FAILED(priorityResult)) {
+				logger::warn("[DLSS-NR Direct] Residency priority failed hr=0x{:08X}", static_cast<uint32_t>(priorityResult));
+			}
+			if (createdNonResident) {
+				const auto residencyResult = device->MakeResident(1, &pageable);
+				if (FAILED(residencyResult)) {
+					logger::warn("[DLSS-NR Direct] Initial MakeResident failed hr=0x{:08X}", static_cast<uint32_t>(residencyResult));
+					return;
 				}
 			}
 		}
+		*a_output = resource.Detach();
 	}
 
 	void NVSDK_CONV ReleaseNRResource(IUnknown* a_resource)
@@ -601,19 +626,25 @@ namespace nvngx::dlss_nr
 	{
 		if (!IsSupportedPerformanceMode(a_parameters.options.performanceMode)) {
 			logger::warn("[DLSS-NR Direct] Performance mode {} is unsupported", a_parameters.options.performanceMode);
+			a_state.lastFailureResult = NVSDK_NGX_Result_FAIL_InvalidParameter;
 			return false;
 		}
 
+		const auto previousAttempts = a_state.failureLatched && SameFailedConfiguration(a_state, a_parameters) ?
+			a_state.retryAttempts : 0u;
 		if ((a_state.failureLatched || NeedsFeatureRecreation(a_state, a_parameters) ||
 			(!a_state.feature && a_state.parameters)) && !ReleaseFeature(a_state)) {
+			a_state.lastFailureResult = NVSDK_NGX_Result_Fail;
 			return false;
 		}
+		a_state.retryAttempts = previousAttempts;
 		if (a_state.feature) {
 			return true;
 		}
 
 		const auto allocateResult = allocateParameters_(&a_state.parameters);
 		if (!IsNGXSuccess(allocateResult) || !a_state.parameters) {
+			a_state.lastFailureResult = IsNGXSuccess(allocateResult) ? NVSDK_NGX_Result_Fail : allocateResult;
 			logger::warn("[DLSS-NR Direct] AllocateParameters failed result=0x{:08X}", static_cast<std::uint32_t>(allocateResult));
 			// Retain any returned allocation for its matching DestroyParameters.
 			return false;
@@ -644,6 +675,7 @@ namespace nvngx::dlss_nr
 			}
 		}
 		if (!IsNGXSuccess(createResult) || !a_state.feature) {
+			a_state.lastFailureResult = !IsNGXSuccess(snippetCreateResult) ? snippetCreateResult : createResult;
 			logger::warn(
 				"[DLSS-NR Direct] CreateFeature failed pass={} primaryResult=0x{:08X} snippetResult=0x{:08X} input={}x{} output={}x{} performanceMode={} preset={}",
 				a_passIndex + 1,
@@ -669,6 +701,7 @@ namespace nvngx::dlss_nr
 		a_state.performanceMode = a_parameters.options.performanceMode;
 		a_state.preset = a_parameters.options.preset;
 		a_state.forceReset = true;
+		a_state.failureLatched = false;
 		logger::info(
 			"[DLSS-NR Direct] Created NGX feature 18 pass={} input={}x{} output={}x{} performanceMode={} preset={}",
 			a_passIndex + 1,
@@ -760,8 +793,17 @@ namespace nvngx::dlss_nr
 		const FeatureState& a_state,
 		const D3D12EvaluationParameters& a_parameters) const
 	{
-		const auto sameFailedConfiguration =
-			a_state.failedInputWidth == a_parameters.inputWidth &&
+		if (a_state.failureLatched && SameFailedConfiguration(a_state, a_parameters) &&
+			(!a_state.retryable || std::chrono::steady_clock::now() < a_state.retryAfter)) return false;
+		if (a_state.failureLatched && SameFailedConfiguration(a_state, a_parameters)) {
+			return a_state.retryable && std::chrono::steady_clock::now() >= a_state.retryAfter;
+		}
+		return !a_state.feature || NeedsFeatureRecreation(a_state, a_parameters) || a_state.failureLatched;
+	}
+
+	bool D3D12Backend::SameFailedConfiguration(const FeatureState& a_state, const D3D12EvaluationParameters& a_parameters) const
+	{
+		return a_state.failedInputWidth == a_parameters.inputWidth &&
 			a_state.failedInputHeight == a_parameters.inputHeight &&
 			a_state.failedOutputWidth == a_parameters.outputWidth &&
 			a_state.failedOutputHeight == a_parameters.outputHeight &&
@@ -769,16 +811,50 @@ namespace nvngx::dlss_nr
 			a_state.failedGuideHeight == a_parameters.guideHeight &&
 			a_state.failedPerformanceMode == a_parameters.options.performanceMode &&
 			a_state.failedPreset == a_parameters.options.preset;
-		if (a_state.failureLatched && sameFailedConfiguration) {
-			return false;
+	}
+
+	void D3D12Backend::LatchFeatureFailure(FeatureState& a_state,
+		const D3D12EvaluationParameters& a_parameters, NVSDK_NGX_Result a_result)
+	{
+		if (a_state.failureLatched && !SameFailedConfiguration(a_state, a_parameters)) a_state.retryAttempts = 0;
+		a_state.failureLatched = true;
+		a_state.lastFailureResult = a_result;
+		a_state.failedInputWidth = a_parameters.inputWidth;
+		a_state.failedInputHeight = a_parameters.inputHeight;
+		a_state.failedOutputWidth = a_parameters.outputWidth;
+		a_state.failedOutputHeight = a_parameters.outputHeight;
+		a_state.failedGuideWidth = a_parameters.guideWidth;
+		a_state.failedGuideHeight = a_parameters.guideHeight;
+		a_state.failedPerformanceMode = a_parameters.options.performanceMode;
+		a_state.failedPreset = a_parameters.options.preset;
+		const bool permanent = a_result == NVSDK_NGX_Result_FAIL_FeatureNotSupported ||
+			a_result == NVSDK_NGX_Result_FAIL_InvalidParameter ||
+			a_result == NVSDK_NGX_Result_FAIL_UnsupportedInputFormat ||
+			a_result == NVSDK_NGX_Result_FAIL_UnsupportedFormat ||
+			a_result == NVSDK_NGX_Result_FAIL_RWFlagMissing ||
+			a_result == NVSDK_NGX_Result_FAIL_MissingInput ||
+			a_result == NVSDK_NGX_Result_FAIL_UnsupportedParameter ||
+			a_result == NVSDK_NGX_Result_FAIL_Denied ||
+			a_result == NVSDK_NGX_Result_FAIL_NotImplemented;
+		a_state.retryable = !permanent && device_ && SUCCEEDED(device_->GetDeviceRemovedReason()) &&
+			++a_state.retryAttempts <= 4;
+		if (a_state.retryable) {
+			a_state.retryAfter = std::chrono::steady_clock::now() +
+				std::chrono::seconds(1u << std::min(a_state.retryAttempts, 4u));
 		}
-		return !a_state.feature || NeedsFeatureRecreation(a_state, a_parameters) || a_state.failureLatched;
+		logger::warn("[DLSS-NR Direct] Feature failure result=0x{:08X} recovery={} attempt={}/4",
+			static_cast<std::uint32_t>(a_result), a_state.retryable ? "backoff" : "held", a_state.retryAttempts);
 	}
 
 	bool D3D12Backend::EnsureIntermediateResources(const D3D12EvaluationParameters& a_parameters)
 	{
 		const auto passCount = std::clamp(a_parameters.passCount, 1u, kMaxPassCount);
 		if (passCount == 1) {
+			for (auto& resource : intermediateResources_) resource.Reset();
+			intermediateWidth_ = intermediateHeight_ = 0;
+			intermediateFormat_ = DXGI_FORMAT_UNKNOWN;
+			intermediateFailureLatched_ = false;
+			intermediateRetryAttempts_ = 0;
 			return true;
 		}
 		if (!device_ || a_parameters.outputFormat == DXGI_FORMAT_UNKNOWN) {
@@ -786,6 +862,13 @@ namespace nvngx::dlss_nr
 		}
 
 		const auto requiredCount = passCount - 1;
+		const auto sameFailedConfiguration = failedIntermediateWidth_ == a_parameters.outputWidth &&
+			failedIntermediateHeight_ == a_parameters.outputHeight &&
+			failedIntermediateFormat_ == a_parameters.outputFormat &&
+			failedIntermediatePassCount_ == passCount;
+		if (intermediateFailureLatched_ && sameFailedConfiguration &&
+			(!intermediateRetryable_ || std::chrono::steady_clock::now() < intermediateRetryAfter_)) return false;
+		if (!sameFailedConfiguration) intermediateRetryAttempts_ = 0;
 		const auto configurationMatches =
 			intermediateWidth_ == a_parameters.outputWidth &&
 			intermediateHeight_ == a_parameters.outputHeight &&
@@ -795,7 +878,9 @@ namespace nvngx::dlss_nr
 			resourcesReady = intermediateResources_[i] != nullptr;
 		}
 		if (resourcesReady) {
+			for (std::uint32_t i = requiredCount; i < intermediateResources_.size(); ++i) intermediateResources_[i].Reset();
 			intermediateFailureLatched_ = false;
+			intermediateRetryAttempts_ = 0;
 			return true;
 		}
 
@@ -833,6 +918,11 @@ namespace nvngx::dlss_nr
 					static_cast<std::uint32_t>(a_parameters.outputFormat),
 					static_cast<std::uint32_t>(result));
 				intermediateFailureLatched_ = true;
+				lastIntermediateFailure_ = result;
+				intermediateRetryable_ = result != E_INVALIDARG && device_ &&
+					SUCCEEDED(device_->GetDeviceRemovedReason()) && ++intermediateRetryAttempts_ <= 4;
+				if (intermediateRetryable_) intermediateRetryAfter_ = std::chrono::steady_clock::now() +
+					std::chrono::seconds(1u << std::min(intermediateRetryAttempts_, 4u));
 				failedIntermediateWidth_ = a_parameters.outputWidth;
 				failedIntermediateHeight_ = a_parameters.outputHeight;
 				failedIntermediateFormat_ = a_parameters.outputFormat;
@@ -845,6 +935,7 @@ namespace nvngx::dlss_nr
 		intermediateHeight_ = a_parameters.outputHeight;
 		intermediateFormat_ = a_parameters.outputFormat;
 		intermediateFailureLatched_ = false;
+		intermediateRetryAttempts_ = 0;
 		return true;
 	}
 
@@ -854,6 +945,23 @@ namespace nvngx::dlss_nr
 		if (!initialized_) {
 			return !initializationAttempted_;
 		}
+		if (passCount > 1 && intermediateFailureLatched_ &&
+			failedIntermediateWidth_ == a_parameters.outputWidth &&
+			failedIntermediateHeight_ == a_parameters.outputHeight &&
+			failedIntermediateFormat_ == a_parameters.outputFormat &&
+			failedIntermediatePassCount_ == passCount &&
+			(!intermediateRetryable_ || std::chrono::steady_clock::now() < intermediateRetryAfter_)) return false;
+		for (std::uint32_t i = 0; i < passCount; ++i) {
+			const auto& state = features_[i];
+			if (state.failureLatched && SameFailedConfiguration(state, a_parameters) &&
+				(!state.retryable || std::chrono::steady_clock::now() < state.retryAfter)) return false;
+		}
+		for (std::uint32_t i = passCount; i < kMaxPassCount; ++i) {
+			if (features_[i].feature || features_[i].parameters) return true;
+		}
+		for (std::uint32_t i = passCount - 1; i < intermediateResources_.size(); ++i) {
+			if (intermediateResources_[i]) return true;
+		}
 
 		if (passCount > 1) {
 			const auto sameFailedIntermediateConfiguration =
@@ -861,7 +969,8 @@ namespace nvngx::dlss_nr
 				failedIntermediateHeight_ == a_parameters.outputHeight &&
 				failedIntermediateFormat_ == a_parameters.outputFormat &&
 				failedIntermediatePassCount_ == passCount;
-			if (intermediateFailureLatched_ && sameFailedIntermediateConfiguration) {
+			if (intermediateFailureLatched_ && sameFailedIntermediateConfiguration &&
+				(!intermediateRetryable_ || std::chrono::steady_clock::now() < intermediateRetryAfter_)) {
 				return false;
 			}
 			if (intermediateWidth_ != a_parameters.outputWidth ||
@@ -878,18 +987,6 @@ namespace nvngx::dlss_nr
 
 		for (std::uint32_t i = 0; i < passCount; ++i) {
 			const auto& state = features_[i];
-			const auto sameFailedConfiguration =
-				state.failedInputWidth == a_parameters.inputWidth &&
-				state.failedInputHeight == a_parameters.inputHeight &&
-				state.failedOutputWidth == a_parameters.outputWidth &&
-				state.failedOutputHeight == a_parameters.outputHeight &&
-				state.failedGuideWidth == a_parameters.guideWidth &&
-				state.failedGuideHeight == a_parameters.guideHeight &&
-				state.failedPerformanceMode == a_parameters.options.performanceMode &&
-				state.failedPreset == a_parameters.options.preset;
-			if (state.failureLatched && sameFailedConfiguration) {
-				return false;
-			}
 			if (NeedsFeaturePreparation(state, a_parameters)) {
 				return true;
 			}
@@ -915,23 +1012,23 @@ namespace nvngx::dlss_nr
 				return false;
 			}
 		}
+		const auto passCount = std::clamp(a_parameters.passCount, 1u, kMaxPassCount);
+		for (std::uint32_t i = 0; i < passCount; ++i) {
+			const auto& state = features_[i];
+			if (state.failureLatched && SameFailedConfiguration(state, a_parameters) &&
+				(!state.retryable || std::chrono::steady_clock::now() < state.retryAfter)) return false;
+		}
+		for (std::uint32_t i = passCount; i < kMaxPassCount; ++i) {
+			if (!ReleaseFeature(features_[i])) return false;
+		}
 		if (!EnsureIntermediateResources(a_parameters)) {
 			return false;
 		}
 
-		const auto passCount = std::clamp(a_parameters.passCount, 1u, kMaxPassCount);
 		for (std::uint32_t i = 0; i < passCount; ++i) {
 			auto& state = features_[i];
 			if (!EnsureFeature(state, a_commandList, a_parameters, i)) {
-				state.failureLatched = true;
-				state.failedInputWidth = a_parameters.inputWidth;
-				state.failedInputHeight = a_parameters.inputHeight;
-				state.failedOutputWidth = a_parameters.outputWidth;
-				state.failedOutputHeight = a_parameters.outputHeight;
-				state.failedGuideWidth = a_parameters.guideWidth;
-				state.failedGuideHeight = a_parameters.guideHeight;
-				state.failedPerformanceMode = a_parameters.options.performanceMode;
-				state.failedPreset = a_parameters.options.preset;
+				LatchFeatureFailure(state, a_parameters, state.lastFailureResult);
 				return false;
 			}
 		}
@@ -1052,20 +1149,13 @@ namespace nvngx::dlss_nr
 					outputDesc.Height,
 					passParameters.options.performanceMode,
 					reset);
-				state.failureLatched = true;
-				state.failedInputWidth = passParameters.inputWidth;
-				state.failedInputHeight = passParameters.inputHeight;
-				state.failedOutputWidth = passParameters.outputWidth;
-				state.failedOutputHeight = passParameters.outputHeight;
-				state.failedGuideWidth = passParameters.guideWidth;
-				state.failedGuideHeight = passParameters.guideHeight;
-				state.failedPerformanceMode = passParameters.options.performanceMode;
-				state.failedPreset = passParameters.options.preset;
+				LatchFeatureFailure(state, passParameters, evaluateResult);
 				RequestReset();
 				lastEvaluatedPassCount_ = 0;
 				return false;
 			}
 			state.forceReset = false;
+			state.retryAttempts = 0;
 		}
 		lastEvaluatedPassCount_ = passCount;
 		return true;

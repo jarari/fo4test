@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 
@@ -152,6 +153,10 @@ namespace nvngx::dlss_nr
 			std::uint32_t performanceMode = 0;
 			std::uint32_t preset = 0;
 			bool failureLatched = false;
+			bool retryable = false;
+			std::uint32_t retryAttempts = 0;
+			NVSDK_NGX_Result lastFailureResult = NVSDK_NGX_Result_Success;
+			std::chrono::steady_clock::time_point retryAfter{};
 			std::uint32_t failedInputWidth = 0;
 			std::uint32_t failedInputHeight = 0;
 			std::uint32_t failedOutputWidth = 0;
@@ -170,6 +175,8 @@ namespace nvngx::dlss_nr
 		bool NeedsFeatureRecreation(const FeatureState& a_state, const D3D12EvaluationParameters& a_parameters) const;
 		bool NeedsFeaturePreparation(const FeatureState& a_state, const D3D12EvaluationParameters& a_parameters) const;
 		bool ReleaseFeature(FeatureState& a_state);
+		bool SameFailedConfiguration(const FeatureState& a_state, const D3D12EvaluationParameters& a_parameters) const;
+		void LatchFeatureFailure(FeatureState& a_state, const D3D12EvaluationParameters& a_parameters, NVSDK_NGX_Result a_result);
 		void SetCreationParameters(NVSDK_NGX_Parameter* a_parameters, const D3D12EvaluationParameters& a_evaluationParameters);
 		void SetEvaluationParameters(NVSDK_NGX_Parameter* a_parameters, const D3D12EvaluationParameters& a_evaluationParameters, bool a_reset);
 
@@ -190,6 +197,10 @@ namespace nvngx::dlss_nr
 		std::uint32_t intermediateHeight_ = 0;
 		DXGI_FORMAT intermediateFormat_ = DXGI_FORMAT_UNKNOWN;
 		bool intermediateFailureLatched_ = false;
+		bool intermediateRetryable_ = false;
+		std::uint32_t intermediateRetryAttempts_ = 0;
+		HRESULT lastIntermediateFailure_ = S_OK;
+		std::chrono::steady_clock::time_point intermediateRetryAfter_{};
 		std::uint32_t failedIntermediateWidth_ = 0;
 		std::uint32_t failedIntermediateHeight_ = 0;
 		DXGI_FORMAT failedIntermediateFormat_ = DXGI_FORMAT_UNKNOWN;

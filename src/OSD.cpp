@@ -519,6 +519,8 @@ void OSD::UpdateStats()
 	}
 
 	reflexLatencyMs = streamline->GetReflexLatencyMs();
+	appGPULatencyMs = 0.0f;
+	DX12SwapChain::GetSingleton()->GetSimulationToAppGPUCompletionMs(appGPULatencyMs);
 
 	const auto newText = BuildText();
 	if (newText != cachedText) {
@@ -541,13 +543,15 @@ std::string OSD::BuildCompactText() const
 	auto upscaling = Upscaling::GetSingleton();
 	const auto fgFPS = upscaling->ShouldUseFrameGeneration(true) || upscaling->ShouldUseExternalFrameGeneration(true) ? generatedFPS : 0.0;
 	char latency[32]{};
-	if (reflexLatencyMs > 0.0f) {
-		std::snprintf(latency, sizeof(latency), "%.1fms", reflexLatencyMs);
+	const bool xellOwner = XeSS::GetSingleton()->OwnsSwapChain();
+	const bool reflexOwner = !xellOwner && Streamline::GetSingleton()->featureReflex;
+	const auto latencyMs = reflexOwner ? reflexLatencyMs : appGPULatencyMs;
+	if (latencyMs > 0.0f) {
+		std::snprintf(latency, sizeof(latency), "%.1fms", latencyMs);
 	} else {
 		std::snprintf(latency, sizeof(latency), "N/A");
 	}
 
-	// Preserve the compact layout's original label and unit width.
 	auto memoryText = gpuMemoryTotalText;
 	if (memoryText.ends_with(" MiB")) {
 		memoryText.replace(memoryText.size() - 4, 4, "MB");
@@ -586,9 +590,11 @@ std::string OSD::BuildDetailedText() const
 		text += line;
 	}
 	text += "GPU Mem: " + gpuMemoryDetailText + "\n";
-	if (reflexLatencyMs > 0.0f) {
-		std::snprintf(line, sizeof(line), "PC Latency: %.2f ms\n", reflexLatencyMs);
-	} else if (!streamline->IsPCLLatencyReportAvailable()) {
+	const bool reflexOwner = !XeSS::GetSingleton()->OwnsSwapChain() && streamline->featureReflex;
+	const auto latencyMs = reflexOwner ? reflexLatencyMs : appGPULatencyMs;
+	if (latencyMs > 0.0f) {
+		std::snprintf(line, sizeof(line), "PC Latency: %.2f ms\n", latencyMs);
+	} else if (reflexOwner && !streamline->IsPCLLatencyReportAvailable()) {
 		std::snprintf(line, sizeof(line), "PC Latency: no report\n");
 	} else {
 		std::snprintf(line, sizeof(line), "PC Latency: timing N/A\n");
@@ -756,6 +762,7 @@ void OSD::Reset()
 	frameTimeMs = 0.0;
 	generatedFPS = 0.0;
 	reflexLatencyMs = 0.0f;
+	appGPULatencyMs = 0.0f;
 	cachedText.clear();
 	cachedMode = 0;
 	textureDirty = true;

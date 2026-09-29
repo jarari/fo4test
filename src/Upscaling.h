@@ -539,9 +539,11 @@ public:
 	struct FeatureRetryBlock
 	{
 		uint64_t retryGameFrame = 0;
+		uint64_t retryAfterTick = 0;
 		uint64_t lastFailureGameFrame = std::numeric_limits<uint64_t>::max();
 		uint32_t consecutiveFailures = 0;
 		bool active = false;
+		bool requiresConfigurationChange = false;
 	};
 
 	std::array<FeatureRetryBlock, 4> featureRetryBlocks{};
@@ -582,7 +584,7 @@ private:
 
 	bool WantsFrameGenerationInputs();
 	bool IsFeatureRequestBlocked(FeatureRequest a_feature) const;
-	void ReportFeatureRequestFailure(FeatureRequest a_feature, std::string_view a_context);
+	void ReportFeatureRequestFailure(FeatureRequest a_feature, std::string_view a_context, bool a_retryable = true);
 	void ClearFeatureRequestFailure(FeatureRequest a_feature);
 	void ClearFrameFeatureRequests();
 	bool EnsureFrameGenerationPatchResources(float2 a_renderSize, DXGI_FORMAT a_colorResourceFormat, DXGI_FORMAT a_colorSRVFormat, DXGI_FORMAT a_motionVectorFormat);

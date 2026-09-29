@@ -32,17 +32,25 @@ namespace
     XESS_FUNCTION(xefgSwapChainGetLastPresentStatus); XESS_FUNCTION(xefgSwapChainDestroy);
     XESS_FUNCTION(xefgSwapChainSetUiCompositionState);
     XESS_FUNCTION(xellD3D12CreateContext); XESS_FUNCTION(xellDestroyContext); XESS_FUNCTION(xellSleep);
-    XESS_FUNCTION(xellSetSleepMode); XESS_FUNCTION(xellAddMarkerData);
+    XESS_FUNCTION(xellSetSleepMode); XESS_FUNCTION(xellAddMarkerData); XESS_FUNCTION(xellGetFramesReports);
 #undef XESS_FUNCTION
 #define XESS_LOAD(name) p_##name = reinterpret_cast<decltype(p_##name)>(GetProcAddress(module, #name)); if (!p_##name) return false
     bool LoadSR()
     {
-        static const bool ready = [] {
-            const auto module = LoadRuntime(L"libxess.dll"); if (!module) return false;
-            XESS_LOAD(xessD3D12CreateContext); XESS_LOAD(xessD3D12Init); XESS_LOAD(xessD3D12Execute);
-            XESS_LOAD(xessDestroyContext); XESS_LOAD(xessSetVelocityScale); XESS_LOAD(xessForceLegacyScaleFactors);
-            return true;
-        }();
+        static std::mutex loadMutex;
+        static HMODULE module = nullptr;
+        static bool ready = false;
+        std::scoped_lock lock(loadMutex);
+        if (ready) return true;
+        // Keep a successfully loaded module once. Only successful export
+        // resolution is cached, so a missing DLL can be retried after install.
+        if (!module) module = LoadRuntime(L"libxess.dll");
+        if (!module) return false;
+#define XESS_LOAD_SR(name) p_##name = reinterpret_cast<decltype(p_##name)>(GetProcAddress(module, #name)); if (!p_##name) { logger::warn("[XeSS SR] Missing export {}", #name); return false; }
+        XESS_LOAD_SR(xessD3D12CreateContext); XESS_LOAD_SR(xessD3D12Init); XESS_LOAD_SR(xessD3D12Execute);
+        XESS_LOAD_SR(xessDestroyContext); XESS_LOAD_SR(xessSetVelocityScale); XESS_LOAD_SR(xessForceLegacyScaleFactors);
+#undef XESS_LOAD_SR
+        ready = true;
         return ready;
     }
     bool LoadFG()
@@ -51,6 +59,7 @@ namespace
             auto module = LoadRuntime(L"libxell.dll"); if (!module) return false;
             XESS_LOAD(xellD3D12CreateContext); XESS_LOAD(xellDestroyContext); XESS_LOAD(xellSleep);
             XESS_LOAD(xellSetSleepMode); XESS_LOAD(xellAddMarkerData);
+            p_xellGetFramesReports = reinterpret_cast<decltype(p_xellGetFramesReports)>(GetProcAddress(module, "xellGetFramesReports"));
             XeLLUnlock::Apply(module);
             module = LoadRuntime(L"libxess_fg.dll"); if (!module) return false;
             XESS_LOAD(xefgSwapChainD3D12CreateContext); XESS_LOAD(xefgSwapChainD3D12InitFromSwapChainDesc);
@@ -72,6 +81,21 @@ namespace
         logger::warn("[XeSS FG] {} failed: {}", operation, static_cast<int>(result));
         return false;
     }
+
+    bool SRRequiresConfigurationChange(xess_result_t result)
+    {
+        switch (result) {
+        case XESS_RESULT_ERROR_UNSUPPORTED_DEVICE:
+        case XESS_RESULT_ERROR_UNSUPPORTED_DRIVER:
+        case XESS_RESULT_ERROR_INVALID_ARGUMENT:
+        case XESS_RESULT_ERROR_NOT_IMPLEMENTED:
+        case XESS_RESULT_ERROR_UNSUPPORTED:
+        case XESS_RESULT_ERROR_CANT_LOAD_LIBRARY:
+            return true;
+        default:
+            return false;
+        }
+    }
 }
 
 void XeSS::DestroySR()
@@ -82,22 +106,41 @@ void XeSS::DestroySR()
 
 bool XeSS::PrepareSR(ID3D12Device* device, UINT width, UINT height, uint quality, DXGI_FORMAT format)
 {
-    if (!device || !width || !height || !LoadSR()) return false;
+    srFailureRequiresConfigurationChange = false;
+    if (!device || !width || !height) return false;
+    if (!LoadSR()) { srFailureRequiresConfigurationChange = true; return false; }
     quality = std::min(quality, 4u);
     if (sr && srDevice == device && srWidth == width && srHeight == height && srQuality == quality && srFormat == format) return true;
     if (sr && !DX12SwapChain::GetSingleton()->WaitForInteropIdle()) return false;
     DestroySR();
-    if (p_xessD3D12CreateContext(device, &sr) < 0) return false;
+    const auto createResult = p_xessD3D12CreateContext(device, &sr);
+    if (createResult < 0 || !sr) {
+        srFailureRequiresConfigurationChange = SRRequiresConfigurationChange(createResult);
+        logger::warn("[XeSS SR] CreateContext failed: {}", static_cast<int>(createResult));
+        DestroySR();
+        return false;
+    }
     constexpr xess_quality_settings_t qualities[] = { XESS_QUALITY_SETTING_AA, XESS_QUALITY_SETTING_QUALITY,
         XESS_QUALITY_SETTING_BALANCED, XESS_QUALITY_SETTING_PERFORMANCE, XESS_QUALITY_SETTING_ULTRA_PERFORMANCE };
     // Keep the existing engine's 1/1.5/1.7/2/3 render-resolution contract.
-    p_xessForceLegacyScaleFactors(sr, true);
+    const auto scaleResult = p_xessForceLegacyScaleFactors(sr, true);
+    if (scaleResult < 0) {
+        srFailureRequiresConfigurationChange = SRRequiresConfigurationChange(scaleResult);
+        logger::warn("[XeSS SR] ForceLegacyScaleFactors failed: {}", static_cast<int>(scaleResult));
+        DestroySR();
+        return false;
+    }
     xess_d3d12_init_params_t init{};
     init.outputResolution = { width, height };
     init.qualitySetting = qualities[quality];
     init.initFlags = ColorRange::IsExtended(format) ? XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE : XESS_INIT_FLAG_LDR_INPUT_COLOR;
     const auto result = p_xessD3D12Init(sr, &init);
-    if (result < 0) { logger::warn("[XeSS SR] Init failed: {}", static_cast<int>(result)); DestroySR(); return false; }
+    if (result < 0) {
+        srFailureRequiresConfigurationChange = SRRequiresConfigurationChange(result);
+        logger::warn("[XeSS SR] Init failed: {}", static_cast<int>(result));
+        DestroySR();
+        return false;
+    }
     srDevice = device; srWidth = width; srHeight = height; srQuality = quality; srFormat = format;
     logger::info("[XeSS SR] Initialized {}x{} quality={} hdr={}", width, height, quality, ColorRange::IsExtended(format));
     return true;
@@ -154,8 +197,10 @@ bool XeSS::CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12C
     if (!FGResult(p_xefgSwapChainD3D12InitFromSwapChainDesc(fg, window, &desc, nullptr, queue, factory, &init), "InitSwapChain") ||
         !FGResult(p_xefgSwapChainD3D12GetSwapChainPtr(fg, IID_PPV_ARGS(chain)), "GetSwapChain")) { DestroyFG(); return false; }
     fgInitialized = true; fgEnabled = false; taggedId = 0; fgReset = 0; fgFormat = desc.Format; generatedFrames = 0;
-    p_xefgSwapChainSetEnabled(fg, false);
-    p_xefgSwapChainSetUiCompositionState(fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED);
+    if (!FGResult(p_xefgSwapChainSetEnabled(fg, false), "InitializeDisabled") ||
+        !FGResult(p_xefgSwapChainSetUiCompositionState(fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED), "SetUiComposition")) {
+        DestroyFG(); return false;
+    }
     failureReason = nullptr;
     logger::info("[XeSS FG] Swapchain initialized format={} maximum={}x", static_cast<uint32_t>(desc.Format), maxGenerated + 1);
     return true;
@@ -163,18 +208,30 @@ bool XeSS::CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12C
 
 bool XeSS::DestroyFG()
 {
-    DisableFG();
+    if (!DisableFG()) return false;
     if (fg && !FGResult(p_xefgSwapChainDestroy(fg), "Destroy")) return false;
     fg = nullptr; fgInitialized = false;
     if (ll) p_xellDestroyContext(ll);
-    ll = nullptr; sleepFrame = UINT_MAX;
+    ll = nullptr;
+    {
+        std::scoped_lock lock(markerMutex);
+        sleepFrame = UINT_MAX;
+        sleepSucceeded = false;
+        sleptPresentId = 0;
+        simulationPresentId.store(0, std::memory_order_relaxed);
+        completedSimulationId = renderStartedId = presentStartedId = presentAttemptId = 0;
+        reportFloorId = presentId.load(std::memory_order_relaxed);
+    }
     return true;
 }
 
-void XeSS::DisableFG()
+bool XeSS::DisableFG()
 {
-    if (fgInitialized && fgEnabled) p_xefgSwapChainSetEnabled(fg, false);
+    const auto wasEnabled = fgEnabled;
+    if (fgInitialized && fgEnabled && !FGResult(p_xefgSwapChainSetEnabled(fg, false), "Disable")) return false;
     fgEnabled = false; taggedId = 0; fgReset = 0;
+    if (wasEnabled) ResetPacingHistory();
+    return true;
 }
 
 bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* motion,
@@ -195,7 +252,7 @@ bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, 
     generated = std::clamp(generated, 1u, maxGenerated);
     // Coldwood's count-change workaround: reset pacing when multiplier changes.
     if (generatedFrames != generated) {
-        DisableFG();
+        if (!DisableFG()) return false;
         if (!FGResult(p_xefgSwapChainSetNumInterpolatedFrames(fg, generated), "SetGeneratedCount")) return false;
         generatedFrames = generated;
     }
@@ -205,9 +262,10 @@ bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, 
     const auto appTime = std::chrono::duration<float, std::milli>(now - lastTagTime).count();
     const auto pacedTime = static_cast<float>(XeFGPacing::RenderTimeMs());
     constants.frameRenderTime = std::clamp(pacedTime > 0.0f ? pacedTime : appTime, 0.1f, 250.0f);
-    // A resumed/reset history must not use the loading gap or a pre-load
-    // pacing sample as this frame's render duration.
-    if (constants.resetHistory) constants.frameRenderTime = 1000.0f / 60.0f;
+    // Image history resets (including optional NR fallback) do not reset
+    // measured pacing. Only an actual timing discontinuity uses a warmup.
+    if (pacingWarmupPending.exchange(false, std::memory_order_acq_rel))
+        constants.frameRenderTime = 1000.0f / 60.0f;
     lastTagTime = now;
     XeFGPacing::NoteFedFrameTime(constants.frameRenderTime);
     if (!FGResult(p_xefgSwapChainTagFrameConstants(fg, presentId, &constants), "TagConstants")) { DisableFG(); return false; }
@@ -231,44 +289,137 @@ bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, 
 void XeSS::RequestReset()
 {
     resetSerial.fetch_add(1, std::memory_order_relaxed);
+}
+
+void XeSS::ResetPacingHistory()
+{
     XeFGPacing::RequestTimingReset();
+    pacingWarmupPending.store(true, std::memory_order_release);
+    std::scoped_lock lock(markerMutex);
+    reportFloorId = presentId.load(std::memory_order_relaxed);
 }
 
 void XeSS::Sleep(uint32_t engineFrame)
 {
+    std::scoped_lock lock(markerMutex);
     if (!ll || !fgInitialized || sleepFrame == engineFrame) return;
-    sleepFrame = engineFrame;
-    p_xellSleep(ll, presentId);
+    auto id = presentId.load(std::memory_order_relaxed);
+    if (sleepFrame != UINT_MAX && sleptPresentId == id) {
+        // Renderer::End may skip Present altogether. The next real engine
+        // frame must not reuse the abandoned logical XeLL/XeFG frame ID.
+        ++id; if (!id) ++id;
+        presentId.store(id, std::memory_order_relaxed);
+        simulationPresentId.store(0, std::memory_order_relaxed);
+        reportFloorId = id;
+    }
+    sleepFrame = engineFrame; // One Sleep attempt per engine frame, even on failure.
+    sleptPresentId = id;
+    const auto result = p_xellSleep(ll, sleptPresentId);
+    sleepSucceeded = result >= 0;
+    if (!sleepSucceeded) logger::warn("[XeLL] Sleep failed frame={} id={} result={}", engineFrame, sleptPresentId, static_cast<int>(result));
 }
 void XeSS::Marker(xell_latency_marker_type_t marker)
 {
+    std::scoped_lock lock(markerMutex);
     if (!ll || !fgInitialized) return;
     const auto id = presentId.load(std::memory_order_relaxed);
-    if (marker == XELL_SIMULATION_START) simulationPresentId.store(id, std::memory_order_relaxed);
-    p_xellAddMarkerData(ll, id, marker);
+    if (!sleepSucceeded || sleptPresentId != id) return;
+    if (marker == XELL_RENDERSUBMIT_START && completedSimulationId != id) return;
+    if (marker == XELL_RENDERSUBMIT_END && renderStartedId != id) return;
+    if (marker == XELL_PRESENT_START && renderStartedId != id) return;
+    if (marker == XELL_PRESENT_END && presentStartedId != id) return;
+    if (marker == XELL_SIMULATION_START) {
+        simulationPresentId.store(id, std::memory_order_relaxed);
+        completedSimulationId = renderStartedId = presentStartedId = 0;
+    }
+    const auto result = p_xellAddMarkerData(ll, id, marker);
+    if (result < 0) {
+        if (marker == XELL_SIMULATION_START) simulationPresentId.store(0, std::memory_order_relaxed);
+        logger::warn("[XeLL] Marker {} failed id={} result={}", static_cast<int>(marker), id, static_cast<int>(result));
+    } else if (marker == XELL_RENDERSUBMIT_START) {
+        renderStartedId = id;
+    } else if (marker == XELL_PRESENT_START) {
+        presentStartedId = id;
+    }
 }
 void XeSS::EndSimulation(uint32_t engineFrame)
 {
     // Loading draws can advance Present while an old simulation is still blocked.
     // Do not attach its end marker to a newer frame or send it twice.
+    std::scoped_lock lock(markerMutex);
     const auto id = simulationPresentId.exchange(0, std::memory_order_relaxed);
-    if (ll && fgInitialized && sleepFrame == engineFrame && id && id == presentId)
-        p_xellAddMarkerData(ll, id, XELL_SIMULATION_END);
+    if (ll && fgInitialized && sleepSucceeded && sleepFrame == engineFrame && id && id == presentId) {
+        const auto result = p_xellAddMarkerData(ll, id, XELL_SIMULATION_END);
+        if (result < 0) logger::warn("[XeLL] Simulation end failed id={} result={}", id, static_cast<int>(result));
+        else completedSimulationId = id;
+    }
 }
-void XeSS::BeforePresent()
+bool XeSS::GetCPUFrameSpanMs(float& a_spanMs)
 {
-    if (!fgInitialized) return;
-    if (taggedId != presentId) DisableFG();
-    p_xefgSwapChainSetPresentId(fg, presentId);
-    Marker(XELL_RENDERSUBMIT_END); Marker(XELL_PRESENT_START);
+    std::scoped_lock lock(markerMutex);
+    if (!ll || !fgInitialized || !p_xellGetFramesReports) return false;
+    xell_frame_report_t reports[64]{};
+    const auto result = p_xellGetFramesReports(ll, reports);
+    if (result < 0) return false;
+    const auto currentId = presentId.load(std::memory_order_relaxed);
+    const xell_frame_report_t* latest = nullptr;
+    for (const auto& report : reports) {
+        if (!report.m_frame_id || report.m_frame_id < reportFloorId ||
+            report.m_frame_id >= currentId || currentId - report.m_frame_id > 64 ||
+            !report.m_sim_start_ts || !report.m_sim_end_ts || !report.m_render_submit_start_ts ||
+            !report.m_render_submit_end_ts || !report.m_present_start_ts || !report.m_present_end_ts ||
+            report.m_sim_end_ts < report.m_sim_start_ts ||
+            report.m_present_end_ts <= report.m_sim_start_ts) continue;
+        if (!latest || report.m_frame_id > latest->m_frame_id) latest = &report;
+    }
+    if (!latest) return false;
+    a_spanMs = static_cast<float>(static_cast<double>(latest->m_present_end_ts - latest->m_sim_start_ts) / 1'000'000.0);
+    return true;
+}
+bool XeSS::BeforePresent()
+{
+    if (!fgInitialized) return true;
+    if (taggedId != presentId && !DisableFG()) return false;
+    std::unique_lock lock(markerMutex);
+    const auto id = presentId.load(std::memory_order_relaxed);
+    if (!FGResult(p_xefgSwapChainSetPresentId(fg, id), "SetPresentId")) {
+        lock.unlock();
+        DisableFG();
+        return false;
+    }
+    presentAttemptId = id;
+    if (presentStartedId != id && sleepSucceeded && sleptPresentId == id && renderStartedId == id) {
+        const auto renderEnd = p_xellAddMarkerData(ll, id, XELL_RENDERSUBMIT_END);
+        const auto presentStart = renderEnd >= 0 ? p_xellAddMarkerData(ll, id, XELL_PRESENT_START) : renderEnd;
+        if (presentStart < 0) {
+            logger::warn("[XeLL] Present markers failed id={} result={}", id, static_cast<int>(presentStart));
+            lock.unlock();
+            DisableFG();
+            return false;
+        }
+        presentStartedId = id;
+    }
+    return true;
 }
 void XeSS::AfterPresent(HRESULT result)
 {
     if (!fgInitialized) return;
-    Marker(XELL_PRESENT_END);
+    if (result == DXGI_ERROR_WAS_STILL_DRAWING) return;
+    {
+        std::scoped_lock lock(markerMutex);
+        const auto id = presentAttemptId;
+        if (id && id == presentId.load(std::memory_order_relaxed)) {
+            if (sleepSucceeded && sleptPresentId == id && presentStartedId == id) {
+                const auto markerResult = p_xellAddMarkerData(ll, id, XELL_PRESENT_END);
+                if (markerResult < 0) logger::warn("[XeLL] Present end failed id={} result={}", id, static_cast<int>(markerResult));
+            }
+            auto next = id + 1; if (!next) ++next;
+            presentId.store(next, std::memory_order_relaxed);
+        }
+        presentAttemptId = 0;
+    }
     xefg_swapchain_present_status_t status{};
     if (result == S_OK && p_xefgSwapChainGetLastPresentStatus(fg, &status) == XEFG_SWAPCHAIN_RESULT_SUCCESS)
         presentedFrames.fetch_add(status.framesPresented, std::memory_order_relaxed);
-    if (FAILED(result)) RequestReset();
-    ++presentId; if (!presentId) ++presentId;
+    if (FAILED(result)) { RequestReset(); ResetPacingHistory(); }
 }
