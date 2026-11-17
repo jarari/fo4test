@@ -227,6 +227,13 @@ bool XeSS::DestroyFG()
 
 bool XeSS::DisableFG()
 {
+    // XeFG forbids toggling after ONLY_NOW tagging until its copy list has been
+    // submitted. This also protects partial-tag failures from clearing history
+    // whose copies have not run yet. No CPU/GPU drain is required here.
+    if (pendingFGCommands) {
+        logger::error("[XeSS FG] Refusing disable before tagged copies are submitted");
+        return false;
+    }
     const auto wasEnabled = fgEnabled;
     if (fgInitialized && fgEnabled && !FGResult(p_xefgSwapChainSetEnabled(fg, false), "Disable")) return false;
     fgEnabled = false; taggedId = 0; fgReset = 0;
@@ -234,14 +241,33 @@ bool XeSS::DisableFG()
     return true;
 }
 
-bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* motion,
-    ID3D12Resource* depth, float2 jitter, float2 renderSize, float2 displaySize, uint generated)
+bool XeSS::PrepareFG(uint generated)
 {
-    if (!fgInitialized || !commands || !color || !motion || !depth) return false;
+    if (!fgInitialized || pendingFGCommands) return false;
+    generated = std::clamp(generated, 1u, maxGenerated);
+    // SDK lifecycle calls must precede tagging, not run inside the SR/FG list.
+    // Menus only toggle enablement; they do not change the interpolation count.
+    if (generatedFrames != generated) {
+        if (!DisableFG()) return false;
+        if (!FGResult(p_xefgSwapChainSetNumInterpolatedFrames(fg, generated), "SetGeneratedCount")) return false;
+        generatedFrames = generated;
+    }
+    if (!fgEnabled) {
+        if (!FGResult(p_xefgSwapChainSetEnabled(fg, true), "Enable")) return false;
+        fgEnabled = true;
+    }
+    return true;
+}
+
+bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* motion,
+    ID3D12Resource* depth, float2 jitter, float2 renderSize, float2 displaySize)
+{
+    taggedId = 0;
+    if (!fgInitialized || !fgEnabled || pendingFGCommands || !commands || !color || !motion || !depth) return false;
     // HUD-less color and the proxy backbuffer must share the same transfer/format.
-    if (color->GetDesc().Format != fgFormat) { DisableFG(); return false; }
+    if (color->GetDesc().Format != fgFormat) return false;
     const auto camera = Util::GetCameraProjection();
-    if (!camera.cameraState || !camera.usedMatrixFOV) { DisableFG(); return false; }
+    if (!camera.cameraState || !camera.usedMatrixFOV) return false;
     xefg_swapchain_frame_constant_data_t constants{};
     const auto projection = camera.cameraViewToClip;
     const auto view = DirectX::XMMatrixMultiply(Util::ToXMMatrix(camera.cameraState->camViewData.currentViewProjUnjittered),
@@ -249,15 +275,8 @@ bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, 
     memcpy(constants.viewMatrix, &view, sizeof(view)); memcpy(constants.projectionMatrix, &projection, sizeof(projection));
     constants.jitterOffsetX = -jitter.x; constants.jitterOffsetY = -jitter.y;
     constants.motionVectorScaleX = renderSize.x; constants.motionVectorScaleY = renderSize.y;
-    generated = std::clamp(generated, 1u, maxGenerated);
-    // Coldwood's count-change workaround: reset pacing when multiplier changes.
-    if (generatedFrames != generated) {
-        if (!DisableFG()) return false;
-        if (!FGResult(p_xefgSwapChainSetNumInterpolatedFrames(fg, generated), "SetGeneratedCount")) return false;
-        generatedFrames = generated;
-    }
     const auto serial = resetSerial.load(std::memory_order_relaxed);
-    constants.resetHistory = fgReset != serial || !fgEnabled;
+    constants.resetHistory = fgReset != serial;
     const auto now = std::chrono::steady_clock::now();
     const auto appTime = std::chrono::duration<float, std::milli>(now - lastTagTime).count();
     const auto pacedTime = static_cast<float>(XeFGPacing::RenderTimeMs());
@@ -268,7 +287,10 @@ bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, 
         constants.frameRenderTime = 1000.0f / 60.0f;
     lastTagTime = now;
     XeFGPacing::NoteFedFrameTime(constants.frameRenderTime);
-    if (!FGResult(p_xefgSwapChainTagFrameConstants(fg, presentId, &constants), "TagConstants")) { DisableFG(); return false; }
+    // A failure invalidates this frame's tags. BeforePresent disables only after
+    // the caller has submitted even a partially recorded SR/FG command list.
+    if (!FGResult(p_xefgSwapChainTagFrameConstants(fg, presentId, &constants), "TagConstants")) return false;
+    pendingFGCommands = commands;
     const auto tag = [&](ID3D12Resource* resource, xefg_swapchain_resource_type_t type, float2 size) {
         xefg_swapchain_d3d12_resource_data_t data{};
         data.type = type; data.validity = XEFG_SWAPCHAIN_RV_ONLY_NOW;
@@ -279,11 +301,14 @@ bool XeSS::TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, 
         return FGResult(p_xefgSwapChainD3D12TagFrameResource(fg, commands, presentId, &data), "TagResource");
     };
     if (!tag(depth, XEFG_SWAPCHAIN_RES_DEPTH, renderSize) || !tag(motion, XEFG_SWAPCHAIN_RES_MOTION_VECTOR, renderSize) ||
-        !tag(color, XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, displaySize) || !FGResult(p_xefgSwapChainSetEnabled(fg, true), "Enable")) {
-        DisableFG(); return false;
-    }
-    generatedFrames = generated; fgEnabled = true; fgReset = serial; taggedId = presentId;
+        !tag(color, XEFG_SWAPCHAIN_RES_HUDLESS_COLOR, displaySize)) return false;
+    fgReset = serial; taggedId = presentId;
     return true;
+}
+
+void XeSS::OnCommandsSubmitted(ID3D12CommandList* commands)
+{
+    if (pendingFGCommands == commands) pendingFGCommands = nullptr;
 }
 
 void XeSS::RequestReset()
@@ -379,6 +404,10 @@ bool XeSS::GetCPUFrameSpanMs(float& a_spanMs)
 bool XeSS::BeforePresent()
 {
     if (!fgInitialized) return true;
+    if (pendingFGCommands) {
+        logger::error("[XeSS FG] Refusing Present before tagged copies are submitted");
+        return false;
+    }
     if (taggedId != presentId && !DisableFG()) return false;
     std::unique_lock lock(markerMutex);
     const auto id = presentId.load(std::memory_order_relaxed);

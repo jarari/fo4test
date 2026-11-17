@@ -25,6 +25,8 @@
 #include "ReShadeDepth.h"
 #include "PipboyTemporalMask.h"
 #include "TextureMemoryReserve.h"
+#include "FeatureRetryPolicy.h"
+#include "UpscalingMenu.h"
 
 extern bool enbLoaded;
 
@@ -49,6 +51,7 @@ struct Main_Run_OnIdle
 {
 	static void thunk(RE::Main* a_main)
 	{
+		Upscaling::GetSingleton()->PollSettingsHotReload();
 		const auto nextFrame = Util::State_GetSingleton()->frameCount + 1;
 		DX12SwapChain::GetSingleton()->WaitForFrameStart();
 		Streamline::GetSingleton()->BeginSimulationFrame(nextFrame);
@@ -298,10 +301,11 @@ namespace
 	constexpr uint32_t kDLSSGResumeStableFrames = 2;
 	constexpr uint64_t kFeatureRetryGameFrames = 5;
 	constexpr uint32_t kFeatureFailuresBeforeRetryBlock = 3;
-	constexpr uint32_t kSRMaxFailureAttempts = 3;
 	FILETIME g_lastSettingsWriteTime{};
 	bool g_hasLastSettingsWriteTime = false;
 	bool g_lastSettingsFileExists = false;
+	std::mutex g_settingsLoadMutex;
+	std::atomic<bool> g_settingsHotReload{ false };
 	bool g_textureMemoryReserveApplied = false;
 	bool g_textureMemoryReserveEnabled = false;
 	uint64_t g_textureMemoryOriginalLimit = 0;
@@ -704,6 +708,24 @@ namespace
 		config.nrAfterSR = settings.dlssNRPosition == 1;
 		config.sharpen = settings.sharpness > 0.0f;
 		config.reshadeDepth = ReShadeDepth::IsActive();
+		config.retainedNRBytes = Streamline::GetSingleton()->GetRetainedNRMemoryEstimate();
+		const auto allocationBytes = [&](ID3D12Resource* resource) -> uint64_t {
+			if (!resource) return 0;
+			const auto desc = resource->GetDesc();
+			const auto info = swap->GetD3D12Device()->GetResourceAllocationInfo(0, 1, &desc);
+			return info.SizeInBytes == UINT64_MAX ? 0 : info.SizeInBytes;
+		};
+		for (size_t i = 0; i < kDX12FrameCount; ++i) {
+			config.retainedNRBytes += allocationBytes(upscaling->nrMotionD3D12[i].get());
+			config.retainedNRBytes += allocationBytes(upscaling->nrDepthD3D12[i].get());
+			// DLSS's raw guides are included in its SR estimate; other SR
+			// methods retain a separate raw copy specifically for NR.
+			if (config.sr != TextureMemoryReserve::SR::DLSS) {
+				config.retainedNRBytes += allocationBytes(upscaling->dlssMotionVectorD3D12[i].get());
+				config.retainedNRBytes += allocationBytes(upscaling->dlssDepthD3D12[i].get());
+			}
+			config.retainedNRColorBytes += allocationBytes(upscaling->dlssSharpenedD3D12[i].get());
+		}
 		const auto estimate = TextureMemoryReserve::Calculate(config);
 		const auto extraReserve = std::min(settings.extraVRAMBudgetMB, 2048u) * TextureMemoryReserve::MiB;
 		const auto reserve = estimate.reserve + extraReserve;
@@ -1939,6 +1961,39 @@ struct SamplerStates
 
 void Upscaling::LoadSettings()
 {
+	LoadSettings(SettingsLoad::Always);
+}
+
+void Upscaling::LoadSettings(SettingsLoad a_mode)
+{
+	std::scoped_lock lock(g_settingsLoadMutex);
+	if (a_mode != SettingsLoad::Always && !SettingsFileChangedSinceLastLoad()) {
+		return;
+	}
+
+	const bool hotReload = a_mode == SettingsLoad::HotReload;
+	FILETIME writeTime{};
+	if (hotReload && !TryGetSettingsWriteTime(writeTime)) {
+		return;
+	}
+
+	CSimpleIniA ini;
+	ini.SetUnicode();
+	const auto readResult = ini.LoadFile(kSettingsPath);
+	if (hotReload) {
+		FILETIME currentWriteTime{};
+		if (readResult < 0 || !TryGetSettingsWriteTime(currentWriteTime) ||
+			CompareFileTime(&writeTime, &currentWriteTime) != 0) {
+			return;
+		}
+		g_lastSettingsWriteTime = writeTime;
+		g_lastSettingsFileExists = true;
+		g_hasLastSettingsWriteTime = true;
+	} else {
+		RememberSettingsWriteTime();
+	}
+	g_settingsHotReload.store(ini.GetBoolValue("Testing", "bHotReloadSettings", false), std::memory_order_relaxed);
+
 	const auto previousUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);
 	const auto previousQualityMode = settings.qualityMode;
 	const auto previousFrameGenerationMode = settings.frameGenerationMode;
@@ -1948,6 +2003,8 @@ void Upscaling::LoadSettings()
 	const auto previousDLSSNRPosition = settings.dlssNRPosition;
 	const auto previousDLSSNREnabled = settings.dlssNREnabled;
 	const auto previousDLSSNRPassCount = settings.dlssNRPassCount;
+	const auto previousNRSeparatePassSettings = settings.dlssNRSeparatePassSettings;
+	const auto previousNRPassOptions = settings.dlssNRPassOptions;
 	const auto previousDLSSNRPreset = settings.dlssNRPreset;
 	const auto previousDLSSNRStyle = settings.dlssNRStyle;
 	const auto previousDLSSNRUseAutoMask = settings.dlssNRUseAutoMask;
@@ -1956,11 +2013,6 @@ void Upscaling::LoadSettings()
 	const auto previousDLSSNRLocalStructureStrength = settings.dlssNRLocalStructureStrength;
 	const auto previousDLSSNRSkinStructureStrength = settings.dlssNRSkinStructureStrength;
 
-	CSimpleIniA ini;
-	ini.SetUnicode();
-	ini.LoadFile(kSettingsPath);
-	RememberSettingsWriteTime();
-	
 	settings.upscaleMethodPreference = static_cast<uint>(ini.GetLongValue("Settings", "iUpscaleMethodPreference", 2));
 	settings.qualityMode = static_cast<uint>(ini.GetLongValue("Settings", "iQualityMode", 1));
 	settings.frameGenerationMode = static_cast<uint>(ini.GetLongValue("Settings", "iFrameGenerationMode", 0));
@@ -1984,6 +2036,19 @@ void Upscaling::LoadSettings()
 	settings.dlssNRLocalToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalToneStrength", 1.0)), 0.0f, 2.0f);
 	settings.dlssNRLocalStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fLocalStructureStrength", 1.0)), 0.0f, 2.0f);
 	settings.dlssNRSkinStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue("DLSSNR", "fSkinStructureStrength", 1.0)), -1.0f, 2.0f);
+	settings.dlssNRSeparatePassSettings = ini.GetBoolValue("DLSSNR", "bSeparateSettingPerPass", false) ? 1u : 0u;
+	for (size_t i = 0; i < settings.dlssNRPassOptions.size(); ++i) {
+		const auto section = std::format("DLSSNR.Pass{}", i + 2);
+		auto& pass = settings.dlssNRPassOptions[i];
+		pass.performanceMode = nvngx::dlss_nr::kNativePerformanceMode;
+		pass.preset = static_cast<uint>(std::clamp<long>(ini.GetLongValue(section.c_str(), "iPreset", settings.dlssNRPreset), 0, 3));
+		pass.style = static_cast<uint>(std::clamp<long>(ini.GetLongValue(section.c_str(), "iStyle", settings.dlssNRStyle), 0, 2));
+		pass.intensity = std::clamp(static_cast<float>(ini.GetDoubleValue(section.c_str(), "fIntensity", settings.dlssNRIntensity)), 0.0f, 1.0f);
+		pass.localToneStrength = std::clamp(static_cast<float>(ini.GetDoubleValue(section.c_str(), "fLocalToneStrength", 0.0)), 0.0f, 2.0f);
+		pass.localStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue(section.c_str(), "fLocalStructureStrength", settings.dlssNRLocalStructureStrength)), 0.0f, 2.0f);
+		pass.skinStructureStrength = std::clamp(static_cast<float>(ini.GetDoubleValue(section.c_str(), "fSkinStructureStrength", settings.dlssNRSkinStructureStrength)), -1.0f, 2.0f);
+		pass.useAutoMask = ini.GetBoolValue(section.c_str(), "bUseAutoMask", settings.dlssNRUseAutoMask != 0);
+	}
 	settings.osdMode = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Settings", "iOnScreenDisplay", 0), 0, 2));
 	settings.extraVRAMBudgetMB = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Misc", "iExtraVRAMBudgetMB", 0), 0, 2048));
 	const auto legacySharpness = ini.GetDoubleValue("Settings", "fRCASSharpness", 0.2);
@@ -2008,6 +2073,8 @@ void Upscaling::LoadSettings()
 		previousDLSSNREnabled != settings.dlssNREnabled ||
 		previousDLSSNRPosition != settings.dlssNRPosition ||
 		previousDLSSNRPassCount != settings.dlssNRPassCount ||
+		previousNRSeparatePassSettings != settings.dlssNRSeparatePassSettings ||
+		(settings.dlssNRSeparatePassSettings && previousNRPassOptions != settings.dlssNRPassOptions) ||
 		previousDLSSNRPreset != settings.dlssNRPreset ||
 		previousDLSSNRStyle != settings.dlssNRStyle ||
 		previousDLSSNRUseAutoMask != settings.dlssNRUseAutoMask ||
@@ -2041,10 +2108,16 @@ void Upscaling::LoadSettings()
 	if (settings.frameGenerationMode > 0 && streamline->initialized && !streamline->UsesD3D12()) {
 		logger::warn("[Upscaling] DLSS-G requires the D3D12 proxy swapchain to be selected at startup. Keep iFrameGenerationMode enabled and restart the game.");
 	}
+	if (hotReload) {
+		logger::info("[Settings] Hot reloaded: SR={} quality={} FG mode={} requested provider={} active provider={} NR={}",
+			settings.upscaleMethodPreference, settings.qualityMode, settings.frameGenerationMode,
+			settings.frameGenerationProvider, GetFGProviderName(), settings.dlssNREnabled);
+	}
 }
 
 bool Upscaling::SaveSettings(const Settings& a_settings)
 {
+	std::scoped_lock lock(g_settingsLoadMutex);
 	const std::filesystem::path settingsPath(kSettingsPath);
 	std::error_code directoryError;
 	std::filesystem::create_directories(settingsPath.parent_path(), directoryError);
@@ -2077,6 +2150,18 @@ bool Upscaling::SaveSettings(const Settings& a_settings)
 	ini.SetLongValue("DLSSNR", "iPosition", static_cast<long>(a_settings.dlssNRPosition));
 	ini.SetLongValue("DLSSNR", "bEnabled", static_cast<long>(a_settings.dlssNREnabled));
 	ini.SetLongValue("DLSSNR", "iPassCount", static_cast<long>(std::clamp(a_settings.dlssNRPassCount, 1u, 3u)));
+	ini.SetBoolValue("DLSSNR", "bSeparateSettingPerPass", a_settings.dlssNRSeparatePassSettings != 0);
+	for (size_t i = 0; i < a_settings.dlssNRPassOptions.size(); ++i) {
+		const auto section = std::format("DLSSNR.Pass{}", i + 2);
+		const auto& pass = a_settings.dlssNRPassOptions[i];
+		ini.SetLongValue(section.c_str(), "iPreset", pass.preset);
+		ini.SetLongValue(section.c_str(), "iStyle", pass.style);
+		ini.SetDoubleValue(section.c_str(), "fIntensity", pass.intensity);
+		ini.SetDoubleValue(section.c_str(), "fLocalToneStrength", pass.localToneStrength);
+		ini.SetDoubleValue(section.c_str(), "fLocalStructureStrength", pass.localStructureStrength);
+		ini.SetDoubleValue(section.c_str(), "fSkinStructureStrength", pass.skinStructureStrength);
+		ini.SetBoolValue(section.c_str(), "bUseAutoMask", pass.useAutoMask);
+	}
 	ini.SetLongValue("Presentation", "iVSyncMode", static_cast<long>(std::min(a_settings.vsyncMode, 2u)));
 	ini.SetLongValue("Presentation", "iOutputFPSLimit", a_settings.outputFPSLimit == 0 ? 0L : static_cast<long>(std::clamp(a_settings.outputFPSLimit, 10u, 500u)));
 	// NR always evaluates at 1:1 resolution, independently of SR quality.
@@ -2102,9 +2187,23 @@ bool Upscaling::SaveSettings(const Settings& a_settings)
 
 void Upscaling::ReloadSettingsIfChanged()
 {
-	if (SettingsFileChangedSinceLastLoad()) {
-		LoadSettings();
+	LoadSettings(SettingsLoad::IfChanged);
+}
+
+void Upscaling::PollSettingsHotReload()
+{
+	if (!g_settingsHotReload.load(std::memory_order_relaxed) ||
+		DX12SwapChain::GetSingleton()->IsLoadingScreen() || UpscalingMenu::IsOpen()) {
+		return;
 	}
+
+	static ULONGLONG nextPoll = 0;
+	const auto now = GetTickCount64();
+	if (now < nextPoll) {
+		return;
+	}
+	nextPoll = now + 500;
+	LoadSettings(SettingsLoad::HotReload);
 }
 
 void Upscaling::OnDataLoaded()
@@ -3291,13 +3390,13 @@ void Upscaling::ReportFeatureRequestFailure(FeatureRequest a_feature, std::strin
 		}
 		block.lastFailureGameFrame = currentGameFrame;
 	}
-	if (temporalSR && (!a_retryable || block.consecutiveFailures >= kSRMaxFailureAttempts)) {
+	if (temporalSR && !a_retryable) {
 		block.active = true;
 		block.requiresConfigurationChange = true;
 		block.retryAfterTick = 0;
 	} else if (temporalSR && !block.requiresConfigurationChange) {
 		block.active = true;
-		block.retryAfterTick = GetTickCount64() + (uint64_t{1} << std::min(block.consecutiveFailures, 2u)) * 1000;
+		block.retryAfterTick = GetTickCount64() + FeatureRetryPolicy::DelayMilliseconds(block.consecutiveFailures);
 	} else if (!temporalSR && block.consecutiveFailures >= kFeatureFailuresBeforeRetryBlock) {
 		block.active = true;
 		block.retryGameFrame = currentGameFrame + kFeatureRetryGameFrames;
@@ -3315,7 +3414,7 @@ void Upscaling::ReportFeatureRequestFailure(FeatureRequest a_feature, std::strin
 
 	const auto retryState = block.requiresConfigurationChange ? "configuration-change" : block.active ? "cooldown" : "unblocked";
 	const auto retryDetails = temporalSR ?
-		std::format("attempts={}/{} state={} retryTick={}", block.consecutiveFailures, kSRMaxFailureAttempts, retryState, block.retryAfterTick) :
+		std::format("attempts={} state={} retryTick={}", block.consecutiveFailures, retryState, block.retryAfterTick) :
 		std::format("failures={} state={} retryFrame={}", block.consecutiveFailures, retryState, block.retryGameFrame);
 	logger::warn(
 		"[Upscaling] {} request failed in {}; {} currentFrame={} "
@@ -4903,7 +5002,13 @@ void Upscaling::CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_m
 				sharpenedDesc.Height = static_cast<UINT>(a_displaySize.y);
 				sharpenedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
 				sharpenedDesc.MiscFlags = 0;
-				EnsureSharedD3D12Texture(this, sharpenedDesc, dlssSharpenedSharedTextures[frameIndex], dlssSharpenedD3D12[frameIndex], true);
+				try {
+					EnsureSharedD3D12Texture(this, sharpenedDesc, dlssSharpenedSharedTextures[frameIndex], dlssSharpenedD3D12[frameIndex], true);
+				} catch (const std::exception& e) {
+					// Optional NR/sharpening must not turn memory pressure into
+					// a failure of otherwise valid DLSS SR inputs.
+					logger::warn("[NR] Optional DLSS output unavailable; retaining base SR: {}", e.what());
+				}
 			}
 
 			// The opaque snapshot is pre-imagespace HDR; this input is post-
@@ -5438,7 +5543,7 @@ bool Upscaling::EvaluateExternalFrameGeneration(ID3D12GraphicsCommandList* a_com
 	auto dx12SwapChain = DX12SwapChain::GetSingleton();
 	const auto succeeded = activeFGProvider == FGProvider::XeSS ?
 		XeSS::GetSingleton()->TagFrame(a_commandList, color, motionVectors, depth, jitter,
-			dlssgInputRenderSizes[a_frameIndex], dlssgInputDisplaySizes[a_frameIndex], settings.xessGeneratedFrames + 1) :
+			dlssgInputRenderSizes[a_frameIndex], dlssgInputDisplaySizes[a_frameIndex]) :
 		FidelityFX::GetSingleton()->ConfigureFrameGeneration(
 		dx12SwapChain->GetD3D12Device(),
 		a_commandList,

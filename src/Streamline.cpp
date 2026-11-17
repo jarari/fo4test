@@ -13,6 +13,7 @@
 
 #include "DX12SwapChain.h"
 #include "ColorRange.h"
+#include "TextureMemoryReserve.h"
 #include "ENBRenderDomain.h"
 #include "Util.h"
 
@@ -272,6 +273,7 @@ void Streamline::Shutdown()
 {
 	ResetReflexLatencyHistory();
 	directDLSSNR.Shutdown();
+	retainedNativeNRBytes = 0;
 	dlssNRSuspended = false;
 	if (initialized && slShutdown) {
 		if (SL_FAILED(result, slShutdown())) {
@@ -1551,6 +1553,11 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 			&view, &resourceTags[0], &resourceTags[1], &resourceTags[2],
 			&resourceTags[3], &resourceTags[4]
 		};
+		if (a_useDLSSNR) {
+			// A failed evaluation can still leave plugin allocations behind.
+			retainedNativeNRBytes = std::max(retainedNativeNRBytes,
+				TextureMemoryReserve::NRFeatureBytes(a_outputExtent.width, a_outputExtent.height));
+		}
 		if (SL_FAILED(result, slEvaluateFeature(feature, *a_frameToken, inputs, numResourceTags + 1, a_commandList))) {
 			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
 				logger::warn(
@@ -1615,6 +1622,8 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		parameters.motionVectorScaleY = 1.0f;
 		parameters.depthInverted = false;
 		parameters.passCount = std::clamp(a_dlssNRPassCount, 1u, 3u);
+		parameters.separatePassSettings = Upscaling::GetSingleton()->settings.dlssNRSeparatePassSettings != 0;
+		parameters.additionalPassOptions = Upscaling::GetSingleton()->settings.dlssNRPassOptions;
 		parameters.outputFormat = a_colorFormat;
 		if (!ValidateConstantsForFrame(a_frameToken)) {
 			return false;
@@ -1931,6 +1940,8 @@ bool Streamline::GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D1
 	a_parameters.options.skinStructureStrength = upscaling->settings.dlssNRSkinStructureStrength;
 	a_parameters.options.useAutoMask = upscaling->settings.dlssNRUseAutoMask != 0;
 	a_parameters.passCount = std::clamp(upscaling->settings.dlssNRPassCount, 1u, 3u);
+	a_parameters.separatePassSettings = upscaling->settings.dlssNRSeparatePassSettings != 0;
+	a_parameters.additionalPassOptions = upscaling->settings.dlssNRPassOptions;
 	a_parameters.outputFormat = upscaling->dlssSharpenedD3D12[a_slot]->GetDesc().Format;
 	return directDLSSNR.NeedsFeaturePreparation(a_parameters);
 }
@@ -1985,6 +1996,8 @@ void Streamline::DestroyDLSSResources(bool a_preserveDirectNR)
 	if (featureDLSSNR && !dlssNRSuspended) {
 		if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS_NR, viewport))) {
 			logger::warn("[Streamline] Could not free DLSS-NR resources: {}", magic_enum::enum_name(result));
+		} else {
+			retainedNativeNRBytes = 0;
 		}
 	}
 	if (featureNIS && nisResourcesUsed) {
@@ -2022,6 +2035,8 @@ void Streamline::SuspendDLSSNR()
 	if (initialized && featureDLSSNR && slFreeResources) {
 		if (SL_FAILED(result, slFreeResources(sl::kFeatureDLSS_NR, viewport))) {
 			logger::warn("[Streamline] Could not free suspended DLSS-NR resources: {}", magic_enum::enum_name(result));
+		} else {
+			retainedNativeNRBytes = 0;
 		}
 	}
 	dlssNRSuspended = true;

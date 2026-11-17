@@ -105,6 +105,8 @@ public:
 		uint dlssNRPosition = 0;                                    ///< 0: Before SR, 1: After SR
 		uint dlssNREnabled = 0;                                     ///< Enable optional NR at the selected SR stage
 		uint dlssNRPassCount = 1;                                   ///< Direct-NGX NR histories evaluated in sequence (1..3)
+		uint dlssNRSeparatePassSettings = 0;
+		std::array<nvngx::dlss_nr::Options, 2> dlssNRPassOptions = nvngx::dlss_nr::DefaultAdditionalPassOptions();
 		uint vsyncMode = 0;                                        ///< 0=game, 1=off, 2=on
 		uint outputFPSLimit = 0;                                   ///< FG-inclusive target, 0=unlimited, otherwise 10..500
 		uint dlssNRPreset = 0;                                      ///< DLSS-NR preset: 0=Default, 1..3=preview presets
@@ -133,6 +135,7 @@ public:
 	void LoadSettings();
 	bool SaveSettings(const Settings& a_settings);
 	void ReloadSettingsIfChanged();
+	void PollSettingsHotReload();
 
 	/**
 	 * @brief Determine which upscaling method should be used
@@ -560,6 +563,9 @@ public:
 	};
 
 private:
+	enum class SettingsLoad { Always, IfChanged, HotReload };
+	void LoadSettings(SettingsLoad a_mode);
+
 	// ========================================
 	// Shader Resources (Private)
 	// ========================================

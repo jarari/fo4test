@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include "NRPassOptions.h"
 
 inline constexpr auto NVSDK_NGX_Feature_DLSSNR = static_cast<NVSDK_NGX_Feature>(18);
 inline constexpr std::uint64_t NVSDK_NGX_DLSSNR_ApplicationId = 141959980;
@@ -70,21 +71,6 @@ inline constexpr char NVSDK_NGX_Parameter_DLSSNR_UICorrection[] = "DLSSNR.UICorr
 
 namespace nvngx::dlss_nr
 {
-	// Host convention is NGX PerfQualityValue + 1: DLAA / Native = 5 + 1.
-	inline constexpr std::uint32_t kNativePerformanceMode = 6;
-
-	struct Options
-	{
-		std::uint32_t performanceMode = kNativePerformanceMode;
-		std::uint32_t preset = 0;
-		std::uint32_t style = 0;
-		float intensity = 1.0f;
-		float localToneStrength = 1.0f;
-		float localStructureStrength = 1.0f;
-		float skinStructureStrength = 1.0f;
-		bool useAutoMask = false;
-	};
-
 	struct D3D12EvaluationParameters
 	{
 		ID3D12Resource* color = nullptr;
@@ -104,6 +90,15 @@ namespace nvngx::dlss_nr
 		std::uint32_t passCount = 1;
 		DXGI_FORMAT outputFormat = DXGI_FORMAT_UNKNOWN;
 		Options options{};
+		bool separatePassSettings = false;
+		std::array<Options, 2> additionalPassOptions = DefaultAdditionalPassOptions();
+
+		D3D12EvaluationParameters ForPass(std::uint32_t pass) const
+		{
+			auto result = *this;
+			result.options = ResolvePassOptions(options, separatePassSettings, additionalPassOptions, pass);
+			return result;
+		}
 	};
 
 	class D3D12Backend
@@ -126,6 +121,7 @@ namespace nvngx::dlss_nr
 		bool PrepareFeature(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters);
 		bool Evaluate(ID3D12GraphicsCommandList* a_commandList, const D3D12EvaluationParameters& a_parameters);
 		std::uint32_t GetLastEvaluatedPassCount() const { return lastEvaluatedPassCount_; }
+		std::uint64_t GetRetainedMemoryEstimate() const;
 		void RequestReset();
 		bool ReleaseFeature();
 		void Shutdown();
@@ -146,6 +142,7 @@ namespace nvngx::dlss_nr
 			PFun_EvaluateFeature activeEvaluateFeature = nullptr;
 			PFun_ReleaseFeature activeReleaseFeature = nullptr;
 			bool forceReset = true;
+			std::uint64_t memoryEstimate = 0;
 			std::uint32_t inputWidth = 0;
 			std::uint32_t inputHeight = 0;
 			std::uint32_t outputWidth = 0;

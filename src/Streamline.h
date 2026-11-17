@@ -49,6 +49,7 @@ public:
 	bool ValidateConstantsForFrame(sl::FrameToken* a_frameToken);
 	bool GetD3D12DLSSNRPreparation(uint32_t a_slot, nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters) const;
 	bool PrepareD3D12DLSSNR(ID3D12GraphicsCommandList* a_list, const nvngx::dlss_nr::D3D12EvaluationParameters& a_parameters);
+	uint64_t GetRetainedNRMemoryEstimate() const { return directDLSSNR.GetRetainedMemoryEstimate() + retainedNativeNRBytes; }
 	// ========================================
 	// Singleton & Lifecycle
 	// ========================================
@@ -366,6 +367,7 @@ private:
 	uint32_t currentD3D12DLSSOutputHeight = 0;
 	uint currentD3D12DLSSModelPreset = std::numeric_limits<uint>::max();
 	bool currentD3D12DLSSNROptionsValid = false;
+	uint64_t retainedNativeNRBytes = 0;
 	sl::DLSSNROptions currentD3D12DLSSNROptions{};
 	bool currentNISOptionsValid = false;
 	bool nisResourcesUsed = false;

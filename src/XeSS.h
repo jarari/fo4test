@@ -23,8 +23,10 @@ public:
     bool CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12CommandQueue* queue,
         HWND window, const DXGI_SWAP_CHAIN_DESC1& desc, IDXGISwapChain4** chain);
     bool DestroyFG(); // Release application proxy references first; XeFG drains its own pacer.
+    bool PrepareFG(uint generated); // Before recording this frame's ONLY_NOW copies.
     bool TagFrame(ID3D12GraphicsCommandList* commands, ID3D12Resource* color, ID3D12Resource* motion,
-        ID3D12Resource* depth, float2 jitter, float2 renderSize, float2 displaySize, uint generated);
+        ID3D12Resource* depth, float2 jitter, float2 renderSize, float2 displaySize);
+    void OnCommandsSubmitted(ID3D12CommandList* commands);
     bool DisableFG();
     bool BeforePresent();
     void AfterPresent(HRESULT result);
@@ -49,6 +51,7 @@ private:
     bool fgInitialized = false, fgEnabled = false;
     uint maxGenerated = 1, generatedFrames = 1;
     uint32_t taggedId = 0;
+    ID3D12CommandList* pendingFGCommands = nullptr; // Borrowed until ExecuteCommandLists.
     std::atomic<uint32_t> simulationPresentId{0};
     std::atomic<uint32_t> presentId{1}, sleepFrame{UINT_MAX};
     std::mutex markerMutex;

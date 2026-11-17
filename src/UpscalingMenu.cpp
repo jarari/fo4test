@@ -474,6 +474,18 @@ namespace
 			"%d",
 			"Runs up to three independent direct-NGX NR histories. Streamline-native NR remains single-pass.");
 		static constexpr std::array nrStyles{ "Default", "Natural", "Cinematic" };
+		static constexpr std::array nrPresets{ "Default", "Preset 1 (preview)", "Preset 2 (preview)", "Preset 3 (preview)" };
+		const bool nativeSinglePass = settings.dlssNRPosition == 0 && streamline->featureDLSSNR && streamline->slDLSSNRSetOptions;
+		if (settings.dlssNRPassCount >= 2) {
+			ImGuiMCP::BeginDisabled(nativeSinglePass);
+			changed |= CheckboxSetting("Separate setting per pass", settings.dlssNRSeparatePassSettings,
+				"Give passes 2 and 3 their own preset, style, mask and strengths. Off preserves shared settings and disables repeated local tone enhancement.");
+			ImGuiMCP::EndDisabled();
+			if (nativeSinglePass) ImGuiMCP::TextWrapped("Streamline-native NR only runs one pass; separate settings require Direct NR.");
+		}
+		const bool separatePasses = settings.dlssNRPassCount >= 2 && settings.dlssNRSeparatePassSettings != 0;
+		if (separatePasses) ImGuiMCP::SeparatorText("NR Pass 1");
+		changed |= ComboSetting("NR Preset", settings.dlssNRPreset, nrPresets, "NR network preset. Changing it recreates the affected NR feature.");
 		changed |= ComboSetting(
 			"NR Style",
 			settings.dlssNRStyle,
@@ -495,6 +507,28 @@ namespace
 			"%.2f",
 			"Controls structure enhancement in inferred skin regions. -1 inherits Local Structure Strength. Values above 1 are experimental.");
 		ImGuiMCP::EndDisabled();
+		if (separatePasses) {
+			ImGuiMCP::BeginDisabled(nativeSinglePass);
+			for (uint i = 0; i + 1 < std::clamp(settings.dlssNRPassCount, 1u, 3u); ++i) {
+				auto& pass = settings.dlssNRPassOptions[i];
+				const auto number = i + 2;
+				ImGuiMCP::SeparatorText(std::format("NR Pass {}", number).c_str());
+				changed |= ComboSetting(std::format("Preset##NR{}", number).c_str(), pass.preset, nrPresets, "Recreates only this pass when changed.");
+				changed |= ComboSetting(std::format("Style##NR{}", number).c_str(), pass.style, nrStyles, "Appearance style for this pass.");
+				changed |= SliderFloatSetting(std::format("Intensity##NR{}", number).c_str(), pass.intensity, 0.0f, 1.0f, "%.2f", "Overall strength for this pass.");
+				changed |= SliderFloatSetting(std::format("Local Tone Strength##NR{}", number).c_str(), pass.localToneStrength, 0.0f, 2.0f, "%.2f", "0 preserves the previous pass's tone mapping. Nonzero applies additional tone enhancement.");
+				changed |= SliderFloatSetting(std::format("Local Structure Strength##NR{}", number).c_str(), pass.localStructureStrength, 0.0f, 2.0f, "%.2f", "Structure strength for this pass.");
+				uint mask = pass.useAutoMask ? 1u : 0u;
+				if (CheckboxSetting(std::format("Automatic Mask##NR{}", number).c_str(), mask, "Infer a mask for this pass.")) {
+					pass.useAutoMask = mask != 0;
+					changed = true;
+				}
+				ImGuiMCP::BeginDisabled(!pass.useAutoMask);
+				changed |= SliderFloatSetting(std::format("Skin Structure Strength##NR{}", number).c_str(), pass.skinStructureStrength, -1.0f, 2.0f, "%.2f", "-1 inherits this pass's Local Structure Strength.");
+				ImGuiMCP::EndDisabled();
+			}
+			ImGuiMCP::EndDisabled();
+		}
 		ImGuiMCP::EndDisabled();
 		ImGuiMCP::EndDisabled();
 

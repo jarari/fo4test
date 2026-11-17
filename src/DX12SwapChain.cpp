@@ -1553,6 +1553,7 @@ void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
 	a_context.fenceValue = UINT64_MAX;
 	ID3D12CommandList* lists[] = { a_context.list.get() };
 	commandQueue->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
+	XeSS::GetSingleton()->OnCommandsSubmitted(a_context.list.get());
 
 	const auto signalValue = commandFenceValue++;
 	const auto signalResult = commandQueue->Signal(commandFence.get(), signalValue);
@@ -1710,7 +1711,9 @@ void DX12SwapChain::WaitForFrameStart()
 			secondNewest = value;
 		}
 	}
-	WaitForCommandFence(secondNewest);
+	// Main::OnIdle can run separately from D3D11 recording. This pre-input
+	// throttle only waits for an already published Present, never flushes D3D11.
+	WaitForCommandFence(secondNewest, false);
 	// Present retains its slot-reuse check for standalone loading draws,
 	// FG transitions and wait failures. No resource retirement rules change.
 }
@@ -1741,7 +1744,7 @@ bool DX12SwapChain::FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext
 	return true;
 }
 
-bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
+bool DX12SwapChain::WaitForCommandFence(UINT64 a_value, bool a_publishD3D11)
 {
 	if (deviceLost || a_value == UINT64_MAX) {
 		return false;
@@ -1758,6 +1761,10 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value)
 	if (completedValue >= a_value) {
 		return true;
 	}
+	// There is no native D3D11 Present to submit pending producer signals.
+	// Publish them before blocking the CPU on a D3D12 consumer fence (including
+	// menu/allocator reuse waits). Flush does not wait for GPU completion.
+	if (a_publishD3D11 && d3d11Context) d3d11Context->Flush();
 	if (!commandFenceEvent) {
 		commandFenceEvent.attach(CreateEventW(nullptr, FALSE, FALSE, nullptr));
 		if (!commandFenceEvent) {
@@ -2436,7 +2443,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (upscaling->IsFrameGenerationActive() || dlssgPresentSafety) {
 		upscaling->TagDLSSGInputs(commandList, presentedFrameIndex);
 	}
-	const bool xeFGOffReady = upscaling->IsExternalFrameGenerationActive() || XeSS::GetSingleton()->DisableFG();
 	auto fidelityFX = FidelityFX::GetSingleton();
 	if (fidelityFX->IsFrameGenerationEnabled() &&
 		!upscaling->IsExternalFrameGenerationActive()) {
@@ -2480,7 +2486,9 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	}
 	if (osdEnabled) RecordLatencyTimestamp(commandContext, Util::State_GetSingleton()->frameCount);
 	ExecuteCommandContext(commandContext);
-	if (!xeFGOffReady) {
+	// A menu may invalidate FG after evaluation. Submit all ONLY_NOW copies
+	// before clearing XeFG history, including partially successful tagging.
+	if (!upscaling->IsExternalFrameGenerationActive() && !XeSS::GetSingleton()->DisableFG()) {
 		if (!FenceFrameSlotAfterPresent(presentedFrameIndex, &commandContext)) return DXGI_ERROR_DEVICE_REMOVED;
 		return E_FAIL;
 	}
@@ -2634,6 +2642,12 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 	}
 
 	if (a_evaluateFSR && !Upscaling::GetSingleton()->PrepareD3D12TemporalSR(frameIndex)) return result;
+	auto* upscaling = Upscaling::GetSingleton();
+	if (a_evaluateFSRFrameGeneration && upscaling->GetFGProvider() == Upscaling::FGProvider::XeSS &&
+		!XeSS::GetSingleton()->PrepareFG(upscaling->settings.xessGeneratedFrames + 1)) {
+		a_evaluateFSRFrameGeneration = false;
+		if (!a_evaluateDLSS && !a_evaluateFSR) return result;
+	}
 	const auto evaluationFrameIndex = frameIndex;
 	nvngx::dlss_nr::D3D12EvaluationParameters nrPreparation{};
 	auto* streamline = Streamline::GetSingleton();
@@ -2664,6 +2678,10 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 			prepared, nrPreparation.inputWidth, nrPreparation.inputHeight,
 			nrPreparation.options.performanceMode, nrPreparation.passCount, initialization.fenceValue);
 	}
+	// Acquire before queueing this frame's consumer wait. Reuse/lifecycle work
+	// must not leave a fresh queue dependency ahead of an unsubmitted list.
+	auto& commandContext = AcquireCommandContext();
+	auto* commandList = commandContext.list.get();
 	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
 	// Submit scene/guide copies now, independently of later UI rendering or
 	// Present. Otherwise D3D12 depends on the D3D11 runtime's automatic flush.
@@ -2671,12 +2689,8 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
 	++fenceValue;
 
-	auto& commandContext = AcquireCommandContext();
-	auto* commandList = commandContext.list.get();
-
 	// The raw ReShade depth snapshot is recorded on D3D11 before this submission;
 	// ReShade itself runs automatically on the final D3D12 swapchain at Present.
-	auto* upscaling = Upscaling::GetSingleton();
 
 	result = EvaluateD3D12WorkOnCommandList(commandList, evaluationFrameIndex, a_evaluateDLSS, a_evaluateFSR, a_evaluateFSRFrameGeneration);
 

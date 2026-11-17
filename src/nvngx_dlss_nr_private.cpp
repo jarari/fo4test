@@ -4,6 +4,8 @@
 #endif
 
 #include <algorithm>
+#include "FeatureRetryPolicy.h"
+#include "TextureMemoryReserve.h"
 #include <dxgi1_6.h>
 #include <atomic>
 #include <cmath>
@@ -650,6 +652,9 @@ namespace nvngx::dlss_nr
 			return false;
 		}
 
+		// Keep this allowance even after a partially successful create. Only a
+		// successful matching release makes these allocations disappear.
+		a_state.memoryEstimate = TextureMemoryReserve::NRFeatureBytes(a_parameters.outputWidth, a_parameters.outputHeight);
 		SetCreationParameters(a_state.parameters, a_parameters);
 		auto createResult = createFeature_(a_commandList, NVSDK_NGX_Feature_DLSSNR, a_state.parameters, &a_state.feature);
 		auto snippetCreateResult = createFeature_ == snippetCreateFeature_ ? createResult : NVSDK_NGX_Result_Success;
@@ -836,13 +841,13 @@ namespace nvngx::dlss_nr
 			a_result == NVSDK_NGX_Result_FAIL_UnsupportedParameter ||
 			a_result == NVSDK_NGX_Result_FAIL_Denied ||
 			a_result == NVSDK_NGX_Result_FAIL_NotImplemented;
-		a_state.retryable = !permanent && device_ && SUCCEEDED(device_->GetDeviceRemovedReason()) &&
-			++a_state.retryAttempts <= 4;
+		a_state.retryable = !permanent && device_ && SUCCEEDED(device_->GetDeviceRemovedReason());
 		if (a_state.retryable) {
+			a_state.retryAttempts = FeatureRetryPolicy::NextAttempt(a_state.retryAttempts);
 			a_state.retryAfter = std::chrono::steady_clock::now() +
-				std::chrono::seconds(1u << std::min(a_state.retryAttempts, 4u));
+				std::chrono::milliseconds(FeatureRetryPolicy::DelayMilliseconds(a_state.retryAttempts));
 		}
-		logger::warn("[DLSS-NR Direct] Feature failure result=0x{:08X} recovery={} attempt={}/4",
+		logger::warn("[DLSS-NR Direct] Feature failure result=0x{:08X} recovery={} backoffStage={}",
 			static_cast<std::uint32_t>(a_result), a_state.retryable ? "backoff" : "held", a_state.retryAttempts);
 	}
 
@@ -919,10 +924,12 @@ namespace nvngx::dlss_nr
 					static_cast<std::uint32_t>(result));
 				intermediateFailureLatched_ = true;
 				lastIntermediateFailure_ = result;
-				intermediateRetryable_ = result != E_INVALIDARG && device_ &&
-					SUCCEEDED(device_->GetDeviceRemovedReason()) && ++intermediateRetryAttempts_ <= 4;
-				if (intermediateRetryable_) intermediateRetryAfter_ = std::chrono::steady_clock::now() +
-					std::chrono::seconds(1u << std::min(intermediateRetryAttempts_, 4u));
+				intermediateRetryable_ = result != E_INVALIDARG && device_ && SUCCEEDED(device_->GetDeviceRemovedReason());
+				if (intermediateRetryable_) {
+					intermediateRetryAttempts_ = FeatureRetryPolicy::NextAttempt(intermediateRetryAttempts_);
+					intermediateRetryAfter_ = std::chrono::steady_clock::now() +
+						std::chrono::milliseconds(FeatureRetryPolicy::DelayMilliseconds(intermediateRetryAttempts_));
+				}
 				failedIntermediateWidth_ = a_parameters.outputWidth;
 				failedIntermediateHeight_ = a_parameters.outputHeight;
 				failedIntermediateFormat_ = a_parameters.outputFormat;
@@ -953,7 +960,7 @@ namespace nvngx::dlss_nr
 			(!intermediateRetryable_ || std::chrono::steady_clock::now() < intermediateRetryAfter_)) return false;
 		for (std::uint32_t i = 0; i < passCount; ++i) {
 			const auto& state = features_[i];
-			if (state.failureLatched && SameFailedConfiguration(state, a_parameters) &&
+			if (state.failureLatched && SameFailedConfiguration(state, a_parameters.ForPass(i)) &&
 				(!state.retryable || std::chrono::steady_clock::now() < state.retryAfter)) return false;
 		}
 		for (std::uint32_t i = passCount; i < kMaxPassCount; ++i) {
@@ -987,7 +994,7 @@ namespace nvngx::dlss_nr
 
 		for (std::uint32_t i = 0; i < passCount; ++i) {
 			const auto& state = features_[i];
-			if (NeedsFeaturePreparation(state, a_parameters)) {
+			if (NeedsFeaturePreparation(state, a_parameters.ForPass(i))) {
 				return true;
 			}
 		}
@@ -1015,7 +1022,7 @@ namespace nvngx::dlss_nr
 		const auto passCount = std::clamp(a_parameters.passCount, 1u, kMaxPassCount);
 		for (std::uint32_t i = 0; i < passCount; ++i) {
 			const auto& state = features_[i];
-			if (state.failureLatched && SameFailedConfiguration(state, a_parameters) &&
+			if (state.failureLatched && SameFailedConfiguration(state, a_parameters.ForPass(i)) &&
 				(!state.retryable || std::chrono::steady_clock::now() < state.retryAfter)) return false;
 		}
 		for (std::uint32_t i = passCount; i < kMaxPassCount; ++i) {
@@ -1027,8 +1034,9 @@ namespace nvngx::dlss_nr
 
 		for (std::uint32_t i = 0; i < passCount; ++i) {
 			auto& state = features_[i];
-			if (!EnsureFeature(state, a_commandList, a_parameters, i)) {
-				LatchFeatureFailure(state, a_parameters, state.lastFailureResult);
+			const auto passParameters = a_parameters.ForPass(i);
+			if (!EnsureFeature(state, a_commandList, passParameters, i)) {
+				LatchFeatureFailure(state, passParameters, state.lastFailureResult);
 				return false;
 			}
 		}
@@ -1066,7 +1074,7 @@ namespace nvngx::dlss_nr
 		for (; passCount < requestedPassCount; ++passCount) {
 			const auto& state = features_[passCount];
 			if (!state.feature || !state.parameters || !state.activeEvaluateFeature || state.failureLatched ||
-				NeedsFeatureRecreation(state, a_parameters)) {
+				NeedsFeatureRecreation(state, a_parameters.ForPass(passCount))) {
 				break;
 			}
 			if (passCount > 0 && !scratchMatches(intermediateResources_[passCount - 1].Get())) {
@@ -1092,13 +1100,9 @@ namespace nvngx::dlss_nr
 
 		for (std::uint32_t pass = 0; pass < passCount; ++pass) {
 			auto& state = features_[pass];
-			auto passParameters = a_parameters;
+			auto passParameters = a_parameters.ForPass(pass);
 			passParameters.color = pass == 0 ? a_parameters.color : intermediateResources_[pass - 1].Get();
 			passParameters.output = pass + 1 == passCount ? a_parameters.output : intermediateResources_[pass].Get();
-			if (pass > 0) {
-				// Avoid compounding local tone remapping across independent histories.
-				passParameters.options.localToneStrength = 0.0f;
-			}
 
 			const auto reset = state.forceReset || a_parameters.reset;
 #ifdef UPSCALING_NR_CAPTURE
@@ -1159,6 +1163,21 @@ namespace nvngx::dlss_nr
 		}
 		lastEvaluatedPassCount_ = passCount;
 		return true;
+	}
+
+	std::uint64_t D3D12Backend::GetRetainedMemoryEstimate() const
+	{
+		std::uint64_t bytes = 0;
+		for (const auto& state : features_) bytes += state.memoryEstimate;
+		if (device_) {
+			for (const auto& resource : intermediateResources_) {
+				if (!resource) continue;
+				const auto desc = resource->GetDesc();
+				const auto info = device_->GetResourceAllocationInfo(0, 1, &desc);
+				if (info.SizeInBytes != UINT64_MAX) bytes += info.SizeInBytes;
+			}
+		}
+		return bytes;
 	}
 
 	void D3D12Backend::RequestReset()

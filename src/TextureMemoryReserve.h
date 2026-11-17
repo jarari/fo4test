@@ -18,12 +18,17 @@ namespace TextureMemoryReserve
 		SR sr = SR::None;
 		FG fg = FG::None;
 		std::uint32_t generatedFrames = 1, nrPasses = 0;
+		std::uint64_t retainedNRBytes = 0, retainedNRColorBytes = 0;
 		bool nrAfterSR = false, sharpen = false, enb = false, reshadeDepth = false;
 	};
 	struct Estimate
 	{
 		std::uint64_t resident{}, sr{}, fg{}, nr{}, ui{}, depth{}, reserve{};
 	};
+	constexpr std::uint64_t NRFeatureBytes(std::uint32_t width, std::uint32_t height)
+	{
+		return 160 * MiB + std::uint64_t{ width } * height * 110;
+	}
 
 	// Planning estimates, not residency measurements. Exclude engine-owned world
 	// textures and count shared D3D11/D3D12 views once. SDK costs are allowances,
@@ -74,6 +79,11 @@ namespace TextureMemoryReserve
 				e.ui += output * (8 * 4 + 4 * 8 + 2 * 4);
 			}
 		}
+		// NR Off/partial failure does not release its caches. Never return their
+		// headroom merely because the requested settings became cheaper.
+		e.nr = std::max(e.nr, c.retainedNRBytes);
+		const auto plannedScratch = c.sr != SR::None && (c.sharpen || c.nrPasses) ? slots * output * color : 0;
+		if (c.retainedNRColorBytes > plannedScratch) e.nr += c.retainedNRColorBytes - plannedScratch;
 		if (c.reshadeDepth) e.depth = output * 4 * (slots + 1);
 		const auto total = e.resident + e.sr + e.fg + e.nr + e.ui + e.depth;
 		// Quantize to 64 MiB; this remains a bounded headroom policy.

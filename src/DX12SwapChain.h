@@ -200,7 +200,7 @@ private:
 	void ResetLatencyTelemetry();
 	bool FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext* a_context = nullptr);
 	D3D12EvaluationResult EvaluateD3D12WorkOnCommandList(ID3D12GraphicsCommandList* a_commandList, UINT a_frameIndex, bool a_evaluateDLSS, bool a_evaluateFSR, bool a_evaluateFSRFrameGeneration);
-	bool WaitForCommandFence(UINT64 a_value);
+	bool WaitForCommandFence(UINT64 a_value, bool a_publishD3D11 = true);
 	void RefreshBackBuffers();
 	void RecreateInteropTextures();
 	void ProcessWindowStateTransition();

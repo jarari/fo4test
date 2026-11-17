@@ -32,19 +32,21 @@ void PresentPacing::WaitLocked(double outputFPS, unsigned multiplier, HWND windo
 		std::chrono::duration<double>(batchSize / std::clamp(outputFPS, 10.0, 500.0)));
 	const auto now = Clock::now();
 	// No catch-up bursts after stalls. Focus loss alone is not suspension.
-	if (valid && now - last < std::chrono::seconds(1)) {
-		const auto deadline = last + interval;
+	const auto remaining = last + interval - now;
+	if (valid && remaining > Clock::duration::zero() && remaining <= interval) {
 		static thread_local winrt::handle timer{ CreateWaitableTimerExW(nullptr, nullptr,
 			CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE) };
-		while (Clock::now() < deadline) {
-			if (window && IsIconic(window)) { valid = false; return; }
-			const auto ticks = std::chrono::duration_cast<std::chrono::duration<long long, std::ratio<1, 10000000>>>(deadline - Clock::now()).count();
-			if (ticks <= 0) { break; }
-			LARGE_INTEGER due{};
-			due.QuadPart = -std::min<long long>(ticks, 500000);
-			if (!timer || !SetWaitableTimer(timer.get(), &due, 0, nullptr, nullptr, FALSE) ||
-				WaitForSingleObject(timer.get(), 100) != WAIT_OBJECT_0) { Sleep(1); }
+		using TimerTicks = std::chrono::duration<long long, std::ratio<1, 10000000>>;
+		LARGE_INTEGER due{};
+		due.QuadPart = -std::chrono::ceil<TimerTicks>(remaining).count();
+		const auto waitMs = static_cast<DWORD>(std::chrono::ceil<std::chrono::milliseconds>(remaining).count());
+		if (timer && SetWaitableTimer(timer.get(), &due, 0, nullptr, nullptr, FALSE)) {
+			// Bound the entire wait. A timeout must not re-arm pacing inside OnIdle or the loading thread.
+			WaitForSingleObject(timer.get(), waitMs + 20);
+		} else {
+			Sleep(waitMs);
 		}
+		if (window && IsIconic(window)) { valid = false; return; }
 	}
 	last = Clock::now();
 	previousMultiplier = multiplier;
