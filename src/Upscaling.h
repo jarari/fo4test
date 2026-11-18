@@ -80,7 +80,9 @@ public:
 	static bool IsSharedTemporalSR(UpscaleMethod method) { return method == UpscaleMethod::kFSR || method == UpscaleMethod::kXeSS; }
 	void SelectFGProviderAtStartup(bool dlssSupported);
 	FGProvider GetFGProvider() const { return activeFGProvider; }
-	uint GetStartupFGPreference() const { return startupFGPreference; }
+	FGProvider ResolveFGPreference(uint preference, DXGI_FORMAT format) const;
+	void ApplyFGProviderPreference(DXGI_FORMAT format);
+	bool FGProviderChangePending() const { return fgProviderSelected && settings.frameGenerationProvider != appliedFGPreference; }
 	void UseXeFGFallback();
 	void UseFSRFGFallback();
 	void DisableFGProvider();
@@ -95,7 +97,7 @@ public:
 		uint upscaleMethodPreference = (uint)UpscaleMethod::kDLSS; ///< Preferred upscaling method
 		uint qualityMode = 1;									   ///< Quality mode: 0=Native AA, 1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance
 		uint frameGenerationMode = 0;                              ///< DLSS-G mode: 0=Disabled, 1=On, 2=Auto, 3=Dynamic
-		uint frameGenerationProvider = 0;                          ///< Restart required: 0=DLSS-G, 1=FSR FG, 2=XeSS FG
+		uint frameGenerationProvider = 0;                          ///< 0=DLSS-G, 1=FSR FG, 2=XeSS FG
 		uint xessGeneratedFrames = 0;                              ///< Index 0..6: 2x..8x, clamped to actual provider support
 		uint dlssgGeneratedFrames = 0;                              ///< MCM index: 0=one generated frame, up to runtime-supported max
 		uint dynamicMFGEnabled = 0;                                 ///< Enable DLSS-G Dynamic Multi Frame Generation when supported
@@ -104,6 +106,7 @@ public:
 		uint dlssModelPreset = 0;                                   ///< DLSS model preset: 0=Recommended, 1=Default, 2=K, 3=M, 4=L
 		uint dlssNRPosition = 0;                                    ///< 0: Before SR, 1: After SR
 		uint dlssNREnabled = 0;                                     ///< Enable optional NR at the selected SR stage
+		uint dlssNRDisableInMenus = 0;
 		uint dlssNRPassCount = 1;                                   ///< Direct-NGX NR histories evaluated in sequence (1..3)
 		uint dlssNRSeparatePassSettings = 0;
 		std::array<nvngx::dlss_nr::Options, 2> dlssNRPassOptions = nvngx::dlss_nr::DefaultAdditionalPassOptions();
@@ -123,7 +126,8 @@ public:
 
 	Settings settings;
 	FGProvider activeFGProvider = FGProvider::Unavailable;
-	uint startupFGPreference = 0;
+	uint appliedFGPreference = 0;
+	bool dlssgAdapterSupported = false;
 	bool fgProviderSelected = false;
 
 	/**
@@ -193,7 +197,7 @@ public:
 	 * @brief Capture and tag present-time DLSS-G inputs after the HUD-less scene is available.
 	 */
 	void CaptureDLSSGInputs(int a_renderTargetIndex, ID3D11Texture2D* a_motionVectorTexture = nullptr, float2 a_renderSize = { 0.0f, 0.0f }, float2 a_displaySize = { 0.0f, 0.0f });
-	bool CaptureD3D12FSRInputs(int a_renderTargetIndex, ID3D11Texture2D* a_motionVectorTexture, float2 a_jitter, float2 a_renderSize, float2 a_displaySize);
+	bool CaptureD3D12FSRInputs(ID3D11Resource* a_sceneColor, ID3D11Texture2D* a_motionVectorTexture, float2 a_jitter, float2 a_renderSize, float2 a_displaySize);
 	bool EvaluateD3D12DLSS(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
 	bool PrepareD3D12TemporalSR(uint32_t a_frameIndex);
 	bool EvaluateD3D12FSR(ID3D12GraphicsCommandList* a_commandList, uint32_t a_frameIndex);
@@ -425,7 +429,7 @@ public:
 	 */
 	void DestroyUpscalingResources(bool a_preserveNativeNR = false, bool a_interopIdle = false);
 	bool IsNRSupported() const;
-	bool IsDLSSNRReady() const { return settings.dlssNREnabled != 0 && IsNRSupported() && !nrAwaitingPresent; }
+	bool IsDLSSNRReady() const { return WantsDLSSNRForFrame() && !nrAwaitingPresent; }
 	bool CaptureRawSRGuides(UINT slot, float2 renderSize, float2 displaySize);
 	void CaptureNRGuides(UINT slot, float2 renderSize, float2 displaySize);
 	bool DispatchSharedTemporalSR(ID3D12GraphicsCommandList* commands, uint32_t slot, ID3D12Resource* color, ID3D12Resource* output);
@@ -493,6 +497,7 @@ public:
 	std::array<winrt::com_ptr<ID3D12Resource>, kDX12FrameCount> fsrReactiveMaskD3D12;
 	std::array<bool, kDX12FrameCount> dlssgInputsReady{};
 	std::array<bool, kDX12FrameCount> externalFrameGenerationInputsReady{};
+	std::array<uint32_t, kDX12FrameCount> externalFrameGenerationCaptureFrames{};
 	std::array<bool, kDX12FrameCount> fsrD3D12InputsReady{};
 	std::array<uint32_t, kDX12FrameCount> dlssgInputFrameTokenIndices{};
 	std::array<bool, kDX12FrameCount> dlssD3D12InputsReady{};
@@ -563,6 +568,9 @@ public:
 	};
 
 private:
+	bool WantsDLSSNRForFrame() const { return settings.dlssNREnabled != 0 && !nrMenuSuspended && IsNRSupported(); }
+	bool nrMenuSuspended = false;
+
 	enum class SettingsLoad { Always, IfChanged, HotReload };
 	void LoadSettings(SettingsLoad a_mode);
 
@@ -593,5 +601,6 @@ private:
 	void ReportFeatureRequestFailure(FeatureRequest a_feature, std::string_view a_context, bool a_retryable = true);
 	void ClearFeatureRequestFailure(FeatureRequest a_feature);
 	void ClearFrameFeatureRequests();
+	float2 GetFrameGenerationPatchSize(const D3D11_TEXTURE2D_DESC& color, const D3D11_TEXTURE2D_DESC& motion) const;
 	bool EnsureFrameGenerationPatchResources(float2 a_renderSize, DXGI_FORMAT a_colorResourceFormat, DXGI_FORMAT a_colorSRVFormat, DXGI_FORMAT a_motionVectorFormat);
 };

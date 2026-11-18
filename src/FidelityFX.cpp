@@ -8,6 +8,7 @@
 
 #include "DX12SwapChain.h"
 #include "ColorRange.h"
+#include "FrameTiming.h"
 #include "Util.h"
 #include "PipboyTemporalMask.h"
 #include "ReShadeDepth.h"
@@ -465,6 +466,9 @@ bool FidelityFX::ConfigureFrameGeneration(
 	};
 	config.HUDLessColor = a_hudlessColor ? ffxApiGetResourceDX12(a_hudlessColor, FFX_API_RESOURCE_STATE_COMPUTE_READ) : ffxApiGetResourceDX12(nullptr, FFX_API_RESOURCE_STATE_COMPUTE_READ);
 	config.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params, void* pUserCtx) -> ffxReturnCode_t {
+		// The SDK owns the callback thread. Match its QPC span to Present
+		// offline instead of sampling the engine frame counter on that thread.
+		FrameTiming::CpuScope timing("FG.FSRDispatchCallback", 0);
 		const auto result = ffxDispatch(reinterpret_cast<ffxContext*>(pUserCtx), &params->header);
 		if (result == FFX_API_RETURN_OK && params->numGeneratedFrames != 0) {
 			FidelityFX::GetSingleton()->RecordGeneratedFrames(params->numGeneratedFrames);

@@ -34,11 +34,11 @@ public:
     void Marker(xell_latency_marker_type_t marker);
     void EndSimulation(uint32_t engineFrame);
     bool GetCPUFrameSpanMs(float& a_spanMs);
-    bool OwnsSwapChain() const { return fgInitialized; }
+    bool OwnsSwapChain() const { return fgInitialized.load(std::memory_order_acquire); }
     const char* FailureReason() const { return failureReason; }
-    bool FGEnabled() const { return fgEnabled; }
+    bool FGEnabled() const { return fgEnabled.load(std::memory_order_acquire); }
     uint MaxGeneratedFrames() const { return maxGenerated; }
-    uint PacingMultiplier() const { return fgEnabled ? generatedFrames + 1 : 1; }
+    uint PacingMultiplier() const { return FGEnabled() ? generatedFrames.load(std::memory_order_relaxed) + 1 : 1; }
     uint64_t PresentedFrames() const { return presentedFrames.load(std::memory_order_relaxed); }
 private:
     xess_context_handle_t sr = nullptr;
@@ -48,8 +48,9 @@ private:
     UINT srWidth = 0, srHeight = 0, srQuality = UINT_MAX;
     DXGI_FORMAT srFormat = DXGI_FORMAT_UNKNOWN, fgFormat = DXGI_FORMAT_UNKNOWN;
     std::chrono::steady_clock::time_point lastTagTime = std::chrono::steady_clock::now();
-    bool fgInitialized = false, fgEnabled = false;
-    uint maxGenerated = 1, generatedFrames = 1;
+    std::atomic_bool fgInitialized{false}, fgEnabled{false};
+    uint maxGenerated = 1;
+    std::atomic_uint32_t generatedFrames{1};
     uint32_t taggedId = 0;
     ID3D12CommandList* pendingFGCommands = nullptr; // Borrowed until ExecuteCommandLists.
     std::atomic<uint32_t> simulationPresentId{0};
@@ -62,6 +63,7 @@ private:
     uint32_t presentStartedId = 0;
     uint32_t presentAttemptId = 0;
     bool sleepSucceeded = false;
+    bool lowLatencyEnabled = true;
     const char* failureReason = nullptr;
     std::atomic<uint64_t> resetSerial{1}, presentedFrames{0};
     std::atomic<bool> pacingWarmupPending{true};

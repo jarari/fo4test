@@ -5,6 +5,8 @@
 
 #include "DX12SwapChain.h"
 #include "ENBRenderDomain.h"
+#include "FrameTiming.h"
+#include "OSD.h"
 #include "Streamline.h"
 #include "Upscaling.h"
 
@@ -259,10 +261,17 @@ struct hkIDXGISwapChainPresent
 {
 	static HRESULT STDMETHODCALLTYPE thunk(IDXGISwapChain* This, UINT SyncInterval, UINT Flags)
 	{
-		auto streamline = Streamline::GetSingleton();
+		auto* streamline = Streamline::GetSingleton();
+		if ((Flags & DXGI_PRESENT_TEST) || This != streamline->swapChain) {
+			return func(This, SyncInterval, Flags);
+		}
+		FrameTiming::CpuScope timing("Present.Total");
+		OSD::GetSingleton()->RenderNative(This);
+		FrameTiming::Finish11();
 		streamline->OnPresentStart();
 		const auto result = func(This, SyncInterval, Flags);
 		streamline->OnPresentEnd(result);
+		if (result == S_OK) DX12SwapChain::GetSingleton()->AdvanceLoadingRecovery();
 		return result;
 	}
 	static inline REL::Relocation<decltype(thunk)> func;
@@ -337,12 +346,6 @@ struct hkD3D11CreateDeviceAndSwapChain
 
 			streamline->SetSwapChain(*ppSwapChain);
 
-			static bool presentHooked = false;
-			if (!presentHooked && *ppSwapChain) {
-				stl::detour_vfunc<8, hkIDXGISwapChainPresent>(*ppSwapChain);
-				presentHooked = true;
-			}
-
 			IDXGIAdapter* featureAdapter = pAdapter;
 			winrt::com_ptr<IDXGIAdapter> queriedAdapter;
 			if (!featureAdapter && *ppDevice) {
@@ -358,6 +361,14 @@ struct hkD3D11CreateDeviceAndSwapChain
 
 			streamline->CheckFeatures(featureAdapter);
 			streamline->PostDevice();
+		}
+		if (ppSwapChain && *ppSwapChain) {
+			if (!streamline->interposer) streamline->SetSwapChain(*ppSwapChain);
+			static bool presentHooked = false;
+			if (!presentHooked) {
+				stl::detour_vfunc<8, hkIDXGISwapChainPresent>(*ppSwapChain);
+				presentHooked = true;
+			}
 		}
 
 		return S_OK;

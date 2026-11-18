@@ -8,10 +8,12 @@
 #include <cstdint>
 #include <cstring>
 #include <intrin.h>
+#include <optional>
 #include <utility>
 
 #include "DX12SwapChain.h"
 #include "ENBRenderDomain.h"
+#include "FrameTiming.h"
 #include "Util.h"
 #include "Upscaling.h"
 #include <d3d11_1.h>
@@ -81,6 +83,8 @@ WorldGuideScope::WorldGuideScope(bool enabled)
 		auto* motion = reinterpret_cast<ID3D11Texture2D*>(data->renderTargets[Util::ResolveRenderTarget(Util::RenderTarget::kMotionVectors)].texture);
 		auto* depth = reinterpret_cast<ID3D11Texture2D*>(data->depthStencilTargets[Util::ResolveDepthStencilTarget(Util::DepthStencilTarget::kMain)].texture);
 		if (!motion || !depth) { return; }
+		FrameTiming::CpuScope cpu("Interface3D.BackupWorldGuides");
+		FrameTiming::Gpu11Scope gpu("Interface3D.BackupWorldGuides");
 		auto* device = reinterpret_cast<ID3D11Device*>(data->device);
 		if (!context) {
 			DX::ThrowIfFailed(reinterpret_cast<ID3D11DeviceContext*>(data->context)->QueryInterface(IID_PPV_ARGS(context.put())));
@@ -108,6 +112,8 @@ WorldGuideScope::WorldGuideScope(bool enabled)
 WorldGuideScope::~WorldGuideScope()
 {
 	if (!captured) { return; }
+	FrameTiming::CpuScope cpu("Interface3D.RestoreWorldGuides");
+	FrameTiming::Gpu11Scope gpu("Interface3D.RestoreWorldGuides");
 	{
 		ContextScope scope;
 		// Restore the exact resources captured before any native-depth slot
@@ -142,6 +148,22 @@ namespace
 	thread_local int colorTarget = 0;
 	thread_local int depthTarget = 0;
 	bool modelHooksInstalled = false;
+	using GuideSnapshot = std::optional<WorldGuides::WorldGuideScope>;
+	thread_local GuideSnapshot* pendingGuides = nullptr;
+
+	struct RenderAllGuides
+	{
+		GuideSnapshot snapshot;
+		GuideSnapshot* previous = pendingGuides;
+
+		explicit RenderAllGuides(bool preserve)
+		{
+			if (!preserve || previous) return;
+			if (modelHooksInstalled) pendingGuides = &snapshot;
+			else snapshot.emplace(true);
+		}
+		~RenderAllGuides() { pendingGuides = previous; }
+	};
 	thread_local uint32_t modelFrame = UINT32_MAX;
 	thread_local std::array<RE::Interface3D::Renderer*, 64> renderedModels{};
 	thread_local size_t renderedModelCount = 0;
@@ -175,33 +197,62 @@ namespace
 		return false;
 	}
 
+	bool IsPowerArmorPipboy(const RE::Interface3D::Renderer& a_renderer)
+	{
+		return a_renderer.postfx.get() == RE::Interface3D::PostEffect::kPipboy &&
+			a_renderer.name == "PipboyMenu" && a_renderer.depth == RE::UI_DEPTH_PRIORITY::kScope;
+	}
+
+	bool& ShaderPostAA()
+	{
+		static REL::Relocation<bool*> flag{ REL::ID{ 801215, 2712496 } };
+		return *flag;
+	}
+
+	struct ScopedShaderPostAA
+	{
+		explicit ScopedShaderPostAA(bool a_postAA) : previous(std::exchange(ShaderPostAA(), a_postAA)) {}
+		~ScopedShaderPostAA() { ShaderPostAA() = previous; }
+		const bool previous;
+	};
+
 	// Patch RenderAll's calls, not the entry points: TF3DHUD's prepass detour
 	// must run exactly once, including its CommitRenderState callback.
 	struct ModelPrepasses
 	{
 		static void thunk(RE::Interface3D::Renderer* a_renderer)
 		{
-			if (a_renderer && a_renderer->postfx.get() == RE::Interface3D::PostEffect::kPipboy) {
-			}
 			if (!AlreadyRendered(a_renderer)) {
+				// RenderAll only sorts the list before this call. Its trailing
+				// target binds use NO_CLEAR, so an empty pass needs no snapshot.
+				if (pendingGuides && !*pendingGuides) pendingGuides->emplace(true);
 				const auto effect = a_renderer->postfx.get();
 				const bool usesHUDGlass = effect == RE::Interface3D::PostEffect::kHUDGlass ||
 					effect == RE::Interface3D::PostEffect::kHUDGlassWithMod ||
 					(a_renderer->screenAttachedElementRoot &&
 						a_renderer->screenMaterialName == "Materials\\Interface\\HUDGlassFlat.BGEM");
-				if (nativeScreenPass && usesHUDGlass) {
+				// RenderAll gives the PA Pip-Boy this priority so it precedes
+				// HUDGlass. Its emissive FX must also draw over the resolved
+				// scene, before either renderer alters the final UI target.
+				const bool powerArmorPipboy = IsPowerArmorPipboy(*a_renderer);
+				if (nativeScreenPass && (usesHUDGlass || powerArmorPipboy)) {
 					// HUDGlass and its shadow material do not produce a generic
 					// coverage-alpha overlay. Supply the real destination BEFORE
 					// prepasses/RenderMain, then keep the engine's completed RGB.
-					if (DX12SwapChain::GetSingleton()->PrepareNativeUIForEngineComposition()) {
-						static bool announced = false;
-						if (!announced) {
-							logger::info("[UI composite] HUDGlass uses engine frame composition; final alpha recomposition bypassed");
-							announced = true;
+					if (DX12SwapChain::GetSingleton()->PrepareNativeUIForEngineComposition(
+						powerArmorPipboy ? "UI.ResolveForPowerArmorPipboy" : "UI.ResolveForHUDGlass")) {
+						static bool hudGlassAnnounced = false;
+						static bool pipboyAnnounced = false;
+						auto& announced = powerArmorPipboy ? pipboyAnnounced : hudGlassAnnounced;
+						if (!std::exchange(announced, true)) {
+							logger::info("[UI composite] {} uses engine frame composition; final alpha recomposition bypassed",
+								powerArmorPipboy ? "PA Pip-Boy" : "HUDGlass");
 						}
 					}
 				}
 				BeginNativeModelTargets(a_renderer);
+				FrameTiming::CpuScope cpu("Interface3D.ModelPrepasses");
+				FrameTiming::Gpu11Scope gpu("Interface3D.ModelPrepasses");
 				func(a_renderer);
 			}
 		}
@@ -213,7 +264,17 @@ namespace
 		static void thunk(RE::Interface3D::Renderer* a_renderer, uint32_t a_target)
 		{
 			if (!AlreadyRendered(a_renderer)) {
-				func(a_renderer, a_target);
+				FrameTiming::CpuScope cpu("Interface3D.ModelMain");
+				FrameTiming::Gpu11Scope gpu("Interface3D.ModelMain");
+				if (nativeScreenPass && IsPowerArmorPipboy(*a_renderer)) {
+					// BSEffectShader sends RenderAll's phase as part of the
+					// Pip-Boy material constants. Keep the stock pre-AA
+					// material response when drawing the promoted screen.
+					const ScopedShaderPostAA stockPhase(false);
+					func(a_renderer, a_target);
+				} else {
+					func(a_renderer, a_target);
+				}
 			}
 			EndNativeModelTargets(a_renderer);
 		}
@@ -737,9 +798,7 @@ namespace
 		static void thunk(uint32_t a_target, bool a_postAA)
 		{
 			if (a_postAA && a_target == 0) {
-				// The Pip-Boy was promoted to this pass for native-resolution UI.
-				// In power armor it must still precede HUDGlass, as it did when
-				// the vanilla pre-AA Pip-Boy pass ran before the post-AA HUD.
+				// Keep the promoted Pip-Boy ahead of HUDGlass on the SDR path.
 				static REL::Relocation<RE::BSTArray<RE::Interface3D::Renderer*>*> renderers{
 					REL::ID{ 996993, 2696455, 4803746 } };
 				static REL::Relocation<RE::BSReadWriteLock*> renderersLock{
@@ -762,10 +821,27 @@ namespace
 					pipboy->depth = pipboyOpen && powerArmorHUD ?
 						RE::UI_DEPTH_PRIORITY::kScope : RE::UI_DEPTH_PRIORITY::kPipboy;
 				}
+				// The ENB HDR path shades the armor display before AA to limit
+				// emission. Without that render domain, the later scene resolve
+				// can overwrite a pre-AA Pip-Boy, so retain its normal phase.
+				// Set the phase while the armor HUD is active, before opening the
+				// Pip-Boy, and undo only a promotion we temporarily suspended.
+				static RE::Interface3D::Renderer* suspendedPromotion = nullptr;
+				if (suspendedPromotion != pipboy) suspendedPromotion = nullptr;
+				if (pipboy && powerArmorHUD && ENBRenderDomain::Get().Active() &&
+					DX12SwapChain::GetSingleton()->swapChainDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+					Upscaling::GetSingleton()->upscaleMethod != Upscaling::UpscaleMethod::kDisabled) {
+					if (pipboy->postAA) {
+						pipboy->postAA = false;
+						suspendedPromotion = pipboy;
+					}
+				} else if (suspendedPromotion) {
+					suspendedPromotion->postAA = true;
+					suspendedPromotion = nullptr;
+				}
 			}
-			// Capture before RenderScope can borrow the native depth slot; restore
-			// after all models and their screen meshes, including early returns.
-			WorldGuides::WorldGuideScope worldGuides(enabled && !a_postAA);
+			// Keep the original guides through all models and native-slot unwind.
+			RenderAllGuides worldGuides(enabled && !a_postAA);
 			// Composition is common to both proxy paths; native depth/viewport
 			// routing remains ENB-only. Restore the pass flag across nested calls.
 			struct ScreenPassScope
@@ -816,20 +892,18 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 	}
 	static REL::Relocation<RE::BSTArray<RE::Interface3D::Renderer*>*> renderers{ REL::ID{ 996993, 2696455, 4803746 } };
 	static REL::Relocation<RE::BSReadWriteLock*> lock{ REL::ID{ 778095, 2696454, 4803745 } };
-	static REL::Relocation<bool*> shaderPostAA{ REL::ID{ 801215, 2712496 } };
 	static REL::Relocation<uint32_t*> displayTarget{ REL::ID{ 113725, 2712501 } };
 	using HasMenus = bool (*)(RE::UI*, const RE::BSFixedString&);
 	static REL::Relocation<HasMenus> hasMenus{ REL::ID{ 1574554, 2284758 } };
 
 	RE::BSAutoReadLock listLock(*lock);
-	WorldGuides::WorldGuideScope worldGuides(true);
+	std::optional<WorldGuides::WorldGuideScope> worldGuides;
 	RenderScope scope;
 	struct ShaderScope
 	{
-		bool previousPostAA = *shaderPostAA;
+		ScopedShaderPostAA postAA{ true };
 		uint32_t previousTarget = *displayTarget;
-		ShaderScope() { *shaderPostAA = true; }
-		~ShaderScope() { *shaderPostAA = previousPostAA; *displayTarget = previousTarget; }
+		~ShaderScope() { *displayTarget = previousTarget; }
 	} shaderScope;
 	for (auto* renderer : *renderers) {
 		if (renderedModelCount == renderedModels.size()) {
@@ -854,6 +928,11 @@ void NativeInterfaceUI::RenderModelsBeforeUpscale(uint32_t a_target)
 		// RT63 is shared with HUDGlass. Produce and consume this renderer's
 		// output consecutively, with the native-color depth hook active for
 		// every intermediate bind. Never cache an SRV for later composition.
+		// Only a model that actually renders can overwrite the world guides.
+		// Keep one snapshot across all such models until native targets unwind.
+		if (!worldGuides) {
+			worldGuides.emplace(true);
+		}
 		ModelPrepasses::thunk(renderer);
 		ModelMain::thunk(renderer, a_target);
 		renderedModels[renderedModelCount++] = renderer;
@@ -986,12 +1065,8 @@ void NativeInterfaceUI::SynchronizePipboyLogicalSpace(uint32_t a_displayHeight)
 		return static_cast<uint32_t>(std::lround(static_cast<double>(a_value) * scale));
 	};
 
-	// This target synchronization is needed on both OG and AE. The gamepad
-	// constraints are expressed in the same logical Pip-Boy surface as the target,
-	// so keep their proportions when the physical allocation is promoted. Without
-	// this, a controller present during startup enters InitPipboy with the old
-	// high-resolution constraint rectangle while a later keyboard-to-controller
-	// switch leaves constraints cleared, producing the input-order-dependent bug.
+	// OG/AE apply the wrist constraint when the cursor is bound to the movie.
+	// Keep its INI rectangle in the original coordinate system until that call.
 	targetWidth->SetUInt(promotedWidth);
 	targetHeight->SetUInt(promotedHeight);
 	static constexpr const char* constraints[]{
@@ -1005,11 +1080,12 @@ void NativeInterfaceUI::SynchronizePipboyLogicalSpace(uint32_t a_displayHeight)
 		"uPipboyConstraintHeight_PowerArmor:Pipboy"
 	};
 	for (const auto* name : constraints) {
+		// Power armor and NG retain their existing viewport paths.
+		if (!REX::FModule::IsRuntimeNG() && !std::string_view(name).ends_with("_PowerArmor:Pipboy")) continue;
 		if (auto* setting = RE::GetINISetting(name)) {
 			setting->SetUInt(scaleValue(setting->GetUInt()));
 		}
 	}
-	logger::info("[ENB UI] Pip-Boy cursor constraint domain scaled x{:.4f} for promoted logical target", scale);
 	if (REX::FModule::IsRuntimeNG()) {
 		auto* cursorRect = FindPipboyCursorViewportRect();
 		if (!cursorRect) {

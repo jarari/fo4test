@@ -1,4 +1,5 @@
 #include "DX11Hooks.h"
+#include "DX12SwapChain.h"
 #include "Upscaling.h"
 #include "UpscalingMenu.h"
 #include "ReShadeDepth.h"
@@ -90,6 +91,12 @@ void OnInit(F4SE::MessagingInterface::Message* a_msg)
 		break;
 	case F4SE::MessagingInterface::kPostPostLoad:
 		Upscaling::InstallHighFPSPhysicsFixCompatibility();
+		break;
+	case F4SE::MessagingInterface::kPreLoadGame:
+	case F4SE::MessagingInterface::kPostLoadGame:
+		logger::info("[Presentation] F4SE save load {}", a_msg->type == F4SE::MessagingInterface::kPreLoadGame ? "started" : "ended");
+		DX12SwapChain::GetSingleton()->NotifyLoadingScreen(
+			a_msg->type == F4SE::MessagingInterface::kPreLoadGame, DX12SwapChain::LoadingSource::Save);
 		break;
 	case F4SE::MessagingInterface::kGameDataReady:
 	{

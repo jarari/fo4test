@@ -12,6 +12,7 @@ namespace RTX40MFGUnlock
 	// RTX40MFG-Unlock. Provider entry observers are only a fallback for an
 	// ambiguous multi-provider process.
 	bool PatchLoadedModules() noexcept;
+	bool RetryProviderDiscovery() noexcept;
 
 	// Supplies the active D3D12 adapter identity required by the Ada midpoint
 	// correction, then retries provider discovery and publication.

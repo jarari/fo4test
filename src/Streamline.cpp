@@ -12,6 +12,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "DX12SwapChain.h"
+#include "FrameTiming.h"
 #include "ColorRange.h"
 #include "TextureMemoryReserve.h"
 #include "ENBRenderDomain.h"
@@ -324,6 +325,10 @@ void Streamline::Shutdown()
 	currentReflexUseMarkersToOptimize = false;
 	currentReflexThreadId = 0;
 	currentDLSSGMode = sl::DLSSGMode::eCount;
+	configuredDLSSGOptions = {};
+	pendingDLSSGDisable = false;
+	reflexRecoveryPresents.store(0);
+	dlssgPresentSafetyFrames = 0;
 	currentDLSSGGeneratedFrames = 0;
 	currentDLSSGDynamicTargetFPS = 0;
 	currentDLSSQualityMode = 1;
@@ -426,6 +431,18 @@ void Streamline::PrepareDirectDLSSNR()
 	directDLSSNR.Prepare(device);
 }
 
+bool Streamline::BindDLSSGFunctions()
+{
+	slDLSSGGetState = nullptr;
+	slDLSSGSetOptions = nullptr;
+	if (!slGetFeatureFunction ||
+		slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", (void*&)slDLSSGGetState) != sl::Result::eOk ||
+		slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)slDLSSGSetOptions) != sl::Result::eOk)
+		return false;
+	RTX40MFGUnlock::ObserveWrapper(reinterpret_cast<const void*>(slDLSSGSetOptions));
+	return slDLSSGGetState && slDLSSGSetOptions;
+}
+
 void Streamline::PostDevice()
 {
 	if (UsesD3D12()) {
@@ -457,9 +474,7 @@ void Streamline::PostDevice()
 	}
 
 	if (featureDLSSG) {
-		slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGGetState", (void*&)slDLSSGGetState);
-		slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)slDLSSGSetOptions);
-		RTX40MFGUnlock::ObserveWrapper(reinterpret_cast<const void*>(slDLSSGSetOptions));
+		BindDLSSGFunctions();
 	}
 
 	if (featureReflex) {
@@ -545,11 +560,16 @@ void Streamline::InvalidateAbandonedPresentScope()
 bool Streamline::PaceFrame(uint32_t a_frameIndex)
 {
 	// Before Reflex Sleep and input markers, even without Streamline/Reflex.
-	DX12SwapChain::GetSingleton()->PaceFrameStart(a_frameIndex);
+	auto* swap = DX12SwapChain::GetSingleton();
+	swap->PaceFrameStart(a_frameIndex);
 	XeSS::GetSingleton()->Sleep(a_frameIndex);
 	if (XeSS::GetSingleton()->OwnsSwapChain()) { EnsureFrameToken(a_frameIndex); UpdateReflex(0, false); return true; }
 	const auto* upscaling = Upscaling::GetSingleton();
 	const bool validToken = EnsureFrameToken(a_frameIndex);
+	if (swap->IsLoadingRecoveryPending()) {
+		UpdateReflex(0, false);
+		return validToken;
+	}
 	if (!validToken || reflexSleepFrame == a_frameIndex) {
 		return validToken;
 	}
@@ -560,6 +580,7 @@ bool Streamline::PaceFrame(uint32_t a_frameIndex)
 	// jobs. Renderer::Begin is only a fallback for independent loading/movie draws.
 	// The SDK requires Sleep even with Reflex Off; the selected mode controls it.
 	if (featureReflex && slReflexSleep) {
+		FrameTiming::CpuScope timing("Pacing.ReflexSleep", a_frameIndex);
 		if (SL_FAILED(res, slReflexSleep(*frameToken))) {
 			logger::warn("[Streamline] Reflex sleep failed: {}", magic_enum::enum_name(res));
 		}
@@ -571,7 +592,8 @@ bool Streamline::PaceFrame(uint32_t a_frameIndex)
 bool Streamline::BeginSimulationFrame(uint32_t a_frameIndex)
 {
 	std::scoped_lock lock(simulationMutex);
-	if (!PaceFrame(a_frameIndex) || simulationMarkerFrame == a_frameIndex) { return false; }
+	if (!PaceFrame(a_frameIndex) || DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending() ||
+		simulationMarkerFrame == a_frameIndex) { return false; }
 	// A blocked Main::OnIdle may still own an older scope. Loading's real
 	// pre-input boundary supersedes it; stale Main completion cannot close this.
 	simulationMarkerFrame = a_frameIndex;
@@ -606,7 +628,8 @@ void Streamline::EndSimulationFrame(uint32_t a_frameIndex)
 void Streamline::BeginRenderFrame(uint32_t a_frameIndex)
 {
 	std::scoped_lock lock(simulationMutex);
-	if (!PaceFrame(a_frameIndex) || renderMarkerFrame == a_frameIndex) { return; }
+	if (!PaceFrame(a_frameIndex) || DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending() ||
+		renderMarkerFrame == a_frameIndex) { return; }
 	// Independent draws without a real simulation scope still pace, but cannot
 	// contribute incomplete vendor latency markers or GPU-span telemetry.
 	if (completedSimulationFrame != a_frameIndex) return;
@@ -673,6 +696,7 @@ sl::FrameToken* Streamline::GetFrameTokenForFrame(uint32_t a_frameIndex)
 
 void Streamline::SetPCLMarker(sl::PCLMarker a_marker, sl::FrameToken* a_frameToken)
 {
+	if (DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) return;
 	auto markerFrameToken = a_frameToken ? a_frameToken : frameToken;
 	if (!markerFrameToken) {
 		return;
@@ -689,6 +713,7 @@ void Streamline::SetPCLMarker(sl::PCLMarker a_marker, sl::FrameToken* a_frameTok
 
 void Streamline::OnPCLStatsPing()
 {
+	if (DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) return;
 	if (!featurePCL || !slPCLSetMarker || !slGetNewFrameToken) {
 		return;
 	}
@@ -710,7 +735,15 @@ void Streamline::OnPCLStatsPing()
 
 void Streamline::UpdateReflex(uint a_reflexMode, bool a_forceEnabled)
 {
-	if (XeSS::GetSingleton()->OwnsSwapChain()) { a_reflexMode = 0; a_forceEnabled = false; }
+	bool retiringDLSSG = reflexRecoveryPresents.load() != 0;
+	if (retiringDLSSG && Upscaling::GetSingleton()->settings.frameGenerationMode != 0) {
+		reflexRecoveryPresents.store(0);
+		retiringDLSSG = false;
+	}
+	if (retiringDLSSG || XeSS::GetSingleton()->OwnsSwapChain() || DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) {
+		a_reflexMode = 0;
+		a_forceEnabled = false;
+	}
 	if (!featureReflex || !slReflexSetOptions) {
 		return;
 	}
@@ -760,7 +793,8 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		const auto now = GetTickCount64();
 		if (now - lastUnlockRetryTick >= 1000) {
 			lastUnlockRetryTick = now;
-			mfgUnlockReady = RTX40MFGUnlock::PatchLoadedModules();
+			FrameTiming::CpuScope timing("DLSSG.ProviderRetry");
+			mfgUnlockReady = RTX40MFGUnlock::RetryProviderDiscovery();
 		}
 	}
 	const bool restrictAdaToNativeTwoX =
@@ -859,8 +893,11 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 		return false;
 	}
 
-	pendingDLSSGDisable = false;
-	dlssgPresentSafetyFrames = 0;
+	// A quick menu exit can request ON before Present has applied OFF or
+	// before the OFF presents that protect input reuse have finished.
+	if (pendingDLSSGDisable || dlssgPresentSafetyFrames != 0) {
+		return true;
+	}
 
 	if (currentDLSSGMode == mode &&
 		currentDLSSGGeneratedFrames == generatedFrames &&
@@ -902,13 +939,18 @@ bool Streamline::UpdateDLSSG(bool a_enabled, uint a_mode, uint a_numFramesToGene
 	options.enableUserInterfaceRecomposition = hasUIBuffer ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 	options.onErrorCallback = DLSSGAPIErrorCallback;
 
-	if (SL_FAILED(result, slDLSSGSetOptions(viewport, options))) {
+	const auto optionsResult = [&] {
+		FrameTiming::CpuScope timing("DLSSG.SetOptions", UINT32_MAX, true);
+		return slDLSSGSetOptions(viewport, options);
+	}();
+	if (SL_FAILED(result, optionsResult)) {
 		logger::warn("[Streamline] Could not set DLSS-G mode {}: {}", static_cast<uint32_t>(mode), magic_enum::enum_name(result));
 		dlssgActive = false;
 		return false;
 	}
 
 	currentDLSSGMode = mode;
+	configuredDLSSGOptions = options;
 	currentDLSSGGeneratedFrames = generatedFrames;
 	currentDLSSGDynamicTargetFPS = dynamicTargetFPS;
 	currentRenderWidth = renderWidth;
@@ -945,18 +987,28 @@ void Streamline::RequestDLSSGDisable()
 	}
 
 	pendingDLSSGDisable = true;
+	if (dlssgActive && Upscaling::GetSingleton()->settings.frameGenerationMode == 0) {
+		// Keeping Reflex enabled while DLSS-G retires can leave Sleep blocking
+		// for ~8 ms per native frame. Resume it after presentation settles.
+		reflexRecoveryPresents.store(8);
+		UpdateReflex(0, false);
+	}
 	RequestTemporalReset();
 }
 
 bool Streamline::DisableDLSSGNow()
 {
+	FrameTiming::CpuScope timing("DLSSG.Disable", UINT32_MAX, true);
 	if (!featureDLSSG || !slDLSSGSetOptions) {
 		return false;
 	}
 
-	sl::DLSSGOptions options{};
+	// OFF is a pause of the active configuration. Resetting the multiplier
+	// and resource descriptors here also reconfigures the presenting runtime
+	// while it still owns generated frames from the previous Present.
+	auto options = configuredDLSSGOptions;
 	options.mode = sl::DLSSGMode::eOff;
-	options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+	options.flags |= sl::DLSSGFlags::eRetainResourcesWhenOff;
 	options.onErrorCallback = DLSSGAPIErrorCallback;
 
 	if (SL_FAILED(result, slDLSSGSetOptions(viewport, options))) {
@@ -993,7 +1045,15 @@ void Streamline::OnDLSSGPresentComplete()
 {
 	if (!dlssgActive && !pendingDLSSGDisable && dlssgPresentSafetyFrames > 0) {
 		--dlssgPresentSafetyFrames;
+	} else if (!dlssgActive && !pendingDLSSGDisable) {
+		AdvanceReflexRecoveryAfterPresent();
 	}
+}
+
+void Streamline::AdvanceReflexRecoveryAfterPresent()
+{
+	auto remaining = reflexRecoveryPresents.load();
+	if (remaining) reflexRecoveryPresents.compare_exchange_strong(remaining, remaining - 1);
 }
 
 void Streamline::TagDLSSGResources(ID3D11Texture2D* a_hudlessColor, ID3D11Texture2D* a_motionVectors, ID3D11Texture2D* a_depth, float2 a_renderSize, float2 a_displaySize)
@@ -1167,6 +1227,7 @@ void Streamline::QueryDLSSGState()
 	}
 	lastDLSSGStateQueryFrame = currentFrame;
 
+	FrameTiming::CpuScope timing("DLSSG.GetState", currentFrame, true);
 	sl::DLSSGState state{};
 	if (SL_FAILED(result, slDLSSGGetState(viewport, state, nullptr))) {
 		logger::warn("[Streamline] Could not query DLSS-G state: {}", magic_enum::enum_name(result));
@@ -1189,10 +1250,15 @@ void Streamline::QueryDLSSGState()
 	}
 }
 
+bool Streamline::UsesReflexLatencyReport() const
+{
+	return featureReflex && !XeSS::GetSingleton()->OwnsSwapChain();
+}
+
 float Streamline::GetReflexLatencyMs()
 {
 	pclLatencyReportAvailable.store(false, std::memory_order_release);
-	if (XeSS::GetSingleton()->OwnsSwapChain() || !featureReflex || !slReflexGetState) {
+	if (!UsesReflexLatencyReport() || !slReflexGetState) {
 		return 0.0f;
 	}
 
@@ -1295,7 +1361,9 @@ bool Streamline::EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWi
 	currentD3D12DLSSOutputHeight = a_outputHeight;
 	currentD3D12DLSSModelPreset = a_dlssModelPreset;
 	currentD3D12DLSSHDR = a_hdr;
-	logger::info("[Streamline] DLSS color range={} output={}x{}", a_hdr ? "extended" : "SDR", a_outputWidth, a_outputHeight);
+	logger::info("[Streamline] DLSS color range={} output={}x{} mode={} modelSetting={} DLAA preset hint={}",
+		a_hdr ? "extended" : "SDR", a_outputWidth, a_outputHeight, magic_enum::enum_name(a_mode),
+		a_dlssModelPreset, magic_enum::enum_name(dlssOptions.dlaaPreset));
 	if (hadValidOptions && lastTemporalResetFrameIndex != constantsFrameIndex) {
 		RequestTemporalReset();
 	}
@@ -1558,7 +1626,13 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 			retainedNativeNRBytes = std::max(retainedNativeNRBytes,
 				TextureMemoryReserve::NRFeatureBytes(a_outputExtent.width, a_outputExtent.height));
 		}
-		if (SL_FAILED(result, slEvaluateFeature(feature, *a_frameToken, inputs, numResourceTags + 1, a_commandList))) {
+		const auto evaluate = [&] {
+			FrameTiming::Gpu12Scope gpu(a_commandList, a_useDLSSNR ? "NR.StreamlineEvaluate" : "SR.DLSS");
+			return slEvaluateFeature(feature, *a_frameToken, inputs, numResourceTags + 1, a_commandList);
+		};
+		const auto result = evaluate();
+		// Streamline reports budget pressure after a successful evaluation and logs the warning itself.
+		if (result != sl::Result::eOk && result != sl::Result::eWarnOutOfVRAM) {
 			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
 				logger::warn(
 					"[Streamline] D3D12 {} evaluate failed: {} token={} input={}x{} output={}x{} color={} outputResource={} mvec={} depth={} transparency={} formats color={} mvec={} depth={}",
@@ -1637,6 +1711,8 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		parameters.options.localStructureStrength = a_dlssNROptions.localStructureStrength;
 		parameters.options.skinStructureStrength = a_dlssNROptions.skinStructureStrength;
 		parameters.options.useAutoMask = a_dlssNROptions.useAutoMask == sl::Boolean::eTrue;
+		FrameTiming::CpuScope timing("NR.DirectEvaluate");
+		FrameTiming::Gpu12Scope gpu(a_commandList, "NR.DirectEvaluate");
 		return directDLSSNR.Evaluate(a_commandList, parameters);
 	};
 
@@ -1842,20 +1918,10 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 
 	DirectX::XMMATRIX clipToCameraView{};
 	DirectX::XMMATRIX clipToCurrentWorld{};
-	DirectX::XMMATRIX prevClipToClip{};
 	const auto currentViewProj = Util::ToXMMatrix(viewData.currentViewProjUnjittered);
-	const auto previousViewProj = Util::ToXMMatrix(viewData.previousViewProjUnjittered);
 	if (!TryInvertMatrix(cameraProjection.cameraViewToClip, clipToCameraView) ||
-		!TryInvertMatrix(currentViewProj, clipToCurrentWorld) ||
-		!IsUsableMatrix(previousViewProj)) {
-		logger::error("[Streamline] Common constants have invalid camera transforms frame={}", currentFrameIndex);
-		return false;
-	}
-
-	const auto clipToPrevClip = DirectX::XMMatrixMultiply(clipToCurrentWorld, previousViewProj);
-	if (!IsUsableMatrix(clipToPrevClip) ||
-		!TryInvertMatrix(clipToPrevClip, prevClipToClip)) {
-		logger::error("[Streamline] Common constants have invalid camera transforms frame={}", currentFrameIndex);
+		!TryInvertMatrix(currentViewProj, clipToCurrentWorld)) {
+		logger::error("[Streamline] Common constants have invalid current camera transforms frame={}", currentFrameIndex);
 		return false;
 	}
 
@@ -1863,6 +1929,19 @@ bool Streamline::UpdateConstants(float2 a_jitter)
 		RequestTemporalReset();
 	}
 	const auto resetHistory = temporalResetPending;
+	// A history reset has no previous sample. The engine may still have an
+	// empty or unrelated previous camera on the first frame after a save load.
+	auto clipToPrevClip = DirectX::XMMatrixIdentity();
+	auto prevClipToClip = DirectX::XMMatrixIdentity();
+	if (!resetHistory) {
+		const auto previousViewProj = Util::ToXMMatrix(viewData.previousViewProjUnjittered);
+		clipToPrevClip = DirectX::XMMatrixMultiply(clipToCurrentWorld, previousViewProj);
+		if (!IsUsableMatrix(previousViewProj) || !IsUsableMatrix(clipToPrevClip) ||
+			!TryInvertMatrix(clipToPrevClip, prevClipToClip)) {
+			logger::error("[Streamline] Common constants have invalid previous camera transforms frame={}", currentFrameIndex);
+			return false;
+		}
+	}
 
 	sl::Constants slConstants{};
 	slConstants.cameraViewToClip = ToSLMatrix(cameraProjection.cameraViewToClip);

@@ -345,7 +345,7 @@ namespace
 				"Runtime: DLSS %s | DLSS-NR %s | DLSS Frame Generation %s | Reflex %s",
 				streamline->featureDLSS ? "available" : "unavailable",
 				streamline->IsNRSupported(false) ? (streamline->featureDLSSNR ? "available" : "direct path") : "unavailable",
-				streamline->featureDLSSG ? "available" : "unavailable",
+				Upscaling::GetSingleton()->dlssgAdapterSupported ? "available" : "unavailable",
 				streamline->featureReflex ? "available" : "unavailable");
 		}
 
@@ -383,49 +383,50 @@ namespace
 
 		ImGuiMCP::SeparatorText("Frame Generation");
 		static constexpr std::array fgProviders{ "DLSS-G", "FSR FG", "XeSS FG" };
-		changed |= ComboSetting("FG Provider (restart required)", settings.frameGenerationProvider, fgProviders,
-			"Applied on game restart. DLSS-G falls back to XeSS FG when unsupported; FP16/scRGB output automatically uses FSR FG for this session.");
+		changed |= ComboSetting("FG Provider", settings.frameGenerationProvider, fgProviders,
+			"Applied after pending generated frames have finished. DLSS-G falls back to XeSS FG when unsupported; FP16/scRGB output automatically uses FSR FG for this session.");
 		ImGuiMCP::TextDisabled("Active FG provider: %s", Upscaling::GetSingleton()->GetFGProviderName());
-		if (settings.frameGenerationProvider != Upscaling::GetSingleton()->GetStartupFGPreference())
-			ImGuiMCP::TextWrapped("Restart the game to apply the selected FG provider.");
+		if (Upscaling::GetSingleton()->FGProviderChangePending())
+			ImGuiMCP::TextWrapped("Switching FG provider...");
 		if (Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::FSR &&
-			Upscaling::GetSingleton()->GetStartupFGPreference() != static_cast<uint>(Upscaling::FGProvider::FSR) &&
+			settings.frameGenerationProvider != static_cast<uint>(Upscaling::FGProvider::FSR) &&
 			DX12SwapChain::GetSingleton()->swapChainDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
 			ImGuiMCP::TextWrapped("FP16/scRGB output uses FSR FG instead of DLSS-G or XeSS FG. DLSS SR remains available.");
 		if (const auto* reason = XeSS::GetSingleton()->FailureReason()) ImGuiMCP::TextWrapped("%s", reason);
 		const bool upscalingDisabled = settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDisabled);
-		ImGuiMCP::BeginDisabled(upscalingDisabled);
+		const auto* upscaling = Upscaling::GetSingleton();
+		const auto selectedProvider = settings.frameGenerationProvider == upscaling->appliedFGPreference ?
+			upscaling->GetFGProvider() : upscaling->ResolveFGPreference(settings.frameGenerationProvider, DX12SwapChain::GetSingleton()->swapChainDesc.Format);
+		ImGuiMCP::BeginDisabled(selectedProvider == Upscaling::FGProvider::Unavailable);
 		static constexpr std::array frameGenerationModes{ "Disabled", "On", "Auto (menu handling)" };
 		changed |= ComboSetting(
 			"Frame Generation",
 			settings.frameGenerationMode,
 			frameGenerationModes,
-			"Enables the active FG provider independently of the selected SR method.");
+			"Enables the active FG provider at native resolution or with any SR method.");
 		ImGuiMCP::EndDisabled();
 
-		const bool frameGenerationDisabled = upscalingDisabled || settings.frameGenerationMode == 0;
-		// Editing the restart-only preference must not redirect live multiplier
-		// edits to a provider that does not own this process's swapchain.
-		const auto activeProvider = Upscaling::GetSingleton()->GetFGProvider();
+		const bool frameGenerationDisabled = settings.frameGenerationMode == 0 || selectedProvider == Upscaling::FGProvider::Unavailable;
+		// The provider and its multiplier are committed together when the menu closes.
 		static constexpr std::array generatedFrameCounts{ "1 (2x)", "2 (3x)", "3 (4x)", "4 (5x)", "5 (6x)" };
 		static constexpr std::array xeCounts{ "1 (2x)", "2 (3x)", "3 (4x)", "4 (5x)", "5 (6x)", "6 (7x)", "7 (8x)" };
 		ImGuiMCP::BeginDisabled(frameGenerationDisabled);
-		if (activeProvider == Upscaling::FGProvider::DLSSG) {
+		if (selectedProvider == Upscaling::FGProvider::DLSSG) {
 			changed |= ComboSetting("Generated Frames", settings.dlssgGeneratedFrames, generatedFrameCounts,
 				"Saved for the active DLSS-G provider. The runtime clamps unsupported values.");
-		} else if (activeProvider == Upscaling::FGProvider::XeSS) {
+		} else if (selectedProvider == Upscaling::FGProvider::XeSS) {
 			changed |= ComboSetting("Generated Frames", settings.xessGeneratedFrames, xeCounts,
 				"Saved for the active XeSS FG provider and clamped to runtime support.");
 			ImGuiMCP::TextDisabled("XeSS runtime maximum: %ux | Low latency: XeLL", XeSS::GetSingleton()->MaxGeneratedFrames() + 1);
-		} else if (activeProvider == Upscaling::FGProvider::FSR) {
+		} else if (selectedProvider == Upscaling::FGProvider::FSR) {
 			ImGuiMCP::TextDisabled("Generated Frames: 1 (2x, fixed)");
 		} else {
 			ImGuiMCP::TextDisabled("Generated Frames: unavailable");
 		}
 		ImGuiMCP::EndDisabled();
 
-		if (activeProvider == Upscaling::FGProvider::DLSSG) {
-			ImGuiMCP::BeginDisabled(frameGenerationDisabled || !streamline->featureDLSSG);
+		if (selectedProvider == Upscaling::FGProvider::DLSSG) {
+			ImGuiMCP::BeginDisabled(frameGenerationDisabled || !upscaling->dlssgAdapterSupported);
 			changed |= CheckboxSetting("Dynamic Multi Frame Generation", settings.dynamicMFGEnabled,
 				"Lets Streamline dynamically select the generated-frame multiplier when supported.");
 			ImGuiMCP::BeginDisabled(settings.dynamicMFGEnabled == 0);
@@ -434,7 +435,7 @@ namespace
 			ImGuiMCP::EndDisabled();
 			ImGuiMCP::EndDisabled();
 		}
-		ImGuiMCP::BeginDisabled(XeSS::GetSingleton()->OwnsSwapChain());
+		ImGuiMCP::BeginDisabled(selectedProvider == Upscaling::FGProvider::XeSS);
 		static constexpr std::array reflexModes{ "Off", "On", "On + Boost" };
 		changed |= ComboSetting(
 			"NVIDIA Reflex",
@@ -461,6 +462,8 @@ namespace
 			settings.dlssNREnabled,
 			"Runs experimental DLSS-NR at the selected stage. NR failure preserves the SR path.");
 		ImGuiMCP::BeginDisabled(settings.dlssNREnabled == 0);
+		changed |= CheckboxSetting("Disable NR in menus", settings.dlssNRDisableInMenus,
+			"Skip Neural Rendering while the game is paused in a menu or loading.");
 		static constexpr std::array nrPositions{ "Before SR", "After SR" };
 		changed |= ComboSetting("NR Position", settings.dlssNRPosition, nrPositions,
 			"Before SR processes render resolution. After SR processes display resolution before UI composition and costs more GPU time and memory.");
@@ -559,7 +562,7 @@ namespace
 			"On-Screen Display",
 			settings.osdMode,
 			osdModes,
-			"Shows D3D12 swapchain and upscaler status while DLSS, FSR or XeSS is active.");
+			"Shows FPS, rendering status and GPU memory for the active presenter.");
 
 		ImGuiMCP::SeparatorText("Misc");
 		changed |= SliderIntSetting(

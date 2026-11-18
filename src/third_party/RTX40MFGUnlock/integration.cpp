@@ -8,6 +8,7 @@
 #include "universal_wrapper_profile.h"
 
 #include <TlHelp32.h>
+#include <Psapi.h>
 #include <nvsdk_ngx.h>
 
 #include <algorithm>
@@ -60,6 +61,7 @@ namespace RTX40MFGUnlock
 			bool createHookInstalled = false;
 			std::int32_t createHookSlot = -1;
 			bool midpointPatched = false;
+			bool midpointVersionRejected = false;
 		};
 
 		// NGX can expose the same provider ABI from the game-local DLL and from
@@ -524,12 +526,15 @@ namespace RTX40MFGUnlock
 				candidate = &record;
 				++candidateCount;
 			}
-			if (candidateCount != 1 || !candidate) {
+			if (candidateCount != 1 || !candidate || candidate->midpointVersionRejected) {
 				return false;
 			}
 
 			const auto path = LoadedModulePath(candidate->module);
 			if (!midpoint_fix::PatchProvider(candidate->module, path.c_str())) {
+				// Failure 3 is eProviderVersion in the vendored midpoint policy.
+				// The inspected image is pinned for the lifetime of this process.
+				candidate->midpointVersionRejected = midpoint_fix::FailureCode() == 3;
 				return false;
 			}
 
@@ -614,6 +619,35 @@ namespace RTX40MFGUnlock
 			logger::warn("[RTX40MFGUnlock] Module patching failed with an unknown exception");
 		}
 		return false;
+	}
+
+	bool RetryProviderDiscovery() noexcept
+	{
+		// The loader callbacks handle new NVIDIA modules immediately. Preserve
+		// the scan for loads outside those callbacks without inspecting every
+		// process module again when the same unsupported provider is resident.
+		std::lock_guard lock(g_mutex);
+		if (std::none_of(g_modules.begin(), g_modules.end(),
+			[](const ModuleRecord& m) { return m.midpointVersionRejected; })) {
+			return PatchLoadedModules();
+		}
+		static std::array<HMODULE, 1024> previous{};
+		static DWORD previousBytes = 0;
+		std::array<HMODULE, 1024> current{};
+		DWORD bytes = 0;
+		if (!K32EnumProcessModules(GetCurrentProcess(), current.data(), sizeof(current), &bytes) ||
+			!bytes || bytes > sizeof(current)) {
+			previousBytes = 0;
+			return PatchLoadedModules();
+		}
+		if (bytes == previousBytes && std::memcmp(previous.data(), current.data(), bytes) == 0 &&
+			std::all_of(g_modules.begin(), g_modules.end(),
+				[](const ModuleRecord& m) { return !m.ngxPatched || m.midpointVersionRejected; })) {
+			return Ready();
+		}
+		previous = current;
+		previousBytes = bytes;
+		return PatchLoadedModules();
 	}
 
 	bool ObserveD3D12Device(ID3D12Device* a_device) noexcept

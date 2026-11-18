@@ -469,11 +469,12 @@ public:
 	 *
 	 * Creates a new D3D11 2D texture resource.
 	 */
-	explicit Texture2D(D3D11_TEXTURE2D_DESC const& a_desc) :
-		desc(a_desc)
+	explicit Texture2D(D3D11_TEXTURE2D_DESC const& a_desc)
 	{
 		auto device = reinterpret_cast<ID3D11Device*>(RE::BSGraphics::GetRendererData()->device);
-		DX::ThrowIfFailed(device->CreateTexture2D(&desc, nullptr, resource.put()));
+		DX::ThrowIfFailed(device->CreateTexture2D(&a_desc, nullptr, resource.put()));
+		// Cache the actual allocation, including any format override or resolved mip count.
+		resource->GetDesc(&desc);
 	}
 
 	/**

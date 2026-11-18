@@ -1,6 +1,7 @@
 #include "XeSS.h"
 #include "ColorRange.h"
 #include "DX12SwapChain.h"
+#include "FrameTiming.h"
 #include "XeSSCompat/XeFGUnlock.h"
 #include "XeSSCompat/XeLLUnLock.h"
 #include <filesystem>
@@ -178,7 +179,12 @@ bool XeSS::CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12C
     failureReason = "XeSS FG initialization failed (SDK/hardware unavailable). See Upscaling.log.";
     if (!LoadFG()) return false;
     *chain = nullptr;
-    if (p_xellD3D12CreateContext(device, &ll) < 0) return false;
+    xell_context_handle_t latency = nullptr;
+    if (p_xellD3D12CreateContext(device, &latency) < 0) return false;
+    {
+        std::scoped_lock lock(markerMutex);
+        ll = latency;
+    }
     if (!FGResult(p_xefgSwapChainD3D12CreateContext(device, &fg), "CreateContext")) { DestroyFG(); return false; }
     xefg_swapchain_properties_t properties{};
     if (!FGResult(p_xefgSwapChainGetProperties(fg, &properties), "GetProperties")) { DestroyFG(); return false; }
@@ -188,7 +194,7 @@ bool XeSS::CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12C
     // On the patched generic provider, MFG also needs working per-frame pacing.
     if (XeFGUnlock::Applied() && !XeFGPacing::g_enabled) maxGenerated = 1;
     xell_sleep_params_t sleep{}; sleep.bLowLatencyMode = 1;
-    if (p_xellSetSleepMode(ll, &sleep) < 0 || !FGResult(p_xefgSwapChainSetLatencyReduction(fg, ll), "SetLatencyReduction")) {
+    if (p_xellSetSleepMode(latency, &sleep) < 0 || !FGResult(p_xefgSwapChainSetLatencyReduction(fg, latency), "SetLatencyReduction")) {
         DestroyFG(); return false;
     }
     xefg_swapchain_d3d12_init_params_t init{};
@@ -196,11 +202,12 @@ bool XeSS::CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12C
     init.uiMode = XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS;
     if (!FGResult(p_xefgSwapChainD3D12InitFromSwapChainDesc(fg, window, &desc, nullptr, queue, factory, &init), "InitSwapChain") ||
         !FGResult(p_xefgSwapChainD3D12GetSwapChainPtr(fg, IID_PPV_ARGS(chain)), "GetSwapChain")) { DestroyFG(); return false; }
-    fgInitialized = true; fgEnabled = false; taggedId = 0; fgReset = 0; fgFormat = desc.Format; generatedFrames = 0;
+    fgEnabled = false; taggedId = 0; fgReset = 0; fgFormat = desc.Format; generatedFrames = 0;
     if (!FGResult(p_xefgSwapChainSetEnabled(fg, false), "InitializeDisabled") ||
         !FGResult(p_xefgSwapChainSetUiCompositionState(fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED), "SetUiComposition")) {
         DestroyFG(); return false;
     }
+    fgInitialized.store(true, std::memory_order_release);
     failureReason = nullptr;
     logger::info("[XeSS FG] Swapchain initialized format={} maximum={}x", static_cast<uint32_t>(desc.Format), maxGenerated + 1);
     return true;
@@ -209,19 +216,20 @@ bool XeSS::CreateSwapChain(ID3D12Device* device, IDXGIFactory2* factory, ID3D12C
 bool XeSS::DestroyFG()
 {
     if (!DisableFG()) return false;
+    // Sleep, latency reports and markers can arrive from the simulation
+    // thread while the render thread removes the presentation backend.
+    std::scoped_lock lock(markerMutex);
     if (fg && !FGResult(p_xefgSwapChainDestroy(fg), "Destroy")) return false;
     fg = nullptr; fgInitialized = false;
     if (ll) p_xellDestroyContext(ll);
     ll = nullptr;
-    {
-        std::scoped_lock lock(markerMutex);
-        sleepFrame = UINT_MAX;
-        sleepSucceeded = false;
-        sleptPresentId = 0;
-        simulationPresentId.store(0, std::memory_order_relaxed);
-        completedSimulationId = renderStartedId = presentStartedId = presentAttemptId = 0;
-        reportFloorId = presentId.load(std::memory_order_relaxed);
-    }
+    sleepFrame = UINT_MAX;
+    sleepSucceeded = false;
+    lowLatencyEnabled = true;
+    sleptPresentId = 0;
+    simulationPresentId.store(0, std::memory_order_relaxed);
+    completedSimulationId = renderStartedId = presentStartedId = presentAttemptId = 0;
+    reportFloorId = presentId.load(std::memory_order_relaxed);
     return true;
 }
 
@@ -234,7 +242,7 @@ bool XeSS::DisableFG()
         logger::error("[XeSS FG] Refusing disable before tagged copies are submitted");
         return false;
     }
-    const auto wasEnabled = fgEnabled;
+    const auto wasEnabled = FGEnabled();
     if (fgInitialized && fgEnabled && !FGResult(p_xefgSwapChainSetEnabled(fg, false), "Disable")) return false;
     fgEnabled = false; taggedId = 0; fgReset = 0;
     if (wasEnabled) ResetPacingHistory();
@@ -327,7 +335,25 @@ void XeSS::ResetPacingHistory()
 void XeSS::Sleep(uint32_t engineFrame)
 {
     std::scoped_lock lock(markerMutex);
-    if (!ll || !fgInitialized || sleepFrame == engineFrame) return;
+    if (!ll || !fgInitialized) return;
+    const bool enableLatency = !DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending();
+    if (lowLatencyEnabled != enableLatency) {
+        xell_sleep_params_t sleep{};
+        sleep.bLowLatencyMode = enableLatency;
+        const auto result = p_xellSetSleepMode(ll, &sleep);
+        if (result < 0) {
+            logger::warn("[XeLL] Could not set low latency={}: {}", enableLatency, static_cast<int>(result));
+        } else {
+            lowLatencyEnabled = enableLatency;
+            sleepFrame = UINT_MAX;
+            sleepSucceeded = false;
+            simulationPresentId.store(0, std::memory_order_relaxed);
+            completedSimulationId = renderStartedId = presentStartedId = 0;
+            reportFloorId = presentId.load(std::memory_order_relaxed);
+            logger::info("[XeLL] Low latency {} at loading boundary", enableLatency ? "resumed" : "suspended");
+        }
+    }
+    if (!enableLatency || !lowLatencyEnabled || sleepFrame == engineFrame) return;
     auto id = presentId.load(std::memory_order_relaxed);
     if (sleepFrame != UINT_MAX && sleptPresentId == id) {
         // Renderer::End may skip Present altogether. The next real engine
@@ -339,14 +365,18 @@ void XeSS::Sleep(uint32_t engineFrame)
     }
     sleepFrame = engineFrame; // One Sleep attempt per engine frame, even on failure.
     sleptPresentId = id;
-    const auto result = p_xellSleep(ll, sleptPresentId);
+    xell_result_t result;
+    {
+        FrameTiming::CpuScope timing("Pacing.XeLLSleep", engineFrame);
+        result = p_xellSleep(ll, sleptPresentId);
+    }
     sleepSucceeded = result >= 0;
     if (!sleepSucceeded) logger::warn("[XeLL] Sleep failed frame={} id={} result={}", engineFrame, sleptPresentId, static_cast<int>(result));
 }
 void XeSS::Marker(xell_latency_marker_type_t marker)
 {
     std::scoped_lock lock(markerMutex);
-    if (!ll || !fgInitialized) return;
+    if (!ll || !fgInitialized || DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) return;
     const auto id = presentId.load(std::memory_order_relaxed);
     if (!sleepSucceeded || sleptPresentId != id) return;
     if (marker == XELL_RENDERSUBMIT_START && completedSimulationId != id) return;
@@ -373,7 +403,8 @@ void XeSS::EndSimulation(uint32_t engineFrame)
     // Do not attach its end marker to a newer frame or send it twice.
     std::scoped_lock lock(markerMutex);
     const auto id = simulationPresentId.exchange(0, std::memory_order_relaxed);
-    if (ll && fgInitialized && sleepSucceeded && sleepFrame == engineFrame && id && id == presentId) {
+    if (ll && fgInitialized && sleepSucceeded && sleepFrame == engineFrame && id && id == presentId &&
+        !DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) {
         const auto result = p_xellAddMarkerData(ll, id, XELL_SIMULATION_END);
         if (result < 0) logger::warn("[XeLL] Simulation end failed id={} result={}", id, static_cast<int>(result));
         else completedSimulationId = id;
@@ -417,7 +448,8 @@ bool XeSS::BeforePresent()
         return false;
     }
     presentAttemptId = id;
-    if (presentStartedId != id && sleepSucceeded && sleptPresentId == id && renderStartedId == id) {
+    if (presentStartedId != id && sleepSucceeded && sleptPresentId == id && renderStartedId == id &&
+        !DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) {
         const auto renderEnd = p_xellAddMarkerData(ll, id, XELL_RENDERSUBMIT_END);
         const auto presentStart = renderEnd >= 0 ? p_xellAddMarkerData(ll, id, XELL_PRESENT_START) : renderEnd;
         if (presentStart < 0) {
@@ -438,7 +470,8 @@ void XeSS::AfterPresent(HRESULT result)
         std::scoped_lock lock(markerMutex);
         const auto id = presentAttemptId;
         if (id && id == presentId.load(std::memory_order_relaxed)) {
-            if (sleepSucceeded && sleptPresentId == id && presentStartedId == id) {
+            if (sleepSucceeded && sleptPresentId == id && presentStartedId == id &&
+                !DX12SwapChain::GetSingleton()->IsLoadingRecoveryPending()) {
                 const auto markerResult = p_xellAddMarkerData(ll, id, XELL_PRESENT_END);
                 if (markerResult < 0) logger::warn("[XeLL] Present end failed id={} result={}", id, static_cast<int>(markerResult));
             }

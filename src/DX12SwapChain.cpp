@@ -28,6 +28,26 @@ extern bool enbLoaded;
 
 namespace
 {
+	bool IsAppGPULatencySampleFrame(uint32_t frame)
+	{
+		return frame % 16 == 0 && Upscaling::GetSingleton()->settings.osdMode != 0 &&
+			!DX12SwapChain::GetSingleton()->UsesNativePresentation() &&
+			!Streamline::GetSingleton()->UsesReflexLatencyReport();
+	}
+
+	UINT GetPresentFlags(IDXGISwapChain* chain, UINT flags, UINT chainFlags, UINT syncInterval, bool forceTearing, bool dlssgPresentSafety)
+	{
+		const UINT withoutTearing = flags & ~DXGI_PRESENT_ALLOW_TEARING;
+		if (syncInterval || dlssgPresentSafety || !(chainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ||
+			(!forceTearing && !(flags & DXGI_PRESENT_ALLOW_TEARING))) {
+			return withoutTearing;
+		}
+		FrameTiming::CpuScope timing("Present.GetFullscreenState");
+		BOOL fullscreen = TRUE;
+		return SUCCEEDED(chain->GetFullscreenState(&fullscreen, nullptr)) && !fullscreen ?
+			withoutTearing | DXGI_PRESENT_ALLOW_TEARING : withoutTearing;
+	}
+
 	struct LoadedImage
 	{
 		std::uintptr_t base = 0;
@@ -398,6 +418,42 @@ namespace
 		return isProxy;
 	}
 
+	bool UpgradeSwapChainForStreamline(Streamline* a_streamline, winrt::com_ptr<IDXGISwapChain4>& a_chain)
+	{
+		if (!a_streamline || !a_streamline->slUpgradeInterface || !a_chain) return false;
+
+		IDXGISwapChain* upgraded = a_chain.get();
+		if (SL_FAILED(result, a_streamline->slUpgradeInterface(reinterpret_cast<void**>(&upgraded)))) {
+			logger::warn("[DX12SwapChain] Could not upgrade swapchain for Streamline: {}", magic_enum::enum_name(result));
+			return false;
+		}
+		if (upgraded && upgraded != a_chain.get()) {
+			winrt::com_ptr<IDXGISwapChain> owner;
+			owner.attach(upgraded);
+			auto upgraded4 = owner.try_as<IDXGISwapChain4>();
+			if (!upgraded4) {
+				logger::warn("[DX12SwapChain] Streamline wrapper does not expose IDXGISwapChain4");
+				return false;
+			}
+			a_chain = std::move(upgraded4);
+		}
+		return LogStreamlineProxy(a_streamline, "swapChain.afterUpgrade", a_chain.get());
+	}
+
+	void EnableStreamlinePresentForExternalFG(winrt::com_ptr<IDXGISwapChain4>& a_chain)
+	{
+		auto* streamline = Streamline::GetSingleton();
+		if (!streamline->UsesD3D12() || !streamline->featureDLSS || streamline->featureDLSSG) return;
+
+		// The external SDK creates the physical swapchain on a native factory.
+		// Wrap the final chain once so DLSS SR gets Streamline's per-frame
+		// cleanup, with the external SDK still responsible for interpolation.
+		if (!LogStreamlineProxy(streamline, "external-owner", a_chain.get()) &&
+			!UpgradeSwapChainForStreamline(streamline, a_chain)) {
+			logger::warn("[DX12SwapChain] Streamline Present hooks unavailable for DLSS SR on the external FG swapchain");
+		}
+	}
+
 	template <class T>
 	winrt::com_ptr<T> WithoutStreamlineProxy(Streamline* streamline, T* object)
 	{
@@ -458,10 +514,9 @@ D3D11D3D12SharedTexture::D3D11D3D12SharedTexture(const D3D11_TEXTURE2D_DESC& a_d
 	winrt::com_ptr<IDXGIResource1> dxgiResource;
 	DX::ThrowIfFailed(resource11->QueryInterface(IID_PPV_ARGS(dxgiResource.put())));
 
-	HANDLE sharedHandle = nullptr;
-	DX::ThrowIfFailed(dxgiResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &sharedHandle));
-	DX::ThrowIfFailed(a_d3d12Device->OpenSharedHandle(sharedHandle, IID_PPV_ARGS(resource12.put())));
-	CloseHandle(sharedHandle);
+	winrt::handle sharedHandle;
+	DX::ThrowIfFailed(dxgiResource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, sharedHandle.put()));
+	DX::ThrowIfFailed(a_d3d12Device->OpenSharedHandle(sharedHandle.get(), IID_PPV_ARGS(resource12.put())));
 }
 
 DXGISwapChainProxy::DXGISwapChainProxy(IDXGISwapChain4* a_swapChain)
@@ -471,7 +526,35 @@ DXGISwapChainProxy::DXGISwapChainProxy(IDXGISwapChain4* a_swapChain)
 
 void DXGISwapChainProxy::SetSwapChain(IDXGISwapChain4* a_swapChain)
 {
-	swapChain.copy_from(a_swapChain);
+	winrt::com_ptr<IDXGISwapChain4> replacement;
+	replacement.copy_from(a_swapChain);
+	std::scoped_lock lock(backendMutex);
+	std::swap(swapChain, replacement);
+}
+
+DXGISwapChainProxy::BackendUse::BackendUse(DXGISwapChainProxy& a_owner) : owner(a_owner)
+{
+	std::scoped_lock lock(owner.backendMutex);
+	backend = owner.swapChain;
+	if (backend) ++owner.backendCalls;
+}
+
+DXGISwapChainProxy::BackendUse::~BackendUse()
+{
+	if (!backend) return;
+	// A wrapper may execute code from Release. Keep the lease counted until it returns.
+	backend = nullptr;
+	std::scoped_lock lock(owner.backendMutex);
+	--owner.backendCalls;
+}
+
+bool DXGISwapChainProxy::TryDetachBackend()
+{
+	winrt::com_ptr<IDXGISwapChain4> retired;
+	std::scoped_lock lock(backendMutex);
+	if (backendCalls != 0 || !swapChain) return false;
+	retired = std::move(swapChain);
+	return true;
 }
 
 ULONG STDMETHODCALLTYPE DXGISwapChainProxy::AddRef()
@@ -508,18 +591,18 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::QueryInterface(REFIID riid, void**
 		return S_OK;
 	}
 
-	return swapChain->QueryInterface(riid, ppvObj);
+	return WithBackend(E_NOINTERFACE, [&](auto* backend) { return backend->QueryInterface(riid, ppvObj); });
 }
 
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetPrivateData(REFGUID Name, UINT DataSize, const void* pData) { return swapChain->SetPrivateData(Name, DataSize, pData); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetPrivateDataInterface(REFGUID Name, const IUnknown* pUnknown) { return swapChain->SetPrivateDataInterface(Name, pUnknown); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetPrivateData(REFGUID Name, UINT* pDataSize, void* pData) { return swapChain->GetPrivateData(Name, pDataSize, pData); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetParent(REFIID riid, void** ppParent) { return swapChain->GetParent(riid, ppParent); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDevice(REFIID riid, void** ppDevice) { return DX12SwapChain::GetSingleton()->GetDevice(riid, ppDevice); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::Present(UINT SyncInterval, UINT Flags) { return DX12SwapChain::GetSingleton()->Present(SyncInterval, Flags); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) { return DX12SwapChain::GetSingleton()->GetBuffer(Buffer, riid, ppSurface); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget) { return DX12SwapChain::GetSingleton()->SetFullscreenState(Fullscreen, pTarget); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(BOOL* pFullscreen, IDXGIOutput** ppTarget) { return swapChain->GetFullscreenState(pFullscreen, ppTarget); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetPrivateData(REFGUID Name, UINT DataSize, const void* pData) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetPrivateData(Name, DataSize, pData); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetPrivateDataInterface(REFGUID Name, const IUnknown* pUnknown) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetPrivateDataInterface(Name, pUnknown); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetPrivateData(REFGUID Name, UINT* pDataSize, void* pData) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetPrivateData(Name, pDataSize, pData); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetParent(REFIID riid, void** ppParent) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetParent(riid, ppParent); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDevice(REFIID riid, void** ppDevice) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto*) { return DX12SwapChain::GetSingleton()->GetDevice(riid, ppDevice); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::Present(UINT SyncInterval, UINT Flags) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto*) { return DX12SwapChain::GetSingleton()->Present(SyncInterval, Flags); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto*) { return DX12SwapChain::GetSingleton()->GetBuffer(Buffer, riid, ppSurface); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetFullscreenState(BOOL Fullscreen, IDXGIOutput* pTarget) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto*) { return DX12SwapChain::GetSingleton()->SetFullscreenState(Fullscreen, pTarget); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenState(BOOL* pFullscreen, IDXGIOutput** ppTarget) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetFullscreenState(pFullscreen, ppTarget); }); }
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(DXGI_SWAP_CHAIN_DESC* pDesc)
 {
@@ -530,7 +613,9 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(DXGI_SWAP_CHAIN_DESC* pDes
 	DXGI_SWAP_CHAIN_DESC1 desc1{};
 	DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreenDesc{};
 	HWND hwnd = nullptr;
-	DX::ThrowIfFailed(GetDesc1(&desc1));
+	BackendUse use(*this);
+	if (!use.Get()) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+	if (const auto hr = GetDesc1(&desc1); FAILED(hr)) return hr;
 	std::ignore = GetFullscreenDesc(&fullscreenDesc);
 	std::ignore = GetHwnd(&hwnd);
 
@@ -552,16 +637,16 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc(DXGI_SWAP_CHAIN_DESC* pDes
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
-	return DX12SwapChain::GetSingleton()->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+	return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto*) { return DX12SwapChain::GetSingleton()->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags); });
 }
 
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) { return DX12SwapChain::GetSingleton()->ResizeTarget(pNewTargetParameters); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetContainingOutput(IDXGIOutput** ppOutput) { return swapChain->GetContainingOutput(ppOutput); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats) { return swapChain->GetFrameStatistics(pStats); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetLastPresentCount(UINT* pLastPresentCount) { return swapChain->GetLastPresentCount(pLastPresentCount); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeTarget(const DXGI_MODE_DESC* pNewTargetParameters) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto*) { return DX12SwapChain::GetSingleton()->ResizeTarget(pNewTargetParameters); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetContainingOutput(IDXGIOutput** ppOutput) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetContainingOutput(ppOutput); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetFrameStatistics(pStats); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetLastPresentCount(UINT* pLastPresentCount) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetLastPresentCount(pLastPresentCount); }); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pDesc)
 {
-	const auto result = swapChain->GetDesc1(pDesc);
+	const auto result = WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetDesc1(pDesc); });
 	const auto& domain = ENBRenderDomain::Get();
 	if (SUCCEEDED(result) && pDesc && domain.Active()) {
 		pDesc->Width = domain.Width();
@@ -572,23 +657,23 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetDesc1(DXGI_SWAP_CHAIN_DESC1* pD
 	}
 	return result;
 }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pDesc) { return swapChain->GetFullscreenDesc(pDesc); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetHwnd(HWND* pHwnd) { return swapChain->GetHwnd(pHwnd); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetCoreWindow(REFIID refiid, void** ppUnk) { return swapChain->GetCoreWindow(refiid, ppUnk); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetFullscreenDesc(DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pDesc) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetFullscreenDesc(pDesc); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetHwnd(HWND* pHwnd) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetHwnd(pHwnd); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetCoreWindow(REFIID refiid, void** ppUnk) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetCoreWindow(refiid, ppUnk); }); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS*) { return Present(SyncInterval, PresentFlags); }
-BOOL STDMETHODCALLTYPE DXGISwapChainProxy::IsTemporaryMonoSupported() { return swapChain->IsTemporaryMonoSupported(); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetRestrictToOutput(IDXGIOutput** ppRestrictToOutput) { return swapChain->GetRestrictToOutput(ppRestrictToOutput); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetBackgroundColor(const DXGI_RGBA* pColor) { return swapChain->SetBackgroundColor(pColor); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBackgroundColor(DXGI_RGBA* pColor) { return swapChain->GetBackgroundColor(pColor); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetRotation(DXGI_MODE_ROTATION Rotation) { return swapChain->SetRotation(Rotation); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetRotation(DXGI_MODE_ROTATION* pRotation) { return swapChain->GetRotation(pRotation); }
+BOOL STDMETHODCALLTYPE DXGISwapChainProxy::IsTemporaryMonoSupported() { return WithBackend(FALSE, [](auto* backend) { return backend->IsTemporaryMonoSupported(); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetRestrictToOutput(IDXGIOutput** ppRestrictToOutput) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetRestrictToOutput(ppRestrictToOutput); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetBackgroundColor(const DXGI_RGBA* pColor) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetBackgroundColor(pColor); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetBackgroundColor(DXGI_RGBA* pColor) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetBackgroundColor(pColor); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetRotation(DXGI_MODE_ROTATION Rotation) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetRotation(Rotation); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetRotation(DXGI_MODE_ROTATION* pRotation) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetRotation(pRotation); }); }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetSourceSize(UINT Width, UINT Height)
 {
 	const auto& domain = ENBRenderDomain::Get();
 	if (domain.Active()) {
 		return Width == domain.Width() && Height == domain.Height() ? S_OK : E_INVALIDARG;
 	}
-	return swapChain->SetSourceSize(Width, Height);
+	return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetSourceSize(Width, Height); });
 }
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetSourceSize(UINT* pWidth, UINT* pHeight)
 {
@@ -601,23 +686,23 @@ HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetSourceSize(UINT* pWidth, UINT* 
 		*pHeight = domain.Height();
 		return S_OK;
 	}
-	return swapChain->GetSourceSize(pWidth, pHeight);
+	return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetSourceSize(pWidth, pHeight); });
 }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetMaximumFrameLatency(UINT MaxLatency) { return swapChain->SetMaximumFrameLatency(MaxLatency); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetMaximumFrameLatency(UINT* pMaxLatency) { return swapChain->GetMaximumFrameLatency(pMaxLatency); }
-HANDLE STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameLatencyWaitableObject() { return swapChain->GetFrameLatencyWaitableObject(); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetMatrixTransform(const DXGI_MATRIX_3X2_F* pMatrix) { return swapChain->SetMatrixTransform(pMatrix); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetMatrixTransform(DXGI_MATRIX_3X2_F* pMatrix) { return swapChain->GetMatrixTransform(pMatrix); }
-UINT STDMETHODCALLTYPE DXGISwapChainProxy::GetCurrentBackBufferIndex() { return swapChain->GetCurrentBackBufferIndex(); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT* pColorSpaceSupport) { return swapChain->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport); }
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) { return swapChain->SetColorSpace1(ColorSpace); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetMaximumFrameLatency(UINT MaxLatency) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetMaximumFrameLatency(MaxLatency); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetMaximumFrameLatency(UINT* pMaxLatency) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetMaximumFrameLatency(pMaxLatency); }); }
+HANDLE STDMETHODCALLTYPE DXGISwapChainProxy::GetFrameLatencyWaitableObject() { return WithBackend(HANDLE{}, [](auto* backend) { return backend->GetFrameLatencyWaitableObject(); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetMatrixTransform(const DXGI_MATRIX_3X2_F* pMatrix) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetMatrixTransform(pMatrix); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::GetMatrixTransform(DXGI_MATRIX_3X2_F* pMatrix) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->GetMatrixTransform(pMatrix); }); }
+UINT STDMETHODCALLTYPE DXGISwapChainProxy::GetCurrentBackBufferIndex() { return WithBackend(0u, [](auto* backend) { return backend->GetCurrentBackBufferIndex(); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::CheckColorSpaceSupport(DXGI_COLOR_SPACE_TYPE ColorSpace, UINT* pColorSpaceSupport) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->CheckColorSpaceSupport(ColorSpace, pColorSpaceSupport); }); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetColorSpace1(ColorSpace); }); }
 
 HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT SwapChainFlags, const UINT* pCreationNodeMask, IUnknown* const* ppPresentQueue)
 {
-	return DX12SwapChain::GetSingleton()->ResizeBuffers1(BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask, ppPresentQueue);
+	return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto*) { return DX12SwapChain::GetSingleton()->ResizeBuffers1(BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask, ppPresentQueue); });
 }
 
-HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void* pMetaData) { return swapChain->SetHDRMetaData(Type, Size, pMetaData); }
+HRESULT STDMETHODCALLTYPE DXGISwapChainProxy::SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void* pMetaData) { return WithBackend(DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, [&](auto* backend) { return backend->SetHDRMetaData(Type, Size, pMetaData); }); }
 
 void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter, Streamline* a_streamline)
 {
@@ -683,6 +768,10 @@ void DX12SwapChain::CreateD3D12Device(IDXGIAdapter* a_adapter, Streamline* a_str
 
 void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWAP_CHAIN_DESC& a_swapChainDesc, Streamline* a_streamline, bool a_useFidelityFXFrameGeneration)
 {
+	if (!swapChainProxy) {
+		presentationFactory.copy_from(a_dxgiFactory);
+		originalPresentationDesc = a_swapChainDesc;
+	}
 	presentPacing.Reset();
 	hwnd = a_swapChainDesc.OutputWindow;
 	ReShadeDepth::SetOutputWindow(hwnd);
@@ -780,8 +869,8 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 				// FSR owns presentation. Passing an SL factory AND upgrading FSR's
 				// returned chain creates SL(FSR(SL(ReShade(DXGI)))); both SL chains
 				// then compete for its single-chain Present tracker and tag lifetime.
-				auto fidelityFXFactory = WithoutStreamlineProxy(a_streamline, a_dxgiFactory);
-				auto fidelityFXQueue = WithoutStreamlineProxy(a_streamline, commandQueue.get());
+				auto fidelityFXFactory = WithoutStreamlineProxy(Streamline::GetSingleton(), a_dxgiFactory);
+				auto fidelityFXQueue = WithoutStreamlineProxy(Streamline::GetSingleton(), commandQueue.get());
 				// FSR exposes its own application waitable object. Keep this request
 				// separate so a failed FSR creation cannot change the SL fallback.
 				auto fidelityFXDesc = swapChainDesc;
@@ -827,19 +916,8 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		LogStreamlineProxy(a_streamline, "dxgiFactory", a_dxgiFactory);
 		LogStreamlineProxy(a_streamline, "factoryForSwapChain", externalOwner ? a_dxgiFactory : upgradedFactory.get());
 		auto swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain", swapChain.get());
-		if (!externalOwner && !swapChainIsStreamlineProxy && a_streamline && a_streamline->slUpgradeInterface) {
-			IDXGISwapChain* upgradedSwapChain = swapChain.get();
-			if (SL_FAILED(result, a_streamline->slUpgradeInterface(reinterpret_cast<void**>(&upgradedSwapChain)))) {
-				logger::warn("[DX12SwapChain] Could not upgrade swapchain for Streamline: {}", magic_enum::enum_name(result));
-			} else if (upgradedSwapChain && upgradedSwapChain != swapChain.get()) {
-				winrt::com_ptr<IDXGISwapChain> upgradedSwapChainOwner;
-				upgradedSwapChainOwner.attach(upgradedSwapChain);
-				winrt::com_ptr<IDXGISwapChain4> upgradedSwapChain4;
-				DX::ThrowIfFailed(upgradedSwapChainOwner->QueryInterface(IID_PPV_ARGS(upgradedSwapChain4.put())));
-				swapChain = upgradedSwapChain4;
-				logger::info("[DX12SwapChain] Swapchain explicitly upgraded for Streamline: swapchain={}", static_cast<void*>(swapChain.get()));
-				swapChainIsStreamlineProxy = LogStreamlineProxy(a_streamline, "swapChain.afterUpgrade", swapChain.get());
-			}
+		if (!externalOwner && !swapChainIsStreamlineProxy) {
+			swapChainIsStreamlineProxy = UpgradeSwapChainForStreamline(a_streamline, swapChain);
 		}
 		if (!externalOwner && !swapChainIsStreamlineProxy) {
 			logger::warn("[DX12SwapChain] D3D12 swapchain is not a Streamline proxy; DLSS-G Present interception may not run on this swapchain");
@@ -905,10 +983,13 @@ void DX12SwapChain::CreateSwapChain(IDXGIFactory5* a_dxgiFactory, const DXGI_SWA
 		if (switchToFSRFG) swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 		logger::info("[DX12SwapChain] Recreating through SDK with negotiated format={}", static_cast<uint32_t>(swapChainDesc.Format));
 	}
+	if (FidelityFX::GetSingleton()->IsFrameGenerationSwapChainActive() || XeSS::GetSingleton()->OwnsSwapChain()) {
+		EnableStreamlinePresentForExternalFG(swapChain);
+	}
 	ConfigureFrameLatency();
 	RefreshBackBuffers();
 	frameIndex = swapChain->GetCurrentBackBufferIndex();
-	swapChainProxy = new DXGISwapChainProxy(swapChain.get());
+	if (!swapChainProxy) swapChainProxy = new DXGISwapChainProxy(swapChain.get());
 	desktopRefreshHz = QueryDesktopRefreshHz(swapChain.get());
 	if (desktopRefreshHz <= 0.0 &&
 		a_swapChainDesc.BufferDesc.RefreshRate.Numerator != 0 &&
@@ -993,7 +1074,7 @@ void DX12SwapChain::SuspendTemporalFeatures(const char* a_reason)
 	XeSS::GetSingleton()->RequestReset();
 	XeSS::GetSingleton()->ResetPacingHistory();
 	Upscaling::GetSingleton()->OnD3D12TemporalSuspend();
-	presentOverrideFinalColor = nullptr;
+	SetPresentOverride(nullptr);
 	for (auto& context : commandContexts) {
 		context.retainedPresentOverride = nullptr;
 		context.screenshotInput.reset();
@@ -1035,9 +1116,15 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	nativeUITexture = nullptr;
 	nativeUIPassthrough = false;
 	menuComposite = nullptr;
+	menuComposite11.reset();
+	menuOverlayView = nullptr;
+	menuOverlayUAV = nullptr;
+	menuCompositeShader = nullptr;
+	menuComputeState = nullptr;
+	menuOverlayTexture = nullptr;
 	sceneUISRV = nullptr;
 	interopReady = false;
-	presentOverrideFinalColor = nullptr;
+	SetPresentOverride(nullptr);
 	for (auto& staging : presentStaging) staging.reset();
 	menuStaging.reset();
 	menuStagingFenceValue = 0;
@@ -1055,7 +1142,7 @@ void DX12SwapChain::ReleaseResizeDependentResources()
 	frameSlotFenceValues.fill(0);
 	inputReuseFenceValues.fill(0);
 	queuedReuseFenceValues.fill(0);
-	presentSlotFenceValues.fill(0);
+	for (auto& value : presentSlotFenceValues) value.store(0, std::memory_order_relaxed);
 	inputsUsedAtPresent.fill(false);
 }
 
@@ -1176,7 +1263,7 @@ HRESULT DX12SwapChain::ResizeENBScene(uint32_t a_quality)
 	Upscaling::GetSingleton()->DestroyUpscalingResources(preserveNativeNR, true);
 	Streamline::GetSingleton()->DestroyDLSSResources(preserveNativeNR);
 	logger::info("[DLSS-NR] Scene quality change: preserve-native-resources={}", preserveNativeNR);
-	presentOverrideFinalColor = nullptr;
+	SetPresentOverride(nullptr);
 	for (auto& command : commandContexts) { command.retainedPresentOverride = nullptr; }
 	NativeInterfaceUI::ReleaseResources();
 	sceneUISRV = nullptr;
@@ -1341,16 +1428,15 @@ HRESULT DX12SwapChain::ResizeTarget(const DXGI_MODE_DESC* a_newTargetParameters)
 void DX12SwapChain::CreateInterop()
 {
 	ENBRenderDomain::Get().Initialize(swapChainDesc.Width, swapChainDesc.Height);
-	HANDLE sharedFenceHandle = nullptr;
 	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(d3d12Fence.put())));
 	DX::ThrowIfFailed(d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(commandFence.put())));
-	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(d3d12Fence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
-	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(d3d11Fence.put())));
-	CloseHandle(sharedFenceHandle);
-	sharedFenceHandle = nullptr;
-	DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(commandFence.get(), nullptr, GENERIC_ALL, nullptr, &sharedFenceHandle));
-	DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedFenceHandle, IID_PPV_ARGS(d3d11CommandFence.put())));
-	CloseHandle(sharedFenceHandle);
+	const auto openSharedFence = [&](ID3D12Fence* fence, winrt::com_ptr<ID3D11Fence>& target) {
+		winrt::handle sharedHandle;
+		DX::ThrowIfFailed(d3d12Device->CreateSharedHandle(fence, nullptr, GENERIC_ALL, nullptr, sharedHandle.put()));
+		DX::ThrowIfFailed(d3d11Device->OpenSharedFence(sharedHandle.get(), IID_PPV_ARGS(target.put())));
+	};
+	openSharedFence(d3d12Fence.get(), d3d11Fence);
+	openSharedFence(commandFence.get(), d3d11CommandFence);
 	RecreateInteropTextures();
 }
 
@@ -1392,6 +1478,13 @@ void DX12SwapChain::RecreateInteropTextures()
 	for (auto& staging : presentStaging) {
 		staging = std::make_unique<D3D11D3D12SharedTexture>(textureDesc, d3d11Device.get(), d3d12Device.get());
 	}
+	menuComposite.reset();
+	menuComposite11.reset();
+	menuOverlayView = nullptr;
+	menuOverlayUAV = nullptr;
+	menuCompositeShader = nullptr;
+	menuComputeState = nullptr;
+	menuOverlayTexture = nullptr;
 	menuStaging.reset();
 	menuStagingFenceValue = 0;
 	interopReady = true;
@@ -1402,6 +1495,7 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 	if (deviceLost) {
 		DX::ThrowIfFailed(DXGI_ERROR_DEVICE_REMOVED);
 	}
+	FrameTiming::SampleQueueClock(commandQueue.get(), gpuTimestampFrequency, lastProfileCalibrationFrame);
 	const auto completedValue = commandFence ? commandFence->GetCompletedValue() : 0;
 	if (completedValue == std::numeric_limits<UINT64>::max()) {
 		deviceLost = true;
@@ -1412,12 +1506,14 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 		auto& context = commandContexts[contextIndex];
 		if (context.fenceValue == 0 || completedValue >= context.fenceValue) {
 			ConsumeLatencyTimestamp(context);
+			context.timing.Collect(gpuTimestampFrequency);
 			nextCommandContext = static_cast<UINT>((contextIndex + 1) % std::size(commandContexts));
 			context.index = static_cast<UINT>(contextIndex);
 			context.fenceValue = 0;
 			context.retainedPresentOverride = nullptr;
 			context.screenshotInput.reset();
 			context.screenshotOutput.reset();
+			context.osd.resources.reset();
 			DX::ThrowIfFailed(context.allocator->Reset());
 			DX::ThrowIfFailed(context.list->Reset(context.allocator.get(), nullptr));
 			return context;
@@ -1439,11 +1535,13 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 	nextCommandContext = static_cast<UINT>((waitContextIndex + 1) % std::size(commandContexts));
 	auto& context = commandContexts[waitContextIndex];
 	ConsumeLatencyTimestamp(context);
+	context.timing.Collect(gpuTimestampFrequency);
 	context.index = waitContextIndex;
 	context.fenceValue = 0;
 	context.retainedPresentOverride = nullptr;
 	context.screenshotInput.reset();
 	context.screenshotOutput.reset();
+	context.osd.resources.reset();
 	DX::ThrowIfFailed(context.allocator->Reset());
 	DX::ThrowIfFailed(context.list->Reset(context.allocator.get(), nullptr));
 	return context;
@@ -1451,6 +1549,7 @@ DX12SwapChain::CommandContext& DX12SwapChain::AcquireCommandContext()
 
 void DX12SwapChain::NoteSimulationStart(uint32_t frame)
 {
+	if (!IsAppGPULatencySampleFrame(frame)) return;
 	LARGE_INTEGER now{};
 	if (!qpcFrequency || !QueryPerformanceCounter(&now)) return;
 	const auto generation = latencyGeneration.load(std::memory_order_acquire);
@@ -1497,9 +1596,9 @@ void DX12SwapChain::RecordLatencyTimestamp(CommandContext& context, uint32_t fra
 
 void DX12SwapChain::ConsumeLatencyTimestamp(CommandContext& context)
 {
-	if (!context.latencyPending || !commandFence || context.fenceValue == UINT64_MAX ||
-		deviceLost || commandFence->GetCompletedValue() == UINT64_MAX ||
-		commandFence->GetCompletedValue() < context.fenceValue) return;
+	if (!context.latencyPending || !commandFence || context.fenceValue == UINT64_MAX || deviceLost) return;
+	const auto completed = commandFence->GetCompletedValue();
+	if (completed == UINT64_MAX || completed < context.fenceValue) return;
 	context.latencyPending = false;
 	if (!context.latencyPresentSucceeded ||
 		context.latencyGeneration != latencyGeneration.load(std::memory_order_acquire)) return;
@@ -1545,8 +1644,9 @@ bool DX12SwapChain::GetSimulationToAppGPUCompletionMs(float& a_ms)
 	return true;
 }
 
-void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
+void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context, bool a_fenceAfterPresent)
 {
+	FrameTiming::CpuScope timing("Interop.D3D12Submit");
 	DX::ThrowIfFailed(a_context.list->Close());
 	// Once submitted, this allocator and its retained resources must never look
 	// idle again unless a successfully signalled fence proves completion.
@@ -1555,6 +1655,12 @@ void DX12SwapChain::ExecuteCommandContext(CommandContext& a_context)
 	commandQueue->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
 	XeSS::GetSingleton()->OnCommandsSubmitted(a_context.list.get());
 
+#ifndef UPSCALING_NR_CAPTURE
+	// The post-Present fence covers both this list and work enqueued by
+	// the presentation wrapper. Retire this allocator on that one signal.
+	if (a_fenceAfterPresent) return;
+#endif
+	FrameTiming::CpuScope signal("Interop.D3D12SubmissionSignal");
 	const auto signalValue = commandFenceValue++;
 	const auto signalResult = commandQueue->Signal(commandFence.get(), signalValue);
 	if (FAILED(signalResult)) {
@@ -1589,20 +1695,18 @@ void DX12SwapChain::ConfigureFrameLatency()
 		logger::warn("[Presentation] SetMaximumFrameLatency({}) failed hr=0x{:08X}; retaining fence pacing", frameLatency, static_cast<uint32_t>(result));
 		return;
 	}
-	// Use the outer SDK's event, not an unwrapped DXGI event. FSR owns its
-	// replacement handle; duplicate it so our ownership cannot close SDK state.
-	const auto event = swapChain->GetFrameLatencyWaitableObject();
-	HANDLE duplicate = nullptr;
-	if (!event || !DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+	// DXGI and the FidelityFX replacement each return a caller-owned handle.
+	frameLatencyEvent.attach(swapChain->GetFrameLatencyWaitableObject());
+	if (!frameLatencyEvent) {
 		logger::warn("[Presentation] Frame-latency event unavailable; retaining fence pacing");
 		return;
 	}
-	frameLatencyEvent.attach(duplicate);
 	logger::info("[Presentation] DXGI frame latency={}; wait before input via outer swapchain", frameLatency);
 }
 
 void DX12SwapChain::WaitForPresentationCapacity(uint32_t frame)
 {
+	FrameTiming::CpuScope timing("Pacing.DXGICapacity", frame);
 	std::scoped_lock lock(frameLatencyMutex);
 	if (!frameLatencyEvent || (frameLatencyFrameValid && frameLatencyFrame == frame)) { return; }
 	frameLatencyFrame = frame;
@@ -1631,12 +1735,17 @@ void DX12SwapChain::WaitForPresentationCapacity(uint32_t frame)
 	}
 }
 
-void DX12SwapChain::NotifyLoadingScreen(bool active)
+void DX12SwapChain::NotifyLoadingScreen(bool active, LoadingSource source)
 {
-	// Menu callbacks only publish state. Never touch GPU/SDK state here.
+	// F4SE save loads and LoadingMenu can overlap and finish in either order.
+	const auto bit = static_cast<uint64_t>(source);
 	auto previous = loadingState.load(std::memory_order_relaxed);
-	while ((previous & 1u) != static_cast<uint64_t>(active)) {
-		const auto next = ((previous + 2) & ~uint64_t{1}) | static_cast<uint64_t>(active);
+	while (((previous & bit) != 0) != active) {
+		const auto sources = previous & kLoadingSources;
+		const auto updated = active ? sources | bit : sources & ~bit;
+		auto epoch = previous & ~kLoadingSources;
+		if ((sources == 0) != (updated == 0)) epoch += kLoadingSources + 1;
+		const auto next = epoch | updated;
 		if (loadingState.compare_exchange_weak(previous, next, std::memory_order_release, std::memory_order_relaxed)) break;
 	}
 }
@@ -1644,7 +1753,8 @@ void DX12SwapChain::NotifyLoadingScreen(bool active)
 void DX12SwapChain::BeginLoadingFrame()
 {
 	const auto state = loadingState.load(std::memory_order_acquire);
-	if (state == appliedLoadingState.load(std::memory_order_relaxed)) return;
+	const auto epoch = state & ~kLoadingSources;
+	if (epoch == appliedLoadingEpoch.load(std::memory_order_relaxed)) return;
 	// Renderer::Begin owns the transition, including open+close with no draws.
 	loadingResumeFrames.store(2, std::memory_order_release);
 	presentPacing.Reset();
@@ -1656,11 +1766,14 @@ void DX12SwapChain::BeginLoadingFrame()
 	}
 	Streamline::GetSingleton()->RequestTemporalReset();
 	XeSS::GetSingleton()->ResetPacingHistory();
-	appliedLoadingState.store(state, std::memory_order_release);
+	appliedLoadingEpoch.store(epoch, std::memory_order_release);
+	logger::info("[Presentation] Loading {}; latency pacing waits for two gameplay Presents (frame={} epoch={})",
+		(state & kLoadingSources) ? "started" : "ended", Util::State_GetSingleton()->frameCount, epoch);
 }
 
 void DX12SwapChain::PaceFrameStart(uint32_t frame)
 {
+	FrameTiming::CpuScope timing("Pacing.BeforeInput", frame);
 	if (IsLoadingRecoveryPending()) {
 		presentPacing.Reset();
 		return;
@@ -1685,7 +1798,7 @@ void DX12SwapChain::PaceFrameStart(uint32_t frame)
 
 void DX12SwapChain::WaitForFrameStart()
 {
-	if (!IsReady() || deviceLost || IsWindowUnavailable()) {
+	if (!CanUseD3D12FrameGeneration() || IsWindowUnavailable()) {
 		return;
 	}
 	const auto* upscaling = Upscaling::GetSingleton();
@@ -1703,7 +1816,8 @@ void DX12SwapChain::WaitForFrameStart()
 	// not be in chronological order. Zero values also cover initial warm-up.
 	UINT64 newest = 0;
 	UINT64 secondNewest = 0;
-	for (const auto value : presentSlotFenceValues) {
+	for (const auto& slot : presentSlotFenceValues) {
+		const auto value = slot.load(std::memory_order_acquire);
 		if (value > newest) {
 			secondNewest = newest;
 			newest = value;
@@ -1720,6 +1834,7 @@ void DX12SwapChain::WaitForFrameStart()
 
 bool DX12SwapChain::FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext* a_context)
 {
+	FrameTiming::CpuScope timing("Interop.PostPresentSignal");
 	if (a_frameIndex >= std::size(frameSlotFenceValues) || !commandQueue || !commandFence) {
 		return false;
 	}
@@ -1731,7 +1846,7 @@ bool DX12SwapChain::FenceFrameSlotAfterPresent(UINT a_frameIndex, CommandContext
 		return false;
 	}
 	frameSlotFenceValues[a_frameIndex] = signalValue;
-	presentSlotFenceValues[a_frameIndex] = signalValue;
+	presentSlotFenceValues[a_frameIndex].store(signalValue, std::memory_order_release);
 	const auto* upscaling = Upscaling::GetSingleton();
 	if (inputsUsedAtPresent[a_frameIndex] || upscaling->IsFrameGenerationActive() ||
 		upscaling->IsExternalFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety()) {
@@ -1761,10 +1876,16 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value, bool a_publishD3D11)
 	if (completedValue >= a_value) {
 		return true;
 	}
+	const auto frame = a_publishD3D11 ? UINT32_MAX : FrameTiming::CurrentFrame() + 1;
+	FrameTiming::CpuScope timing(a_publishD3D11 ? "Fence.RenderThread.Wait" : "Fence.BeforeInput.Wait", frame, true);
 	// There is no native D3D11 Present to submit pending producer signals.
 	// Publish them before blocking the CPU on a D3D12 consumer fence (including
 	// menu/allocator reuse waits). Flush does not wait for GPU completion.
 	if (a_publishD3D11 && d3d11Context) d3d11Context->Flush();
+	// The input and render threads can wait for different values at the same
+	// time. A shared auto-reset event can wake the other waiter and lose the
+	// completion that this thread was waiting for.
+	static thread_local winrt::handle commandFenceEvent;
 	if (!commandFenceEvent) {
 		commandFenceEvent.attach(CreateEventW(nullptr, FALSE, FALSE, nullptr));
 		if (!commandFenceEvent) {
@@ -1795,7 +1916,7 @@ bool DX12SwapChain::WaitForCommandFence(UINT64 a_value, bool a_publishD3D11)
 		}
 		if (waitResult != WAIT_OBJECT_0 || GetTickCount64() >= deadline) {
 			const auto removedReason = d3d12Device ? d3d12Device->GetDeviceRemovedReason() : E_FAIL;
-			deviceLost = FAILED(removedReason);
+			if (FAILED(removedReason)) deviceLost = true;
 			logger::error(
 				"[DX12SwapChain] Command fence wait failed waitResult=0x{:08X} value={} completed={} removed=0x{:08X}",
 				waitResult, a_value, completedAfterWait, static_cast<uint32_t>(removedReason));
@@ -1813,6 +1934,22 @@ bool DX12SwapChain::IsFrameSlotComplete(UINT slot) const
 	return completed != UINT64_MAX && completed >= frameSlotFenceValues[slot];
 }
 
+bool DX12SwapChain::QueueD3D11ReuseWait(UINT64 a_value, const char* gpuMarker)
+{
+	if (deviceLost) return false;
+	if (a_value == 0) return true;
+	if (!commandFence || !d3d11CommandFence || !d3d11Context) return false;
+	const auto completed = commandFence->GetCompletedValue();
+	if (completed == UINT64_MAX) {
+		deviceLost = true;
+		return false;
+	}
+	if (completed >= a_value) return true;
+	FrameTiming::CpuScope timing("Interop.D3D11ReuseWait");
+	FrameTiming::Gpu11Scope gpu(gpuMarker);
+	return SUCCEEDED(d3d11Context->Wait(d3d11CommandFence.get(), a_value));
+}
+
 bool DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly)
 {
 	if (deviceLost || a_frameIndex >= std::size(frameSlotFenceValues)) {
@@ -1826,16 +1963,14 @@ bool DX12SwapChain::WaitForFrameSlot(UINT a_frameIndex, bool a_inputsOnly)
 
 	// Only GPU writes reuse these allocations. Let the CPU keep recording;
 	// Present separately bounds frame lead using the unchanged swapchain slots.
-	if (!d3d11CommandFence || !d3d11Context || deviceLost ||
-		FAILED(d3d11Context->Wait(d3d11CommandFence.get(), waitValue))) {
-		return false;
-	}
+	if (!QueueD3D11ReuseWait(waitValue, "Interop.FrameSlotWait")) return false;
 	queuedReuseFenceValues[a_frameIndex] = waitValue;
 	return true;
 }
 
 bool DX12SwapChain::GetRetirementFences(uint64_t& a_d3d11, uint64_t& a_d3d12)
 {
+	FrameTiming::CpuScope timing("Interop.D3D11RetirementSignal");
 	if (!d3d11Context || !d3d11Fence || !commandFence || deviceLost) { return false; }
 	const auto value = fenceValue++;
 	if (FAILED(d3d11Context->Signal(d3d11Fence.get(), value))) { return false; }
@@ -1872,7 +2007,7 @@ bool DX12SwapChain::WaitForGPUIdle()
 	frameSlotFenceValues.fill(0);
 	inputReuseFenceValues.fill(0);
 	queuedReuseFenceValues.fill(0);
-	presentSlotFenceValues.fill(0);
+	for (auto& value : presentSlotFenceValues) value.store(0, std::memory_order_relaxed);
 	inputsUsedAtPresent.fill(false);
 	return true;
 }
@@ -1951,7 +2086,7 @@ void DX12SwapChain::EndNativeUI()
 void DX12SwapChain::PublishNativeUIForOverlays()
 {
 	if (UpscalingMenu::IsOpen()) {
-		ResolveNativeUIForMenu();
+		ResolveNativeUIForMenu("UI.ResolveForModMenu");
 	}
 	if (!nativeUIActive || nativeUIWindowTargetActive) { return; }
 	// Only after engine UI/model rendering has finished. RendererWindow is
@@ -2038,7 +2173,7 @@ std::shared_ptr<D3D11D3D12SharedTexture> DX12SwapChain::CaptureScreenshot()
 	}
 }
 
-bool DX12SwapChain::PrepareNativeUIForEngineComposition()
+bool DX12SwapChain::PrepareNativeUIForEngineComposition(const char* marker)
 {
 	if (!IsReady() || deviceLost || IsWindowUnavailable() || sceneResizeActive) {
 		return false;
@@ -2049,8 +2184,151 @@ bool DX12SwapChain::PrepareNativeUIForEngineComposition()
 	if (!presentOverrideFinalColor) {
 		return false;  // No split D3D12 world/D3D11 UI to resolve.
 	}
-	// The existing menu resolve uses GPU-side waits for the interop transfers. Preserve
-	// OM bindings because this entry point runs inside the engine render loop.
+	try {
+		ResolveNativeUIForMenu(marker);
+	} catch (const std::exception& e) {
+		logger::error("[UI composite] Engine menu composition failed: {}", e.what());
+		return false;
+	}
+	return nativeUIIncludesScene;
+}
+
+bool DX12SwapChain::ResolveNativeUIOnD3D11(ID3D11Texture2D* a_uiTarget)
+{
+	if (!presentOverrideSharedColor) { return false; }
+	D3D11_TEXTURE2D_DESC desc{};
+	a_uiTarget->GetDesc(&desc);
+	if (desc.Format != swapChainDesc.Format || desc.Width != swapChainDesc.Width || desc.Height != swapChainDesc.Height ||
+		desc.SampleDesc.Count != 1 || desc.MipLevels != 1 || desc.ArraySize != 1) { return false; }
+	if (menuOverlayTexture.get() != a_uiTarget) {
+		menuOverlayUAV = nullptr;
+		menuOverlayView = nullptr;
+		menuCompositeShader = nullptr;
+		const bool floatTarget = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+		const bool unormTarget = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
+		D3D11_FEATURE_DATA_FORMAT_SUPPORT2 support{ desc.Format };
+		if ((floatTarget || unormTarget) && (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) &&
+			SUCCEEDED(d3d11Device->CheckFeatureSupport(D3D11_FEATURE_FORMAT_SUPPORT2, &support, sizeof(support))) &&
+			(support.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD)) {
+			d3d11Device->CreateUnorderedAccessView(a_uiTarget, nullptr, menuOverlayUAV.put());
+		}
+		if (!menuOverlayUAV && FAILED(d3d11Device->CreateShaderResourceView(a_uiTarget, nullptr, menuOverlayView.put()))) {
+			menuOverlayTexture = nullptr;
+			return false;
+		}
+		menuOverlayTexture.copy_from(a_uiTarget);
+	}
+	if (!menuOverlayUAV && !menuComposite11) {
+		// Match the D3D12 target's conversion. Formats without typed UAV
+		// stores continue through the existing D3D12 compositor.
+		UINT formatSupport = 0;
+		if (FAILED(d3d11Device->CheckFormatSupport(desc.Format, &formatSupport)) ||
+			!(formatSupport & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW)) { return false; }
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		desc.MiscFlags = 0;
+		desc.CPUAccessFlags = 0;
+		winrt::com_ptr<ID3D11Texture2D> texture;
+		if (FAILED(d3d11Device->CreateTexture2D(&desc, nullptr, texture.put()))) { return false; }
+		auto output = std::make_unique<Texture2D>(texture.detach());
+		if (FAILED(d3d11Device->CreateUnorderedAccessView(output->resource.get(), nullptr, output->uav.put()))) { return false; }
+		menuComposite11 = std::move(output);
+	}
+	if (!menuCompositeShader) {
+		constexpr char source[] = R"(
+Texture2D<float4> Scene : register(t0);
+Texture2D<float4> Overlay : register(t1);
+#ifdef UNORM_IN_PLACE
+RWTexture2D<unorm float4> Output : register(u0);
+#else
+RWTexture2D<float4> Output : register(u0);
+#endif
+SamplerState LinearClamp : register(s0);
+[numthreads(8, 8, 1)]
+void main(uint3 p : SV_DispatchThreadID)
+{
+	uint width, height;
+	Output.GetDimensions(width, height);
+	if (p.x >= width || p.y >= height) return;
+	const float4 scene = Scene.SampleLevel(LinearClamp, (float2(p.xy) + 0.5) / float2(width, height), 0);
+	#ifdef IN_PLACE
+	const float4 ui = Output[p.xy];
+#else
+	const float4 ui = Overlay.Load(int3(p.xy, 0));
+#endif
+	Output[p.xy] = float4(ui.rgb + scene.rgb * (1.0 - saturate(ui.a)), 1.0);
+})";
+		winrt::com_ptr<ID3DBlob> shader;
+		const D3D_SHADER_MACRO macros[]{
+			{ "IN_PLACE", "1" },
+			{ desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? nullptr : "UNORM_IN_PLACE", "1" },
+			{ nullptr, nullptr }
+		};
+		if (FAILED(D3DCompile(source, sizeof(source) - 1, nullptr, menuOverlayUAV ? macros : nullptr, nullptr, "main", "cs_5_0",
+				D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shader.put(), nullptr)) ||
+			FAILED(d3d11Device->CreateComputeShader(shader->GetBufferPointer(), shader->GetBufferSize(), nullptr, menuCompositeShader.put()))) {
+			return false;
+		}
+	}
+	if (!nativeUISampler) {
+		D3D11_SAMPLER_DESC sampler{};
+		sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sampler.MaxLOD = D3D11_FLOAT32_MAX;
+		if (FAILED(d3d11Device->CreateSamplerState(&sampler, nativeUISampler.put()))) { return false; }
+	}
+	if (!QueueD3D11ReuseWait(presentOverrideProducerFence, "Interop.MenuSceneWait")) { return false; }
+
+	FrameTiming::Gpu11Scope timing("UI.MenuResolve");
+	if (!menuComputeState) {
+		const auto level = d3d11Device->GetFeatureLevel();
+		if (FAILED(d3d11Device->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION,
+			__uuidof(ID3D11Device), nullptr, menuComputeState.put()))) { return false; }
+	}
+	// The UI texture may also be bound by an engine shader in another stage.
+	winrt::com_ptr<ID3DDeviceContextState> previous;
+	d3d11Context->SwapDeviceContextState(menuComputeState.get(), previous.put());
+	ID3D11ShaderResourceView* inputs[]{ presentOverrideSharedColor.get(), menuOverlayView.get() };
+	auto* output = menuOverlayUAV ? menuOverlayUAV.get() : menuComposite11->uav.get();
+	auto* sampler = nativeUISampler.get();
+	d3d11Context->CSSetShader(menuCompositeShader.get(), nullptr, 0);
+	d3d11Context->CSSetShaderResources(0, 2, inputs);
+	d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+	d3d11Context->CSSetSamplers(0, 1, &sampler);
+	{
+		FrameTiming::Gpu11Scope dispatch("UI.MenuResolve.Blend");
+		d3d11Context->Dispatch((desc.Width + 7) / 8, (desc.Height + 7) / 8, 1);
+	}
+	ID3D11ShaderResourceView* nullInputs[2]{};
+	d3d11Context->CSSetShaderResources(0, 2, nullInputs);
+	output = nullptr;
+	d3d11Context->CSSetUnorderedAccessViews(0, 1, &output, nullptr);
+	if (!menuOverlayUAV) {
+		FrameTiming::Gpu11Scope copy("UI.MenuResolve.CopyBack");
+		d3d11Context->CopyResource(a_uiTarget, menuComposite11->resource.get());
+	}
+
+	d3d11Context->SwapDeviceContextState(previous.get(), nullptr);
+	return true;
+}
+
+void DX12SwapChain::ResolveNativeUIForMenu(const char* marker)
+{
+	if (!IsReady() || deviceLost || IsWindowUnavailable() || sceneResizeActive ||
+		nativeUIIncludesScene || !presentOverrideFinalColor) { return; }
+	// Keep the same overlay allocation for Scaleform and ENB caches.
+	auto* uiTarget = nativeUIActive && nativeUITexture ? nativeUITexture->resource.get() :
+		swapChainBufferProxy ? swapChainBufferProxy->resource.get() : nullptr;
+	if (!uiTarget) { return; }
+	FrameTiming::CpuScope timing("UI.MenuResolve");
+	FrameTiming::CpuScope caller(marker);
+	// The D3D11 compositor switches to an isolated context state for the
+	// dispatch and copy. That switch also preserves the engine's OM bindings.
+	if (ResolveNativeUIOnD3D11(uiTarget)) {
+		nativeUIIncludesScene = true;
+		return;
+	}
+	if (deviceLost) { return; }
 	struct RestoreTargets
 	{
 		ID3D11DeviceContext* context;
@@ -2070,24 +2348,6 @@ bool DX12SwapChain::PrepareNativeUIForEngineComposition()
 			context->OMSetRenderTargets(static_cast<UINT>(views.size()), views.data(), depth.get());
 		}
 	} restore(d3d11Context.get());
-	try {
-		ResolveNativeUIForMenu();
-	} catch (const std::exception& e) {
-		logger::error("[UI composite] Engine menu composition failed: {}", e.what());
-		return false;
-	}
-	return nativeUIIncludesScene;
-}
-
-void DX12SwapChain::ResolveNativeUIForMenu()
-{
-	if (!IsReady() || deviceLost || IsWindowUnavailable() || sceneResizeActive ||
-		nativeUIIncludesScene || !presentOverrideFinalColor) { return; }
-	// Non-ENB already renders UI into the display-sized proxy returned by
-	// GetBuffer. Resolve into that same allocation for the framework's blur.
-	auto* uiTarget = nativeUIActive && nativeUITexture ? nativeUITexture->resource.get() :
-		swapChainBufferProxy ? swapChainBufferProxy->resource.get() : nullptr;
-	if (!uiTarget) { return; }
 	// Resolve a complete frame before destination-dependent HUDGlass menus,
 	// menu background filters or ScopeMenu's black surround. Normal gameplay
 	// keeps the split UI path. nativeUIIncludesScene deduplicates every caller.
@@ -2104,17 +2364,22 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 		menuStaging = std::make_unique<D3D11D3D12SharedTexture>(desc, d3d11Device.get(), d3d12Device.get());
 	}
 	auto& command = AcquireCommandContext();
-	if (!WaitForCommandFence(menuStagingFenceValue)) { return; }
+	// Only this D3D11 write needs to wait for the previous snapshot's reader.
+	// Queue the dependency so the renderer can keep recording the frame.
+	if (!QueueD3D11ReuseWait(menuStagingFenceValue, "Interop.MenuStagingWait")) { return; }
 	auto* staging = menuStaging.get();
 	if (!staging) { return; }
 	d3d11Context->CopyResource(staging->resource11.get(), uiTarget);
 	const auto inputFence = fenceValue++;
-	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), inputFence));
-	// There is no real D3D11 Present to submit this context for us. Submit
-	// the UI copy and its signal before the D3D12 queue consumes the snapshot.
-	d3d11Context->Flush();
-	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), inputFence));
+	{
+		FrameTiming::CpuScope publish("Interop.MenuInputPublish");
+		DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), inputFence));
+		// Publish the UI copy before the D3D12 consumer waits on it.
+		d3d11Context->Flush();
+		DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), inputFence));
+	}
 	command.retainedPresentOverride = presentOverrideFinalColor;
+	command.timing.Begin(d3d12Device.get(), command.list.get(), "UI.MenuResolve");
 	auto* scene = command.retainedPresentOverride.get();
 	auto* output = menuComposite->resource12.get();
 	auto* input = staging->resource12.get();
@@ -2131,10 +2396,14 @@ void DX12SwapChain::ResolveNativeUIForMenu()
 		std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
 	}
 	command.list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
+	command.timing.End(command.list.get());
 	ExecuteCommandContext(command);
 	menuStagingFenceValue = command.fenceValue;
 	if (!rendered) { return; }
-	DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), command.fenceValue));
+	{
+		FrameTiming::Gpu11Scope gpu("Interop.MenuCompositeWait");
+		DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), command.fenceValue));
+	}
 	d3d11Context->CopyResource(uiTarget, menuComposite->resource11.get());
 	nativeUIIncludesScene = true;
 }
@@ -2156,6 +2425,17 @@ bool DX12SwapChain::BeginNativeUI()
 	const auto* sceneRenderer = RE::BSGraphics::GetRendererData();
 	D3D11_TEXTURE2D_DESC sceneDesc{};
 	scene->GetDesc(&sceneDesc);
+	const auto isSceneTarget = [scene](const auto& target) {
+		if (target.texture) {
+			return reinterpret_cast<ID3D11Texture2D*>(target.texture) == scene;
+		}
+		// Renderer::Begin can publish only the swapchain views in RT0.
+		auto* view = reinterpret_cast<ID3D11RenderTargetView*>(target.rtView);
+		if (!view) return false;
+		winrt::com_ptr<ID3D11Resource> resource;
+		view->GetResource(resource.put());
+		return resource.get() == static_cast<ID3D11Resource*>(scene);
+	};
 	const bool usePassthrough =
 		upscaling->settings.upscaleMethodPreference == static_cast<uint>(Upscaling::UpscaleMethod::kDisabled) &&
 		upscaling->settings.dlssNREnabled == 0 &&
@@ -2165,8 +2445,8 @@ bool DX12SwapChain::BeginNativeUI()
 		!XeSS::GetSingleton()->FGEnabled() && !presentOverrideFinalColor &&
 		sceneDesc.Width == swapChainDesc.Width && sceneDesc.Height == swapChainDesc.Height &&
 		sceneDesc.Format == swapChainDesc.Format &&
-		reinterpret_cast<ID3D11Texture2D*>(sceneRenderer->renderTargets[0].texture) == scene &&
-		reinterpret_cast<ID3D11Texture2D*>(sceneRenderer->renderWindow[0].swapChainRenderTarget.texture) == scene;
+		isSceneTarget(sceneRenderer->renderTargets[0]) &&
+		isSceneTarget(sceneRenderer->renderWindow[0].swapChainRenderTarget);
 	if (usePassthrough != nativeUIPassthrough) {
 		nativeUIPassthrough = usePassthrough;
 		++nativeUIGeneration;
@@ -2175,6 +2455,8 @@ bool DX12SwapChain::BeginNativeUI()
 	if (usePassthrough) {
 		return true;
 	}
+	FrameTiming::CpuScope cpu("UI.ENBNativeResolve");
+	FrameTiming::Gpu11Scope gpu("UI.ENBNativeResolve");
 	try {
 		if (!nativeUITexture) {
 			D3D11_TEXTURE2D_DESC desc{};
@@ -2300,8 +2582,272 @@ void main(uint3 p : SV_DispatchThreadID)
 	}
 }
 
+bool DX12SwapChain::SetDLSSGPresentationHooks(bool a_enabled)
+{
+	auto* streamline = Streamline::GetSingleton();
+	if (Upscaling::GetSingleton()->GetFGProvider() != Upscaling::FGProvider::DLSSG ||
+		!streamline->featureDLSSG) return true;
+	if (!streamline->slSetFeatureLoaded) return false;
+
+	bool loaded = !a_enabled;
+	if (streamline->slIsFeatureLoaded &&
+		streamline->slIsFeatureLoaded(sl::kFeatureDLSS_G, loaded) == sl::Result::eOk &&
+		loaded == a_enabled) return !a_enabled || (streamline->slDLSSGGetState && streamline->slDLSSGSetOptions) || streamline->BindDLSSGFunctions();
+
+	const auto result = streamline->slSetFeatureLoaded(sl::kFeatureDLSS_G, a_enabled);
+	if (result != sl::Result::eOk) {
+		logger::error("[Presentation] DLSS-G hook state {} failed: {}", a_enabled, magic_enum::enum_name(result));
+		return false;
+	}
+	if (a_enabled) return streamline->BindDLSSGFunctions();
+	streamline->slDLSSGGetState = nullptr;
+	streamline->slDLSSGSetOptions = nullptr;
+	return true;
+}
+
+bool DX12SwapChain::ReleasePresentationBackend()
+{
+	for (auto& buffer : swapChainBuffers) buffer = nullptr;
+	swapChain = nullptr;
+	ConfigureFrameLatency();
+	auto* xess = XeSS::GetSingleton();
+	if (xess->OwnsSwapChain() && !xess->DestroyFG()) return false;
+	auto* fidelityFX = FidelityFX::GetSingleton();
+	if (fidelityFX->IsFrameGenerationSwapChainActive()) fidelityFX->DestroyFrameGenerationResources();
+	return true;
+}
+
+HRESULT DX12SwapChain::CreateNativeSwapChain(IDXGIFactory2* a_factory, const DXGI_SWAP_CHAIN_DESC1& a_desc)
+{
+	auto desc = a_desc;
+	desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	winrt::com_ptr<IDXGISwapChain1> physical;
+	if (const auto hr = a_factory->CreateSwapChainForHwnd(d3d11Device.get(), hwnd, &desc, nullptr, nullptr, physical.put()); FAILED(hr)) {
+		return hr;
+	}
+	winrt::com_ptr<IDXGISwapChain4> candidate;
+	if (const auto hr = physical->QueryInterface(IID_PPV_ARGS(candidate.put())); FAILED(hr)) return hr;
+	DXGI_SWAP_CHAIN_DESC1 actual{};
+	if (const auto hr = candidate->GetDesc1(&actual); FAILED(hr)) return hr;
+	if (actual.Format != desc.Format || actual.Width != desc.Width || actual.Height != desc.Height) return DXGI_ERROR_UNSUPPORTED;
+	if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+		const auto hr = candidate->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+		if (FAILED(hr)) return hr;
+	}
+	auto* streamline = Streamline::GetSingleton();
+	// DLSS-G's hooks are unloaded before creating this presenter. DLSS SR
+	// still needs Streamline's common Present hooks for per-frame cleanup.
+	if (streamline->UsesD3D12() && streamline->featureDLSS &&
+		!LogStreamlineProxy(streamline, "native-present", candidate.get()) &&
+		!UpgradeSwapChainForStreamline(streamline, candidate)) return E_NOINTERFACE;
+	swapChainDesc = actual;
+	swapChain = std::move(candidate);
+	applicationFrameLatencyWaitable = true;
+	return S_OK;
+}
+
+void DX12SwapChain::UpdatePresentationBackend()
+{
+	auto* upscaling = Upscaling::GetSingleton();
+	const auto& settings = upscaling->settings;
+	const auto wasNative = UsesNativePresentation();
+	const auto provider = upscaling->GetFGProvider();
+	auto* streamline = Streamline::GetSingleton();
+	const auto& domain = ENBRenderDomain::Get();
+	const bool changingProvider = upscaling->FGProviderChangePending();
+	const bool wantsNative = changingProvider || (settings.frameGenerationMode == 0 &&
+		!upscaling->ShouldUseFrameGeneration(false) &&
+		(settings.upscaleMethodPreference != 0 || !domain.Active() || domain.Quality() == 0));
+	if (changingProvider && wasNative && IsReady() && !deviceLost && !IsLoadingRecoveryPending()) {
+		// The old generator and its pacing hooks have already retired on the
+		// native presenter. The next frame may now create the new SDK chain.
+		upscaling->ApplyFGProviderPreference(swapChainDesc.Format);
+		return;
+	}
+	if (wantsNative == wasNative || !IsReady() || deviceLost || IsWindowUnavailable() ||
+		IsLoadingRecoveryPending() || Util::State_GetSingleton()->frameCount < 30 ||
+		GetTickCount64() < nextPresentationRetry || RE::BSGraphics::GetRendererData()->requestWindowSizeChange) {
+		return;
+	}
+	if (wantsNative && (streamline->NeedsDLSSGPresentSafety() || XeSS::GetSingleton()->FGEnabled() ||
+		FidelityFX::GetSingleton()->IsFrameGenerationEnabled())) return;
+	if (provider == Upscaling::FGProvider::DLSSG && streamline->featureDLSSG &&
+		(!streamline->UsesD3D12() || !streamline->slSetFeatureLoaded)) return;
+	const auto currentDesc = swapChainDesc;
+	if (currentDesc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+		currentDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+		currentDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) return;
+
+	if (changingPresentation.exchange(true, std::memory_order_acq_rel)) return;
+	struct FinishTransition
+	{
+		std::atomic_bool& changing;
+		~FinishTransition() { changing.store(false, std::memory_order_release); }
+	} finish{ changingPresentation };
+	if (!swapChainProxy->TryDetachBackend()) return;
+	struct PublishBackend
+	{
+		DXGISwapChainProxy& proxy;
+		winrt::com_ptr<IDXGISwapChain4>& chain;
+		~PublishBackend() { proxy.SetSwapChain(chain.get()); }
+	} publish{ *swapChainProxy, swapChain };
+
+	BOOL fullscreen = TRUE;
+	winrt::com_ptr<IDXGIFactory2> factory;
+	if (FAILED(swapChain->GetFullscreenState(&fullscreen, nullptr)) || fullscreen ||
+		FAILED(swapChain->GetParent(IID_PPV_ARGS(factory.put())))) {
+		nextPresentationRetry = GetTickCount64() + 1000;
+		return;
+	}
+	FrameTiming::CpuScope timing("Present.BackendTransition");
+	const auto start = std::chrono::steady_clock::now();
+	if (!WaitForInteropIdle()) {
+		nextPresentationRetry = GetTickCount64() + 1000;
+		return;
+	}
+	// DLSS-G may still own references after OFF has taken effect. Drain its
+	// input fence while the old swapchain and its completion state still exist.
+	if (wantsNative && provider == Upscaling::FGProvider::DLSSG && streamline->slDLSSGGetState) {
+		sl::DLSSGState state{};
+		if (streamline->slDLSSGGetState(streamline->viewport, state, nullptr) == sl::Result::eOk &&
+			state.inputsProcessingCompletionFence && state.lastPresentInputsProcessingCompletionFenceValue) {
+			auto* fence = static_cast<ID3D12Fence*>(state.inputsProcessingCompletionFence);
+			if (fence->GetCompletedValue() < state.lastPresentInputsProcessingCompletionFenceValue &&
+				(FAILED(commandQueue->Wait(fence, state.lastPresentInputsProcessingCompletionFenceValue)) || !WaitForGPUIdle())) {
+				nextPresentationRetry = GetTickCount64() + 1000;
+				return;
+			}
+		}
+	}
+
+	ReShadeDepth::ResetAfterIdle();
+	SetPresentOverride(nullptr);
+	for (auto& value : presentSlotFenceValues) value.store(0, std::memory_order_relaxed);
+	frameSlotFenceValues.fill(0);
+	inputReuseFenceValues.fill(0);
+	queuedReuseFenceValues.fill(0);
+	inputsUsedAtPresent.fill(false);
+	if (!ReleasePresentationBackend()) {
+		deviceLost = true;
+		return;
+	}
+	d3d11Context->Flush();
+
+	const auto create = [&](bool native) -> HRESULT {
+		if (!SetDLSSGPresentationHooks(!native)) return E_FAIL;
+		nativePresentation.store(native, std::memory_order_release);
+		if (native) return CreateNativeSwapChain(factory.get(), currentDesc);
+
+		auto desc = originalPresentationDesc;
+		desc.BufferDesc.Width = currentDesc.Width;
+		desc.BufferDesc.Height = currentDesc.Height;
+		desc.BufferDesc.Format = currentDesc.Format;
+		try {
+			CreateSwapChain(presentationFactory.get(), desc, provider == Upscaling::FGProvider::DLSSG ? streamline : nullptr,
+				provider == Upscaling::FGProvider::FSR);
+			if (swapChainDesc.Format != currentDesc.Format || swapChainDesc.Width != currentDesc.Width ||
+				swapChainDesc.Height != currentDesc.Height) return DXGI_ERROR_UNSUPPORTED;
+			return S_OK;
+		} catch (const std::exception& error) {
+			logger::warn("[Presentation] DX12 swapchain recreation failed: {}", error.what());
+			return E_FAIL;
+		}
+	};
+
+	if (const auto hr = create(wantsNative); FAILED(hr)) {
+		logger::warn("[Presentation] Switching to {} failed (0x{:08X}); restoring previous presenter",
+			wantsNative ? "D3D11" : "D3D12", static_cast<uint32_t>(hr));
+		nextPresentationRetry = GetTickCount64() + 5000;
+		upscaling->activeFGProvider = provider;
+		if (!ReleasePresentationBackend() || FAILED(create(wasNative))) {
+			logger::error("[Presentation] Could not restore the previous presenter");
+			deviceLost = true;
+			return;
+		}
+	}
+	const auto native = UsesNativePresentation();
+	if (native) ConfigureFrameLatency();
+	frameIndex = swapChain->GetCurrentBackBufferIndex();
+	presentPacing.Reset();
+	ResetLatencyTelemetry();
+	OSD::GetSingleton()->Reset();
+	streamline->RequestTemporalReset();
+	logger::info("[Presentation] Switched to {} in {:.2f} ms, game swapchain={} frame={}",
+		native ? "D3D11" : "D3D12",
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+		static_cast<void*>(swapChainProxy), Util::State_GetSingleton()->frameCount);
+}
+
+void DX12SwapChain::AdvanceLoadingRecovery()
+{
+	if (!IsLoadingScreen() && (loadingState.load(std::memory_order_acquire) & ~kLoadingSources) == appliedLoadingEpoch.load(std::memory_order_acquire)) {
+		const auto remaining = loadingResumeFrames.load(std::memory_order_relaxed);
+		if (remaining != 0) {
+			loadingResumeFrames.store(remaining - 1, std::memory_order_release);
+			if (remaining == 1) {
+				logger::info("[Presentation] Loading recovery completed after Present frame={} epoch={}",
+					Util::State_GetSingleton()->frameCount, appliedLoadingEpoch.load(std::memory_order_relaxed));
+			}
+		}
+	}
+}
+
+HRESULT DX12SwapChain::PresentNative(UINT a_syncInterval, UINT a_flags)
+{
+	if (IsWindowUnavailable()) {
+		presentPacing.Reset();
+		return swapChain->Present(0, a_flags & ~DXGI_PRESENT_ALLOW_TEARING);
+	}
+	if (!BeginNativeUI()) return E_FAIL;
+	// The engine-facing target may still contain a transparent overlay on
+	// frames without a destination-dependent HUD pass.
+	ResolveNativeUIForMenu("UI.ResolveForPresent");
+	auto* scene = nativeUIActive && nativeUITexture ? nativeUITexture->resource.get() :
+		(swapChainBufferProxyENB ? swapChainBufferProxyENB->resource11.get() : swapChainBufferProxy->resource.get());
+	winrt::com_ptr<ID3D11Texture2D> backBuffer;
+	if (const auto hr = swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.put())); FAILED(hr)) return hr;
+	{
+		FrameTiming::Gpu11Scope copy("Present.NativeStageCopy");
+		d3d11Context->CopyResource(backBuffer.get(), scene);
+	}
+	OSD::GetSingleton()->RenderNative(d3d11Device.get(), d3d11Context.get(), backBuffer.get());
+	backBuffer = nullptr;
+	FrameTiming::Finish11();
+
+	auto* upscaling = Upscaling::GetSingleton();
+	const auto vsync = upscaling->settings.vsyncMode;
+	const auto sync = vsync == 2 ? 1u : vsync == 1 ? 0u : a_syncInterval;
+	a_flags = GetPresentFlags(swapChain.get(), a_flags, swapChainDesc.Flags, sync, vsync == 1, false);
+
+	auto* streamline = Streamline::GetSingleton();
+	const bool emitMarkers = !IsLoadingRecoveryPending() && streamline->NeedsPresentMarkers() &&
+		streamline->HasRenderMarkerForFrame(Util::State_GetSingleton()->frameCount);
+	if (emitMarkers) streamline->OnPresentStart();
+	const auto result = [&] {
+		FrameTiming::CpuScope timing("Present.NativeDXGI");
+		return swapChain->Present(sync, a_flags);
+	}();
+	if (emitMarkers) streamline->OnPresentEnd(result, false);
+	if (SUCCEEDED(result)) {
+		SetPresentOverride(nullptr);
+		const auto presentedSlot = frameIndex;
+		frameIndex = swapChain->GetCurrentBackBufferIndex();
+		upscaling->AdvanceDeferredResourceReleases();
+		if (result == S_OK) {
+			streamline->AdvanceReflexRecoveryAfterPresent();
+			upscaling->OnNRPresentComplete(presentedSlot);
+			AdvanceLoadingRecovery();
+		}
+	} else if (result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET) {
+		deviceLost = true;
+	}
+	if (result != S_OK && result != DXGI_ERROR_WAS_STILL_DRAWING) presentPacing.Reset();
+	return result;
+}
+
 HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
+	FrameTiming::CpuScope timing("Present.Total", UINT32_MAX, true);
 	// TEST does not consume the staged scene or advance resource retirement.
 	if (Flags & DXGI_PRESENT_TEST) {
 		return swapChain ? swapChain->Present(SyncInterval, Flags) : DXGI_ERROR_INVALID_CALL;
@@ -2318,7 +2864,13 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	auto streamline = Streamline::GetSingleton();
 	auto upscaling = Upscaling::GetSingleton();
 	const auto osdEnabled = upscaling->settings.osdMode != 0;
+	static bool wasOSDEnabled = false;
+	if (!osdEnabled && wasOSDEnabled) {
+		OSD::GetSingleton()->Reset();
+	}
+	wasOSDEnabled = osdEnabled;
 	ProcessWindowStateTransition();
+	if (UsesNativePresentation()) return PresentNative(SyncInterval, Flags);
 	// SetOptions takes effect at the next Present. Apply OFF on this thread
 	// before clearing input tags so the first menu frame is not interpolated
 	// with missing HUD-less/depth/motion resources.
@@ -2328,7 +2880,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	streamline->ApplyPendingDLSSGDisable();
 	if (IsWindowUnavailable()) {
 		presentPacing.Reset();
-		presentOverrideFinalColor = nullptr;
+		SetPresentOverride(nullptr);
 		const auto presentedFrameIndex = frameIndex;
 		if (!XeSS::GetSingleton()->BeforePresent()) return E_FAIL;
 		const auto result = swapChain->Present(0, Flags & ~DXGI_PRESENT_ALLOW_TEARING);
@@ -2349,7 +2901,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// Keep at most the existing number of swapchain slots in flight. Moving
 	// input reuse to the GPU must not create an unbounded CPU submission queue.
 	{
-		if (!WaitForCommandFence(presentSlotFenceValues[frameIndex])) {
+		if (!WaitForCommandFence(presentSlotFenceValues[frameIndex].load(std::memory_order_acquire))) {
 			return DXGI_ERROR_DEVICE_REMOVED;
 		}
 	}
@@ -2375,15 +2927,47 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	} else {
 		captureSource = swapChainBufferProxy->resource.get();
 	}
-	d3d11Context->CopyResource(staging->resource11.get(), captureSource);
-	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
-	// Publish the complete D3D11 UI batch before the consumer queue waits.
-	// Flush submits work; it does not wait for GPU completion on the CPU.
-	d3d11Context->Flush();
-	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
+	{
+		FrameTiming::CpuScope cpu("Present.D3D11Publish");
+		{
+			FrameTiming::Gpu11Scope gpu("Present.StageCopy");
+			d3d11Context->CopyResource(staging->resource11.get(), captureSource);
+		}
+		FrameTiming::Finish11();
+		{
+			FrameTiming::CpuScope signal("Present.D3D11Signal");
+			DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+		}
+		// Publish the complete D3D11 UI batch before the consumer queue waits.
+		{
+			FrameTiming::CpuScope flush("Present.D3D11Flush");
+			d3d11Context->Flush();
+		}
+	}
+	{
+		FrameTiming::CpuScope wait("Present.D3D12InputWait");
+		DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
+	}
 	++fenceValue;
+	commandContext.timing.Begin(d3d12Device.get(), commandList, "Present.BackBuffer");
 
 	const auto presentedFrameIndex = frameIndex;
+	bool externalFGReady = upscaling->IsExternalFrameGenerationActive();
+	if (upscaling->upscaleMethod == Upscaling::UpscaleMethod::kDisabled) {
+		// This submission already waits for the HUD-less guides and the final
+		// D3D11 UI. Consume only a capture from this engine frame and slot.
+		externalFGReady = externalFGReady &&
+			upscaling->externalFrameGenerationInputsReady[presentedFrameIndex] &&
+			upscaling->externalFrameGenerationCaptureFrames[presentedFrameIndex] == Util::State_GetSingleton()->frameCount;
+		if (externalFGReady && upscaling->GetFGProvider() == Upscaling::FGProvider::XeSS) {
+			externalFGReady = XeSS::GetSingleton()->PrepareFG(upscaling->settings.xessGeneratedFrames + 1);
+		}
+		if (externalFGReady) {
+			FrameTiming::CpuScope fgTiming("FG.ExternalPrepare");
+			externalFGReady = upscaling->EvaluateExternalFrameGeneration(commandList, presentedFrameIndex);
+		}
+		upscaling->externalFrameGenerationInputsReady[presentedFrameIndex] = false;
+	}
 	auto destination = swapChainBuffers[presentedFrameIndex].get();
 	// Consume the frame stamp even if this Present could not publish depth.
 	// Repeated Presents without world rendering must never recycle old depth.
@@ -2444,8 +3028,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		upscaling->TagDLSSGInputs(commandList, presentedFrameIndex);
 	}
 	auto fidelityFX = FidelityFX::GetSingleton();
-	if (fidelityFX->IsFrameGenerationEnabled() &&
-		!upscaling->IsExternalFrameGenerationActive()) {
+	if (fidelityFX->IsFrameGenerationEnabled() && !externalFGReady) {
 		const auto desc = destination->GetDesc();
 		const auto displaySize = float2(static_cast<float>(desc.Width), static_cast<float>(desc.Height));
 		fidelityFX->DisableFrameGeneration(
@@ -2456,39 +3039,41 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			desc.Format);
 	}
 
-	static bool wasOSDEnabled = false;
-	if (!osdEnabled && wasOSDEnabled) {
-		OSD::GetSingleton()->Reset();
-	}
-	wasOSDEnabled = osdEnabled;
 	if (osdEnabled) {
 		if (destinationState != D3D12_RESOURCE_STATE_RENDER_TARGET) {
 			auto beforeOSD = CD3DX12_RESOURCE_BARRIER::Transition(destination, destinationState, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			commandList->ResourceBarrier(1, &beforeOSD);
 			destinationState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 		}
-		if (osdEnabled) {
-			OSD::GetSingleton()->Render(
-				d3d12Device.get(),
-				commandList,
-				commandContext.osdUpload,
-				destination,
-				presentedFrameIndex,
-				swapChainDesc.Format,
-				swapChainDesc.Width,
-				swapChainDesc.Height);
-		}
+		OSD::GetSingleton()->Render(
+			d3d12Device.get(),
+			commandList,
+			commandContext.osd,
+			destination,
+			presentedFrameIndex,
+			swapChainDesc.Format,
+			swapChainDesc.Width,
+			swapChainDesc.Height);
 		auto afterOSD = CD3DX12_RESOURCE_BARRIER::Transition(destination, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 		commandList->ResourceBarrier(1, &afterOSD);
 	} else {
 		auto afterCopy = CD3DX12_RESOURCE_BARRIER::Transition(destination, destinationState, D3D12_RESOURCE_STATE_PRESENT);
 		commandList->ResourceBarrier(1, &afterCopy);
 	}
-	if (osdEnabled) RecordLatencyTimestamp(commandContext, Util::State_GetSingleton()->frameCount);
-	ExecuteCommandContext(commandContext);
+	commandContext.timing.End(commandList);
+	if (osdEnabled) {
+		const auto frame = Util::State_GetSingleton()->frameCount;
+		// The overlay refreshes twice a second. A sparse GPU clock sample
+		// keeps that telemetry off the normal Present path.
+		if (IsAppGPULatencySampleFrame(frame)) RecordLatencyTimestamp(commandContext, frame);
+	}
+	{
+		FrameTiming::CpuScope cpu("Present.D3D12Submit");
+		ExecuteCommandContext(commandContext, true);
+	}
 	// A menu may invalidate FG after evaluation. Submit all ONLY_NOW copies
 	// before clearing XeFG history, including partially successful tagging.
-	if (!upscaling->IsExternalFrameGenerationActive() && !XeSS::GetSingleton()->DisableFG()) {
+	if (!externalFGReady && !XeSS::GetSingleton()->DisableFG()) {
 		if (!FenceFrameSlotAfterPresent(presentedFrameIndex, &commandContext)) return DXGI_ERROR_DEVICE_REMOVED;
 		return E_FAIL;
 	}
@@ -2499,13 +3084,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (dlssgPresentSafety) {
 		presentSyncInterval = streamline->SupportsDLSSGVSync() ? std::min(presentSyncInterval, 1u) : 0u;
 	}
-	UINT presentFlags = Flags & ~DXGI_PRESENT_ALLOW_TEARING;
-	BOOL fullscreen = FALSE;
-	const bool knownWindowed = SUCCEEDED(swapChain->GetFullscreenState(&fullscreen, nullptr)) && !fullscreen;
-	if (presentSyncInterval == 0 && knownWindowed && (swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) &&
-		!dlssgPresentSafety && (vsyncMode == 1 || (Flags & DXGI_PRESENT_ALLOW_TEARING))) {
-		presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
-	}
+	const UINT presentFlags = GetPresentFlags(swapChain.get(), Flags, swapChainDesc.Flags, presentSyncInterval, vsyncMode == 1, dlssgPresentSafety);
 	// Diagnostic only: pacing happens before simulation/input, never here.
 	const auto pacingMultiplier = streamline->dlssgActive ? streamline->GetDLSSGPacingMultiplier() :
 		(XeSS::GetSingleton()->FGEnabled() ? XeSS::GetSingleton()->PacingMultiplier() : (FidelityFX::GetSingleton()->IsFrameGenerationEnabled() ? 2u : 1u));
@@ -2525,7 +3104,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		loggedSync = presentSyncInterval;
 		loggedDynamicPacing = sdkDynamicPacing;
 	}
-	const auto emitPresentMarkers = streamline->NeedsPresentMarkers() &&
+	const auto emitPresentMarkers = !IsLoadingRecoveryPending() && streamline->NeedsPresentMarkers() &&
 		streamline->HasRenderMarkerForFrame(Util::State_GetSingleton()->frameCount);
 	const auto depthPresentFrame = static_cast<uint64_t>(Util::State_GetSingleton()->frameCount);
 	ReShadeDepth::PublishPresent(presentedFrameIndex, depthPresentFrame, destination);
@@ -2534,7 +3113,10 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		return E_FAIL;
 	}
 	if (emitPresentMarkers) streamline->OnPresentStart();
-	const auto result = swapChain->Present(presentSyncInterval, presentFlags);
+	const auto result = [&] {
+		FrameTiming::CpuScope cpu("Present.DXGI", UINT32_MAX, true);
+		return swapChain->Present(presentSyncInterval, presentFlags);
+	}();
 	XeSS::GetSingleton()->AfterPresent(result);
 	commandContext.latencyPresentSucceeded = result == S_OK;
 	if (result == DXGI_ERROR_WAS_STILL_DRAWING && commandContext.retainedPresentOverride) {
@@ -2553,14 +3135,11 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 			return DXGI_ERROR_DEVICE_REMOVED;
 		}
 
-		streamline->OnDLSSGPresentComplete();
 		upscaling->AdvanceDeferredResourceReleases();
 		if (result == S_OK) {
+			streamline->OnDLSSGPresentComplete();
 			upscaling->OnNRPresentComplete(presentedFrameIndex);
-			if (!IsLoadingScreen() && loadingState.load(std::memory_order_acquire) == appliedLoadingState.load(std::memory_order_acquire)) {
-				const auto remaining = loadingResumeFrames.load(std::memory_order_relaxed);
-				if (remaining != 0) loadingResumeFrames.store(remaining - 1, std::memory_order_release);
-			}
+			AdvanceLoadingRecovery();
 		}
 	}
 	if (FAILED(result)) {
@@ -2605,6 +3184,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		return result;
 	}
 
+	SetPresentOverride(nullptr);
 	const auto nextFrameIndex = swapChain->GetCurrentBackBufferIndex();
 
 	if (dlssgPresentSafety || upscaling->IsFrameGenerationActive()) {
@@ -2629,7 +3209,7 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentFrame(bool a_evaluateDLSS, bool a_evaluateFSR, bool a_evaluateFSRFrameGeneration, bool a_waitForD3D11Consumption)
 {
 	D3D12EvaluationResult result{};
-	if (!IsReady() || deviceLost || temporalFeaturesSuspended || IsWindowUnavailable()) {
+	if (!CanEvaluateD3D12() || temporalFeaturesSuspended || IsWindowUnavailable()) {
 		return result;
 	}
 
@@ -2682,17 +3262,33 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 	// must not leave a fresh queue dependency ahead of an unsubmitted list.
 	auto& commandContext = AcquireCommandContext();
 	auto* commandList = commandContext.list.get();
-	DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
-	// Submit scene/guide copies now, independently of later UI rendering or
-	// Present. Otherwise D3D12 depends on the D3D11 runtime's automatic flush.
-	d3d11Context->Flush();
-	DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
-	++fenceValue;
+	{
+		FrameTiming::CpuScope publish("Interop.EvaluationInputPublish");
+		{
+			FrameTiming::CpuScope signal("Interop.D3D11InputSignal");
+			DX::ThrowIfFailed(d3d11Context->Signal(d3d11Fence.get(), fenceValue));
+		}
+		// Publish scene/guide copies independently of subsequent UI rendering.
+		{
+			FrameTiming::CpuScope flush("Interop.D3D11InputFlush");
+			d3d11Context->Flush();
+		}
+		{
+			FrameTiming::CpuScope wait("Interop.D3D12InputWait");
+			DX::ThrowIfFailed(commandQueue->Wait(d3d12Fence.get(), fenceValue));
+		}
+		++fenceValue;
+	}
 
 	// The raw ReShade depth snapshot is recorded on D3D11 before this submission;
 	// ReShade itself runs automatically on the final D3D12 swapchain at Present.
 
-	result = EvaluateD3D12WorkOnCommandList(commandList, evaluationFrameIndex, a_evaluateDLSS, a_evaluateFSR, a_evaluateFSRFrameGeneration);
+	{
+		FrameTiming::CpuScope cpu("Upscaling.D3D12Evaluate");
+		commandContext.timing.Begin(d3d12Device.get(), commandList, "Upscaling.D3D12Evaluate");
+		result = EvaluateD3D12WorkOnCommandList(commandList, evaluationFrameIndex, a_evaluateDLSS, a_evaluateFSR, a_evaluateFSRFrameGeneration);
+		commandContext.timing.End(commandList);
+	}
 
 	// An unsuccessful SDK call may already have recorded copies/dispatches.
 	// Submit and retire this list even on failure before shared inputs are reused.
@@ -2704,6 +3300,8 @@ DX12SwapChain::D3D12EvaluationResult DX12SwapChain::EvaluateD3D12WorkForCurrentF
 		upscaling->IsExternalFrameGenerationActive() || Streamline::GetSingleton()->NeedsDLSSGPresentSafety();
 
 	if (a_waitForD3D11Consumption) {
+		FrameTiming::CpuScope wait("Interop.D3D11ResultWait");
+		FrameTiming::Gpu11Scope gpu("Interop.D3D11ResultWait");
 		DX::ThrowIfFailed(d3d11Context->Wait(d3d11CommandFence.get(), signalValue));
 	}
 	return result;
@@ -2743,20 +3341,23 @@ bool DX12SwapChain::EvaluateD3D12FSRForCurrentFrame()
 	return EvaluateD3D12WorkForCurrentFrame(false, true, false).fsr;
 }
 
-bool DX12SwapChain::EvaluateExternalFrameGenerationForCurrentFrame()
-{
-	return EvaluateD3D12WorkForCurrentFrame(false, false, true).externalFrameGeneration;
-}
-
-void DX12SwapChain::SetPresentOverride(ID3D12Resource* a_finalColor)
+void DX12SwapChain::SetPresentOverride(ID3D12Resource* a_finalColor, Texture2D* a_sharedColor, bool a_evaluated)
 {
 	presentOverrideFinalColor.copy_from(a_finalColor);
+	presentOverrideSharedColor = nullptr;
+	presentOverrideProducerFence = 0;
+	if (!a_finalColor || !a_sharedColor) { return; }
+	if (!a_sharedColor->srv && FAILED(d3d11Device->CreateShaderResourceView(
+			a_sharedColor->resource.get(), nullptr, a_sharedColor->srv.put()))) { return; }
+	presentOverrideSharedColor = a_sharedColor->srv;
+	presentOverrideProducerFence = a_evaluated ? inputReuseFenceValues[frameIndex] : 0;
 }
 
 bool DX12SwapChain::EnsureExternalFrameGenerationSwapChain()
 {
+	if (!CanUseD3D12FrameGeneration()) return false;
 	if (Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::XeSS) return XeSS::GetSingleton()->OwnsSwapChain();
-	if (!IsReady() || !fidelityFXFrameGenerationSwapChainAllowed) {
+	if (!fidelityFXFrameGenerationSwapChainAllowed) {
 		return false;
 	}
 
@@ -2781,6 +3382,7 @@ bool DX12SwapChain::EnsureExternalFrameGenerationSwapChain()
 		if (wrappedSwapChain != originalSwapChain) {
 			winrt::com_ptr<IDXGISwapChain4> wrappedOwner;
 			wrappedOwner.attach(wrappedSwapChain);
+			EnableStreamlinePresentForExternalFG(wrappedOwner);
 			swapChain = wrappedOwner;
 			ConfigureFrameLatency();
 			if (swapChainProxy) {
@@ -2823,6 +3425,10 @@ HRESULT DX12SwapChain::GetDevice(REFIID a_riid, void** a_device)
 
 void DX12SwapChain::RefreshBackBuffers()
 {
+	if (UsesNativePresentation()) {
+		Upscaling::GetSingleton()->UpdateTextureMemoryUpgradeReserve();
+		return;
+	}
 	if (commandFence && !WaitForGPUIdle()) {
 		DX::ThrowIfFailed(DXGI_ERROR_DEVICE_REMOVED);
 	}

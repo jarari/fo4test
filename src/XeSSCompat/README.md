@@ -10,7 +10,7 @@ Install the three DLLs beside `Upscaling.dll`, not in the game's executable dire
 
 - `Settings/iUpscaleMethodPreference`: 0 off, 1 FSR, 2 DLSS (default), 3 XeSS.
 - `Settings/iFrameGenerationProvider`: 0 DLSS-G (default), 1 FSR FG, 2 XeSS FG.
-  Read before swapchain creation, including non-ENB. Subsequent edits require restarting the game.
+  Changing the provider at runtime drains the previous presenter before activating the new one.
   DLSS-G unavailable selects XeSS FG. If XeFG also fails, FG is disabled; it does not silently select FSR.
 - `Settings/iXeSSGeneratedFrames`: index 0..6 requests 1..7 generated frames (2x..8x).
   Clamped to the provider's supported count. Changing this does not recreate the swapchain.
@@ -33,7 +33,7 @@ Unknown layouts retain stock SDK capabilities. No Intel file is patched on disk.
 See [NOTICE.md](NOTICE.md) for attribution and license.
 
 XeSS-FG 3.0.2 explicitly does **not** support FP16/scRGB swapchains. On such an output,
-the user must select FSR FG and restart. This integration does not convert HDR to SDR or rewrite
+the runtime selects FSR FG automatically. This integration does not convert HDR to SDR or rewrite
 RenoDX's output. XeSS SR does support FP16 color. Intel's HDR10 path requires matching HDR10
 color input and swapchain; it is not equivalent to FP16/scRGB.
 

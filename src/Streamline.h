@@ -115,6 +115,7 @@ public:
 	 * @brief Initialise features after device
 	 */
 	void PostDevice();
+	bool BindDLSSGFunctions();
 
 	/**
 	 * @brief Track the swap chain used for present-time Streamline features.
@@ -187,6 +188,7 @@ public:
 	bool NeedsPresentMarkers() const { return featurePCL && slPCLSetMarker && (presentFrameToken || frameToken); }
 	bool HasRenderMarkerForFrame(uint32_t a_frame) const { return renderMarkerFrame.load(std::memory_order_acquire) == a_frame; }
 	void OnDLSSGPresentComplete();
+	void AdvanceReflexRecoveryAfterPresent();
 	uint32_t GetCurrentFrameTokenIndex() const { return currentFrameTokenIndex; }
 	sl::FrameToken* GetFrameTokenForFrame(uint32_t a_frameIndex);
 	uint32_t GetLastPresentFrameTokenIndex() const { return lastPresentFrameTokenIndex; }
@@ -208,6 +210,7 @@ public:
 	sl::ReflexMode GetCurrentReflexMode() const { return currentReflexMode; }
 	// Latest eligible Reflex simulation-start -> driver GPU-end duration; 0 means unavailable.
 	float GetReflexLatencyMs();
+	bool UsesReflexLatencyReport() const;
 	void ResetReflexLatencyHistory();
 	uint32_t GetOSDGeneratedFramesPerRenderFrame() const { return dlssgActive ? (currentDLSSGGeneratedFrames != 0 ? currentDLSSGGeneratedFrames : 1) : 0; }
 	double GetDLSSGPresentedFrameMultiplier() const { return lastDLSSGPresentMultiplier; }
@@ -356,6 +359,7 @@ private:
 	bool currentReflexUseMarkersToOptimize = false;
 	uint32_t currentReflexThreadId = 0;
 	sl::DLSSGMode currentDLSSGMode = sl::DLSSGMode::eCount;
+	sl::DLSSGOptions configuredDLSSGOptions{};
 	uint32_t currentDLSSGGeneratedFrames = 0;
 	uint32_t currentDLSSGDynamicTargetFPS = 0;
 	uint currentDLSSQualityMode = 1;
@@ -376,6 +380,7 @@ private:
 	uint32_t pclPingCount = 0;
 	std::atomic<bool> pclLatencyReportAvailable{ false };
 	bool pendingDLSSGDisable = false;
+	std::atomic_uint reflexRecoveryPresents{ 0 };
 	uint32_t dlssgPresentSafetyFrames = 0;
 	bool dlssgVSyncSupported = false;
 	bool loggedDLSSNRFallback = false;
