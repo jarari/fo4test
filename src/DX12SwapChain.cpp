@@ -440,10 +440,23 @@ namespace
 		return LogStreamlineProxy(a_streamline, "swapChain.afterUpgrade", a_chain.get());
 	}
 
+	// Streamline wraps only the DLSS-G presenter unless [Settings]
+	// bStreamlineWrapAllFG restores 1.8.0's wrapping of every presenter.
+	// Unwrapped XeSS/FSR presenters match 1.7.2: no SL Present hooks and so no
+	// SL VRAM budget tracking; Reflex/PCL use explicit SL calls, not hooks.
+	bool StreamlineWrapsNonDLSSGPresenters()
+	{
+		return Upscaling::GetSingleton()->settings.streamlineWrapAllFG != 0;
+	}
+
 	void EnableStreamlinePresentForExternalFG(winrt::com_ptr<IDXGISwapChain4>& a_chain)
 	{
 		auto* streamline = Streamline::GetSingleton();
 		if (!streamline->UsesD3D12() || !streamline->featureDLSS || streamline->featureDLSSG) return;
+		if (!StreamlineWrapsNonDLSSGPresenters()) {
+			logger::info("[DX12SwapChain] External FG presenter is not wrapped by Streamline (bStreamlineWrapAllFG=0)");
+			return;
+		}
 
 		// The external SDK creates the physical swapchain on a native factory.
 		// Wrap the final chain once so DLSS SR gets Streamline's per-frame
@@ -2635,9 +2648,16 @@ HRESULT DX12SwapChain::CreateNativeSwapChain(IDXGIFactory2* a_factory, const DXG
 		if (FAILED(hr)) return hr;
 	}
 	auto* streamline = Streamline::GetSingleton();
-	// DLSS-G's hooks are unloaded before creating this presenter. DLSS SR
-	// still needs Streamline's common Present hooks for per-frame cleanup.
-	if (streamline->UsesD3D12() && streamline->featureDLSS &&
+	// DLSS-G's hooks are unloaded before creating this presenter. 1.8.0 kept
+	// Streamline's common Present hooks on it for DLSS SR; keep that for the
+	// DLSS-G provider (or bStreamlineWrapAllFG) and leave XeSS/FSR unwrapped.
+	const bool wrapNative = StreamlineWrapsNonDLSSGPresenters() ||
+		Upscaling::GetSingleton()->GetFGProvider() == Upscaling::FGProvider::DLSSG;
+	if (!wrapNative) {
+		logger::info("[DX12SwapChain] Native presenter is not wrapped by Streamline (provider={}, bStreamlineWrapAllFG=0)",
+			Upscaling::GetSingleton()->GetFGProviderName());
+	}
+	if (wrapNative && streamline->UsesD3D12() && streamline->featureDLSS &&
 		!LogStreamlineProxy(streamline, "native-present", candidate.get()) &&
 		!UpgradeSwapChainForStreamline(streamline, candidate)) return E_NOINTERFACE;
 	swapChainDesc = actual;

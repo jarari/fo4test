@@ -2170,6 +2170,16 @@ void Upscaling::LoadSettings(SettingsLoad a_mode)
 	settings.extraVRAMBudgetMB = static_cast<uint>(std::clamp<long>(ini.GetLongValue("Misc", "iExtraVRAMBudgetMB", 0), 0, 2048));
 	const auto legacySharpness = ini.GetDoubleValue("Settings", "fRCASSharpness", 0.2);
 	settings.sharpness = std::clamp(static_cast<float>(ini.GetDoubleValue("Settings", "fSharpness", legacySharpness)), 0.0f, 1.0f);
+	const auto previousDirectNGXSR = settings.directNGXSR;
+	settings.directNGXSR = ini.GetBoolValue("Settings", "bDirectNGXSR", true) ? 1u : 0u;
+	// Presenter wrapping is decided when a presenter is created.
+	settings.streamlineWrapAllFG = ini.GetBoolValue("Settings", "bStreamlineWrapAllFG", false) ? 1u : 0u;
+	settings.streamlineLogWarnings = ini.GetBoolValue("Settings", "bStreamlineLogWarnings", false) ? 1u : 0u;
+	Streamline::SetLogWarnings(settings.streamlineLogWarnings != 0);
+	if (!hotReload || previousDirectNGXSR != settings.directNGXSR) {
+		logger::info("[Settings] bDirectNGXSR={} bStreamlineWrapAllFG={} bStreamlineLogWarnings={}",
+			settings.directNGXSR, settings.streamlineWrapAllFG, settings.streamlineLogWarnings);
+	}
 
 	auto streamline = Streamline::GetSingleton();
 	const auto currentUpscaleMethodPreference = static_cast<UpscaleMethod>(settings.upscaleMethodPreference);

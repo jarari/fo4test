@@ -9,6 +9,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "DX12SwapChain.h"
@@ -23,6 +26,160 @@ namespace
 	constexpr wchar_t kPCLStatsPingMessageName[] = L"PC_Latency_Stats_Ping";
 	constexpr uint32_t kDLSSGStateQueryInterval = 15;
 
+	std::atomic_bool g_streamlineLogWarnings{ false };
+
+	// Identical Streamline warnings/errors can arrive every frame (for example
+	// the VRAM budget warning). spdlog flushes on info, so each forwarded line
+	// is a synchronous write on the render path. Forward the first occurrence,
+	// count repeats and summarise them once per window.
+	class StreamlineLogRateLimiter
+	{
+	public:
+		static constexpr auto kWindow = std::chrono::seconds(10);
+
+		void Submit(sl::LogType a_type, std::string_view a_message)
+		{
+			std::vector<Line> lines;
+			{
+				std::scoped_lock lock(mutex);
+				const auto now = std::chrono::steady_clock::now();
+				CollectExpired(now, lines);
+
+				auto key = std::string(Normalize(a_message));
+				key.insert(key.begin(), static_cast<char>('0' + static_cast<int>(a_type)));
+				auto it = entries.find(key);
+				if (it == entries.end()) {
+					if (entries.size() >= kMaxEntries) {
+						FlushAll(lines);
+					}
+					entries.emplace(std::move(key), Entry{ a_type, std::string(a_message), now, 0 });
+					lines.push_back({ a_type, std::string(a_message), 0 });
+				} else {
+					++it->second.repeats;
+				}
+			}
+			Emit(lines);
+		}
+
+	private:
+		static constexpr std::size_t kMaxEntries = 256;
+		static constexpr auto kSweepInterval = std::chrono::seconds(1);
+
+		struct Entry
+		{
+			sl::LogType type;
+			std::string message;
+			std::chrono::steady_clock::time_point windowStart;
+			uint32_t repeats;
+		};
+		struct Line
+		{
+			sl::LogType type;
+			std::string message;
+			uint32_t repeats;  // 0 = first occurrence
+		};
+
+		// Drop the leading "[..][..][tid:..][time]" decoration so per-thread
+		// and per-timestamp variants of one message compare equal.
+		static std::string_view Normalize(std::string_view a_message)
+		{
+			while (!a_message.empty()) {
+				const auto first = a_message.find_first_not_of(" \t");
+				if (first == std::string_view::npos) {
+					return {};
+				}
+				a_message.remove_prefix(first);
+				if (a_message.front() != '[') {
+					break;
+				}
+				const auto close = a_message.find(']');
+				if (close == std::string_view::npos) {
+					break;
+				}
+				a_message.remove_prefix(close + 1);
+			}
+			while (!a_message.empty() && (a_message.back() == '\n' || a_message.back() == '\r' || a_message.back() == ' ')) {
+				a_message.remove_suffix(1);
+			}
+			return a_message;
+		}
+
+		void CollectExpired(std::chrono::steady_clock::time_point a_now, std::vector<Line>& a_lines)
+		{
+			if (a_now - lastSweep < kSweepInterval) {
+				return;
+			}
+			lastSweep = a_now;
+			for (auto it = entries.begin(); it != entries.end();) {
+				auto& entry = it->second;
+				if (a_now - entry.windowStart < kWindow) {
+					++it;
+					continue;
+				}
+				if (entry.repeats == 0) {
+					it = entries.erase(it);
+					continue;
+				}
+				// Still repeating: one summary per window, no re-log of the text.
+				a_lines.push_back({ entry.type, entry.message, entry.repeats });
+				entry.repeats = 0;
+				entry.windowStart = a_now;
+				++it;
+			}
+		}
+
+		void FlushAll(std::vector<Line>& a_lines)
+		{
+			for (auto& [key, entry] : entries) {
+				if (entry.repeats != 0) {
+					a_lines.push_back({ entry.type, entry.message, entry.repeats });
+				}
+			}
+			entries.clear();
+		}
+
+		static void Emit(const std::vector<Line>& a_lines)
+		{
+			for (const auto& line : a_lines) {
+				if (line.repeats == 0) {
+					switch (line.type) {
+					case sl::LogType::eWarn:
+						logger::warn("[Streamline SDK] {}", line.message);
+						break;
+					case sl::LogType::eError:
+						logger::error("[Streamline SDK] {}", line.message);
+						break;
+					default:
+						logger::info("[Streamline SDK] {}", line.message);
+						break;
+					}
+				} else {
+					switch (line.type) {
+					case sl::LogType::eWarn:
+						logger::warn("[Streamline SDK] {} ... repeated {} times in the last 10 s", line.message, line.repeats);
+						break;
+					case sl::LogType::eError:
+						logger::error("[Streamline SDK] {} ... repeated {} times in the last 10 s", line.message, line.repeats);
+						break;
+					default:
+						logger::info("[Streamline SDK] {} ... repeated {} times in the last 10 s", line.message, line.repeats);
+						break;
+					}
+				}
+			}
+		}
+
+		std::mutex mutex;
+		std::unordered_map<std::string, Entry> entries;
+		std::chrono::steady_clock::time_point lastSweep{};
+	};
+
+	StreamlineLogRateLimiter& GetStreamlineLogRateLimiter()
+	{
+		static StreamlineLogRateLimiter limiter;
+		return limiter;
+	}
+
 	void StreamlineLogCallback(sl::LogType a_type, const char* a_message)
 	{
 		if (!a_message) {
@@ -33,17 +190,12 @@ namespace
 			return;
 		}
 
-		switch (a_type) {
-		case sl::LogType::eWarn:
-			logger::warn("[Streamline SDK] {}", a_message);
-			break;
-		case sl::LogType::eError:
-			logger::error("[Streamline SDK] {}", a_message);
-			break;
-		default:
-			logger::info("[Streamline SDK] {}", a_message);
-			break;
+		// Warnings are opt-in; errors are always forwarded (rate-limited).
+		if (a_type == sl::LogType::eWarn && !g_streamlineLogWarnings.load(std::memory_order_relaxed)) {
+			return;
 		}
+
+		GetStreamlineLogRateLimiter().Submit(a_type, a_message);
 	}
 
 	void DLSSGAPIErrorCallback(const sl::APIError& a_error)
@@ -196,7 +348,7 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 	sl::Preferences pref;
 
 	sl::Feature d3d11FeaturesToLoad[] = { sl::kFeatureDLSS, sl::kFeatureNIS, sl::kFeatureReflex, sl::kFeaturePCL };
-	sl::Feature d3d12FeaturesToLoad[] = { sl::kFeatureImGUI, sl::kFeatureDLSS, sl::kFeatureDLSS_NR, sl::kFeatureNIS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
+	sl::Feature d3d12FeaturesToLoad[] = { sl::kFeatureImGUI, sl::kFeatureDLSS, sl::kFeatureNIS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
 	if (a_renderAPI == sl::RenderAPI::eD3D12) {
 		pref.featuresToLoad = d3d12FeaturesToLoad;
 		pref.numFeaturesToLoad = _countof(d3d12FeaturesToLoad);
@@ -217,7 +369,7 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 		pref.pathsToPlugins = pluginPaths;
 		pref.numPathsToPlugins = _countof(pluginPaths);
 
-		for (const auto& runtimeDependency : { L"sl.imgui.dll", L"sl.dlss_nr.dll", L"nvngx_dlssnr.dll", L"sl.dlss_g.dll", L"nvngx_dlssg.dll", L"sl.nis.dll", L"sl.reflex.dll", L"sl.pcl.dll" }) {
+		for (const auto& runtimeDependency : { L"sl.imgui.dll", L"nvngx_dlssnr.dll", L"sl.dlss_g.dll", L"nvngx_dlssg.dll", L"sl.nis.dll", L"sl.reflex.dll", L"sl.pcl.dll" }) {
 			const auto dependencyPath = std::filesystem::path(interposerDirectory) / runtimeDependency;
 			logger::info("[Streamline] Runtime dependency {} {}", dependencyPath.string(), std::filesystem::exists(dependencyPath) ? "found" : "missing");
 		}
@@ -254,10 +406,10 @@ void Streamline::Initialize(sl::RenderAPI a_renderAPI)
 	slGetNewFrameToken = (PFun_slGetNewFrameToken*)GetProcAddress(interposer, "slGetNewFrameToken");
 	slSetD3DDevice = (PFun_slSetD3DDevice*)GetProcAddress(interposer, "slSetD3DDevice");
 
-	const auto dlssNRRuntimePresent =
-		a_renderAPI == sl::RenderAPI::eD3D12 &&
-		std::filesystem::exists(std::filesystem::path(interposerDirectory) / L"sl.dlss_nr.dll");
-	const auto sdkVersion = dlssNRRuntimePresent ? sl::kSDKVersionDLSSNRPreview : sl::kSDKVersion;
+	// The shipped runtime is the Streamline 2.13 preview. DLSS-NR itself is not
+	// loaded through Streamline any more (direct NGX only), but D3D12 keeps the
+	// SDK version the runtime has always been initialized with.
+	const auto sdkVersion = a_renderAPI == sl::RenderAPI::eD3D12 ? sl::kSDKVersionDLSSNRPreview : sl::kSDKVersion;
 	if (SL_FAILED(res, slInit(pref, sdkVersion))) {
 		logger::critical("[Streamline] Failed to initialize Streamline: {}", magic_enum::enum_name(res));
 	} else {
@@ -274,6 +426,8 @@ void Streamline::Shutdown()
 {
 	ResetReflexLatencyHistory();
 	directDLSSNR.Shutdown();
+	// The shared NGX core is owned by Streamline; release our handles first.
+	directDLSSSR.ReleaseAll();
 	retainedNativeNRBytes = 0;
 	dlssNRSuspended = false;
 	if (initialized && slShutdown) {
@@ -390,10 +544,9 @@ void Streamline::CheckFeatures(IDXGIAdapter* a_adapter)
 	logger::info("[Streamline] Checking features");
 	if (UsesD3D12()) {
 		CheckFeature(sl::kFeatureDLSS, a_adapter, featureDLSS, "DLSS");
-		CheckFeature(sl::kFeatureDLSS_NR, a_adapter, featureDLSSNR, "DLSS-NR");
-		if (!featureDLSSNR) {
-			PrepareDirectDLSSNR();
-		}
+		// DLSS-NR runs only through direct NGX; the Streamline DLSS-NR plugin is never loaded.
+		featureDLSSNR = false;
+		PrepareDirectDLSSNR();
 	} else {
 		featureDLSS = false;
 		featureDLSSNR = false;
@@ -1485,6 +1638,92 @@ bool Streamline::ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resour
 	return true;
 }
 
+void Streamline::SetLogWarnings(bool a_enabled)
+{
+	g_streamlineLogWarnings.store(a_enabled, std::memory_order_relaxed);
+}
+
+bool Streamline::UsesDirectDLSSSR() const
+{
+	// Availability stays gated on Streamline's DLSS plugin: it guarantees the
+	// shared NGX core is initialized for this device and nvngx_dlss.dll is found.
+	return UsesD3D12() && featureDLSS &&
+		Upscaling::GetSingleton()->settings.directNGXSR != 0 &&
+		!directDLSSSR.IsUnavailable();
+}
+
+bool Streamline::EvaluateDirectDLSSSR(ID3D12GraphicsCommandList* a_commandList, ID3D12Resource* a_color, ID3D12Resource* a_output, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, sl::FrameToken* a_frameToken, sl::DLSSMode a_mode, uint a_dlssModelPreset, const sl::Extent& a_colorExtent, const sl::Extent& a_outputExtent, float a_sharpness)
+{
+	if (!a_color || !a_output) {
+		logger::warn("[DLSS-SR Direct] D3D12 DLSS SR unavailable color={} output={}", static_cast<void*>(a_color), static_cast<void*>(a_output));
+		return false;
+	}
+	if (a_sharpness > 0.0f && !(featureNIS && slNISSetOptions && slEvaluateFeature)) {
+		if (!loggedDirectSRSharpening) {
+			logger::info("[DLSS-SR Direct] fSharpness={} requested but Streamline NIS is unavailable; sharpening stays off", a_sharpness);
+			loggedDirectSRSharpening = true;
+		}
+	}
+	// Jitter, reset and camera state come from the same common constants
+	// Streamline SR would have consumed for this frame.
+	if (!ValidateConstantsForFrame(a_frameToken)) {
+		return false;
+	}
+
+	// Mirror sl.dlss: preset hints per quality mode, PerfQuality = DLSSMode - 1,
+	// MVLowRes (guides are render-sized), AutoExposure (useAutoExposure=true,
+	// no exposure texture), IsHDR from colorBuffersHDR, no DepthInverted or
+	// MVJittered (common constants), sharpening deprecated/off.
+	sl::DLSSOptions presets{};
+	ApplyDLSSModelPreset(presets, a_dlssModelPreset);
+	nvngx::dlss_sr::D3D12Parameters parameters{};
+	parameters.color = a_color;
+	parameters.output = a_output;
+	parameters.motionVectors = a_motionVectors;
+	parameters.depth = a_depth;
+	parameters.animatedTextureMask = a_animatedTextureMask;
+	parameters.renderWidth = a_colorExtent.width;
+	parameters.renderHeight = a_colorExtent.height;
+	parameters.outputWidth = a_outputExtent.width;
+	parameters.outputHeight = a_outputExtent.height;
+	parameters.perfQualityValue = static_cast<int>(a_mode) - 1;
+	parameters.presets = {
+		static_cast<uint32_t>(presets.dlaaPreset),
+		static_cast<uint32_t>(presets.qualityPreset),
+		static_cast<uint32_t>(presets.balancedPreset),
+		static_cast<uint32_t>(presets.performancePreset),
+		static_cast<uint32_t>(presets.ultraPerformancePreset),
+		static_cast<uint32_t>(presets.ultraQualityPreset)
+	};
+	const bool hdr = ColorRange::IsExtended(a_color->GetDesc().Format);
+	parameters.createFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
+		(hdr ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0);
+	parameters.jitterX = constantsJitter.x;
+	parameters.jitterY = constantsJitter.y;
+	// sl::Constants::mvecScale is {1,1} (UV-space vectors); sl.dlss scales by
+	// the render extent to obtain NGX pixel-space motion.
+	parameters.motionVectorScaleX = static_cast<float>(a_colorExtent.width);
+	parameters.motionVectorScaleY = static_cast<float>(a_colorExtent.height);
+	parameters.preExposure = 1.0f;
+	parameters.exposureScale = 1.0f;
+	parameters.reset = lastTemporalResetFrameIndex == constantsFrameIndex;
+
+	bool recreated = false;
+	const bool succeeded = [&] {
+		FrameTiming::Gpu12Scope gpu(a_commandList, "SR.DLSS");
+		return directDLSSSR.Evaluate(a_commandList, parameters, &recreated);
+	}();
+	if (recreated) {
+		logger::info("[DLSS-SR Direct] color range={} output={}x{} mode={} modelSetting={} DLAA preset hint={}",
+			hdr ? "extended" : "SDR", a_outputExtent.width, a_outputExtent.height, magic_enum::enum_name(a_mode),
+			a_dlssModelPreset, magic_enum::enum_name(presets.dlaaPreset));
+		if (lastTemporalResetFrameIndex != constantsFrameIndex) {
+			RequestTemporalReset();
+		}
+	}
+	return succeeded;
+}
+
 bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputColor, ID3D12Resource* a_sharpenedOutput, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_renderSize, float2 a_displaySize, DXGI_FORMAT a_colorFormat, DXGI_FORMAT a_motionVectorFormat, DXGI_FORMAT a_depthFormat, uint a_qualityMode, float a_sharpness, uint a_dlssModelPreset, uint a_dlssNRPassCount, ID3D12Resource* a_nrMotionVectors, float2 a_nrJitterDelta, bool a_nrAfterSR, ID3D12Resource* a_nrDepth, const sl::DLSSNROptions& a_dlssNROptions, bool* a_sharpened, const std::function<bool(ID3D12Resource*, ID3D12Resource*)>& a_evaluateSR)
 {
 	if (a_sharpened) {
@@ -1552,6 +1791,18 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 	currentDLSSQualityMode = a_qualityMode;
 	currentDLSSModelPreset = a_dlssModelPreset;
 
+	if (!a_evaluateSR) {
+		// DLSS SR frame: retire stale direct handles, and reset history when
+		// SR moves between the direct-NGX and Streamline dispatchers.
+		const bool directSR = UsesDirectDLSSSR();
+		directDLSSSR.AdvanceFrame(!directSR);
+		if (lastDLSSSRPathDirect != -1 && lastDLSSSRPathDirect != static_cast<int>(directSR)) {
+			logger::info("[Streamline] DLSS SR dispatcher changed to {}", directSR ? "direct NGX" : "Streamline");
+			RequestTemporalReset();
+		}
+		lastDLSSSRPathDirect = static_cast<int>(directSR);
+	}
+
 	sl::Extent lowResExtent{ 0, 0, static_cast<uint32_t>(a_renderSize.x), static_cast<uint32_t>(a_renderSize.y) };
 	sl::Extent fullExtent{ 0, 0, static_cast<uint32_t>(a_displaySize.x), static_cast<uint32_t>(a_displaySize.y) };
 
@@ -1571,6 +1822,15 @@ bool Streamline::UpscaleD3D12(ID3D12Resource* a_color, ID3D12Resource* a_outputC
 		const auto feature = a_useDLSSNR ? sl::kFeatureDLSS_NR : sl::kFeatureDLSS;
 		const bool featureAvailable = a_useDLSSNR ? featureDLSSNR : featureDLSS;
 		const bool setOptionsAvailable = a_useDLSSNR ? static_cast<bool>(slDLSSNRSetOptions) : static_cast<bool>(slDLSSSetOptions);
+		if (!a_useDLSSNR && UsesDirectDLSSSR()) {
+			const bool directResult = EvaluateDirectDLSSSR(a_commandList, a_featureColor, a_featureOutput, a_motionVectors, a_depth,
+				a_animatedTextureMask, a_frameToken, dlssMode, a_dlssModelPreset, a_colorExtent, a_outputExtent, a_sharpness);
+			// An unusable direct backend falls through to Streamline SR (logged once).
+			if (directResult || !directDLSSSR.IsUnavailable()) {
+				return directResult;
+			}
+			RequestTemporalReset();
+		}
 		if (!featureAvailable || !setOptionsAvailable || !a_featureColor || !a_featureOutput) {
 			if (!a_useDLSSNR || !loggedDLSSNRFallback) {
 				logger::warn(
@@ -2062,6 +2322,8 @@ void Streamline::DestroyDLSSResources(bool a_preserveDirectNR)
 	srInputNRPassCount = 0;
 	DisableDLSS();
 	if (!a_preserveDirectNR) { directDLSSNR.ReleaseFeature(); }
+	// Callers drain the D3D12 queue first, so retired handles can go now too.
+	directDLSSSR.ReleaseAll();
 
 	if (!initialized || !slFreeResources) {
 		return;

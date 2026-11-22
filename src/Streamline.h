@@ -19,6 +19,7 @@
 #pragma warning(pop)
 #include "sl_dlss_nr.h"
 #include "nvngx_dlss_nr_private.h"
+#include "nvngx_dlss_sr_direct.h"
 #include "Buffer.h"
 
 #include <limits>
@@ -229,6 +230,16 @@ public:
 	 */
 	void DisableDLSS();
 	void DestroyDLSSResources(bool a_preserveDirectNR = false);
+
+	/**
+	 * @brief Opt-in forwarding of Streamline SDK warnings ([Settings] bStreamlineLogWarnings).
+	 */
+	static void SetLogWarnings(bool a_enabled);
+
+	/**
+	 * @brief True when D3D12 DLSS SR is dispatched through direct NGX instead of slEvaluateFeature.
+	 */
+	bool UsesDirectDLSSSR() const;
 	void SuspendDLSSNR();
 	void ResumeDLSSNR();
 
@@ -313,6 +324,7 @@ private:
 	bool ApplyNISSharpenD3D12(ID3D12Resource* a_inputColor, ID3D12Resource* a_outputColor, ID3D12GraphicsCommandList* a_commandList, sl::FrameToken* a_frameToken, float2 a_displaySize, float a_sharpness);
 	bool EnsureD3D12DLSSOptions(sl::DLSSMode a_mode, uint32_t a_outputWidth, uint32_t a_outputHeight, uint a_dlssModelPreset, bool a_hdr);
 	bool EnsureD3D12DLSSNROptions(const sl::DLSSNROptions& a_options);
+	bool EvaluateDirectDLSSSR(ID3D12GraphicsCommandList* a_commandList, ID3D12Resource* a_color, ID3D12Resource* a_output, ID3D12Resource* a_motionVectors, ID3D12Resource* a_depth, ID3D12Resource* a_animatedTextureMask, sl::FrameToken* a_frameToken, sl::DLSSMode a_mode, uint a_dlssModelPreset, const sl::Extent& a_colorExtent, const sl::Extent& a_outputExtent, float a_sharpness);
 	void PrepareDirectDLSSNR();
 	bool EnsureNISOptions(float a_sharpness, std::string_view a_logContext);
 	void ResetOptionCaches();
@@ -386,5 +398,8 @@ private:
 	bool loggedDLSSNRFallback = false;
 	bool loggedNativeDLSSNRMultipass = false;
 	bool dlssNRSuspended = false;
+	bool loggedDirectSRSharpening = false;
+	int lastDLSSSRPathDirect = -1;
 	nvngx::dlss_nr::D3D12Backend directDLSSNR;
+	nvngx::dlss_sr::D3D12Backend directDLSSSR;
 };
